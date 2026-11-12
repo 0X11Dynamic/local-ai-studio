@@ -10,6 +10,12 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 static FLAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)(?:^|[\s,])(--?[a-zA-Z][a-zA-Z0-9-]*)").unwrap());
+/// e.g. "--spec-type none,draft-simple,draft-eagle3,draft-mtp,..."
+static SPEC_TYPE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^--spec-type\s+([a-z0-9][a-z0-9,-]*)").unwrap());
+
+/// Bump when `parse` learns something new, so installed runtimes are probed
+/// again (see `RuntimeManager::reprobe_outdated`). 1: `spec_types`.
+pub const RUNTIME_CAPS_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RuntimeCapabilities {
@@ -19,6 +25,13 @@ pub struct RuntimeCapabilities {
     pub cache_types: Vec<String>,
     /// Allowed `--load-mode` values, when the build has that flag.
     pub load_modes: Vec<String>,
+    /// Speculative decoding types `--spec-type` accepts (e.g. "draft-mtp").
+    #[serde(default)]
+    pub spec_types: Vec<String>,
+    /// [`RUNTIME_CAPS_VERSION`] of the parser that read the help text; 0 in
+    /// manifests written before it existed.
+    #[serde(default)]
+    pub version: u32,
 }
 
 impl RuntimeCapabilities {
@@ -65,7 +78,16 @@ impl RuntimeCapabilities {
                 }
             }
         }
-        Self { flags, cache_types, load_modes }
+        let spec_types = SPEC_TYPE_RE
+            .captures(help)
+            .map(|c| c[1].split(',').map(str::to_string).filter(|t| !t.is_empty()).collect())
+            .unwrap_or_default();
+        Self { flags, cache_types, load_modes, spec_types, version: RUNTIME_CAPS_VERSION }
+    }
+
+    /// The build can run speculative decoding of this type (`--spec-type`).
+    pub fn has_spec_type(&self, t: &str) -> bool {
+        self.has("--spec-type") && self.spec_types.iter().any(|s| s == t)
     }
 
     /// Run `<exe> --help` and parse it.
@@ -115,6 +137,12 @@ mod tests {
 
                                         (env: LLAMA_ARG_LOAD_MODE)
 -ngl,  --gpu-layers, --n-gpu-layers N   max. number of layers to store in VRAM, either an exact number,
+--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache
+                                        comma-separated list of types of speculative decoding to use (default:
+                                        none)
+-fitt, --fit-target MiB0,MiB1,MiB2,...
+                                        target margin per device for --fit, comma-separated list of values,
+-fitc, --fit-ctx N                      minimum ctx size that can be set by --fit option, default: 4096
 ";
 
     #[test]
@@ -126,5 +154,20 @@ mod tests {
         assert!(!c.has("--mlock"));
         assert!(c.cache_types.contains(&"q8_0".to_string()) && c.cache_types.len() == 9);
         assert_eq!(c.load_modes, vec!["auto", "none", "mmap", "mlock", "mmap+mlock", "dio"]);
+    }
+
+    #[test]
+    fn parses_spec_types_and_fit_flags() {
+        let c = RuntimeCapabilities::parse(SAMPLE);
+        assert!(c.has("--spec-type") && c.has("--fit-target") && c.has("-fitt") && c.has("--fit-ctx"), "{:?}", c.flags);
+        assert_eq!(c.spec_types.len(), 11, "{:?}", c.spec_types);
+        assert!(c.has_spec_type("draft-mtp") && !c.has_spec_type("draft-nope"));
+        assert_eq!(c.version, RUNTIME_CAPS_VERSION);
+        // A build without the flag, and a manifest saved before these fields.
+        let old = RuntimeCapabilities::parse("-c, --ctx-size N x\n");
+        assert!(old.spec_types.is_empty() && !old.has_spec_type("draft-mtp"));
+        let saved: RuntimeCapabilities = serde_json::from_str(r#"{"flags": ["--spec-type"], "cache_types": [], "load_modes": []}"#).unwrap();
+        assert_eq!(saved.version, 0);
+        assert!(!saved.has_spec_type("draft-mtp"));
     }
 }

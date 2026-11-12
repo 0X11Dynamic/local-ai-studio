@@ -197,6 +197,32 @@ impl RuntimeManager {
         out
     }
 
+    /// Probe `--help` again for runtimes whose manifest was written by an
+    /// older capability parser (see `RUNTIME_CAPS_VERSION`), and save the
+    /// result. Runs `llama-server --help` only; never loads a model.
+    pub async fn reprobe_outdated(&self) {
+        for mut r in self.list_installed() {
+            if r.capabilities.version >= crate::capabilities::RUNTIME_CAPS_VERSION {
+                continue;
+            }
+            match RuntimeCapabilities::probe(&r.server_path).await {
+                Ok(caps) => {
+                    r.capabilities = caps;
+                    let path = self.dir.join(&r.id).join(MANIFEST);
+                    match serde_json::to_vec_pretty(&r) {
+                        Ok(bytes) if path.is_file() => {
+                            if let Err(e) = std::fs::write(&path, bytes) {
+                                tracing::warn!("could not update {}: {e}", path.display());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Err(e) => tracing::warn!("could not re-read the flags of runtime {}: {e}", r.id),
+            }
+        }
+    }
+
     pub fn get(&self, id: &str) -> AppResult<InstalledRuntime> {
         self.list_installed()
             .into_iter()

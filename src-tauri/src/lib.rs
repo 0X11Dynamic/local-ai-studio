@@ -57,6 +57,11 @@ pub fn run() {
             let st_mcp = state.clone();
             tauri::async_runtime::spawn(async move { services::mcp::autoconnect(st_mcp) });
 
+            // Re-read the flags of runtimes probed by an older app version
+            // (e.g. the --spec-type list); runs `llama-server --help` only.
+            let st_rt = state.clone();
+            tauri::async_runtime::spawn(async move { st_rt.runtimes.reprobe_outdated().await });
+
             // Start the local API if the user enabled autostart.
             let st_api = state.clone();
             tauri::async_runtime::spawn(async move {
