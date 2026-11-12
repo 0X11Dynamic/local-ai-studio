@@ -150,6 +150,8 @@ struct Inner {
     status: EngineStatus,
     running: Option<Running>,
     load_cancel: Option<CancellationToken>,
+    /// The first reply's speed has been checked for a VRAM spill (per load).
+    speed_checked: bool,
 }
 
 #[derive(Clone)]
@@ -171,7 +173,7 @@ impl Engine {
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(1024);
         Self {
-            inner: Arc::new(Mutex::new(Inner { status: EngineStatus::unloaded(), running: None, load_cancel: None })),
+            inner: Arc::new(Mutex::new(Inner { status: EngineStatus::unloaded(), running: None, load_cancel: None, speed_checked: false })),
             logs: Arc::new(Mutex::new(VecDeque::with_capacity(LOG_CAPACITY))),
             events,
             op_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -388,13 +390,21 @@ impl Engine {
         let props = client.props().await.ok();
         let secs = started.elapsed().as_secs_f64();
         let facts = offload.lock().unwrap().clone();
-        self.inner.lock().unwrap().load_cancel = None;
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.load_cancel = None;
+            g.speed_checked = false;
+        }
+        let fit = fits_layers(&req.config, &req.runtime);
+        if let Some((n, m)) = facts.offloaded {
+            tracing::info!("llama.cpp put {n} of {m} layers on the GPU{}", if fit { " (--fit)" } else { "" });
+        }
         self.set_status(|s| {
             s.state = EngineState::Loaded;
             s.props = props;
             s.load_seconds = Some(secs);
             s.gpu_layers_offloaded = facts.offloaded;
-            s.warnings = facts.spill_warnings();
+            s.warnings = facts.spill_warnings(fit.then_some(req.config.fit_target_mib.unwrap_or(crate::config::DEFAULT_FIT_TARGET_MIB)));
             s.buffers = facts.buffers;
             s.devices = facts.devices;
         });
@@ -511,13 +521,19 @@ impl LogFacts {
     /// system memory when VRAM runs out (sysmem fallback). Loading "succeeds"
     /// but generation becomes very slow. Detect it by comparing what was
     /// allocated on each device with the free memory it had at startup.
-    fn spill_warnings(&self) -> Vec<String> {
+    /// `fit_margin_mib`: llama.cpp fitted the layers itself (`--fit`) with this
+    /// margin, so the advice is a larger margin rather than fewer layers.
+    fn spill_warnings(&self, fit_margin_mib: Option<u32>) -> Vec<String> {
         let mut out = Vec::new();
         for d in &self.devices {
             let used: f64 = self.buffers.iter().filter(|b| b.device == d.device).map(|b| b.mib).sum();
             if d.free_mib > 0.0 && used > d.free_mib + 64.0 {
+                let advice = match fit_margin_mib {
+                    Some(m) => format!("Raise the GPU memory margin for fitting (Advanced settings, now {m} MiB) and reload."),
+                    None => "Offload fewer layers, lower the context, or use a smaller quantization.".to_string(),
+                };
                 out.push(format!(
-                    "{} allocated {:.1} GB but had only {:.1} GB free, so about {:.1} GB is in shared system memory. Generation will be much slower. Offload fewer layers, lower the context, or use a smaller quantization.",
+                    "{} allocated {:.1} GB but had only {:.1} GB free, so about {:.1} GB is in shared system memory. Generation will be much slower. {advice}",
                     d.device,
                     used / 1024.0,
                     d.free_mib / 1024.0,
@@ -526,6 +542,73 @@ impl LogFacts {
             }
         }
         out
+    }
+}
+
+/// llama.cpp picks the GPU layers itself for this load (`--fit` on, no
+/// explicit `-ngl`), as Share with CPU does.
+fn fits_layers(cfg: &LoadConfig, rt: &InstalledRuntime) -> bool {
+    cfg.fit && cfg.gpu_layers == crate::config::GpuLayers::Auto && rt.capabilities.has("--fit")
+}
+
+/// Prompt processing below this multiple of the generation speed, with part
+/// of the model on the GPU, points to a VRAM spill. Measured on an RTX 5060:
+/// normal splits run prompts 60-75x faster than generation (Gemma-4-E4B
+/// 1900 vs 25.6 t/s, Qwen3.8-27B 401 vs 5.6 t/s); the spill at ~7.7 GB used
+/// collapsed prompts to 51 t/s at ~4 t/s generation (about 13x).
+const SPILL_PROMPT_TO_GEN_RATIO: f64 = 20.0;
+/// Too-short prompts and replies give noisy speeds; skip them.
+const SPILL_CHECK_MIN_PROMPT_TOKENS: u64 = 512;
+const SPILL_CHECK_MIN_GEN_TOKENS: u64 = 16;
+
+/// Does a reply's speed suggest the GPU spilled into shared system memory?
+/// `prompt_tokens` are the ones actually processed (not served from cache).
+pub fn prompt_speed_suggests_spill(prompt_tokens: u64, prompt_tps: f64, gen_tokens: u64, gen_tps: f64) -> bool {
+    prompt_tokens >= SPILL_CHECK_MIN_PROMPT_TOKENS
+        && gen_tokens >= SPILL_CHECK_MIN_GEN_TOKENS
+        && prompt_tps > 0.0
+        && gen_tps > 0.0
+        && prompt_tps < gen_tps * SPILL_PROMPT_TO_GEN_RATIO
+}
+
+impl Engine {
+    /// Look at the first reply long enough to measure after a load: a prompt
+    /// speed that collapsed next to the generation speed usually means VRAM
+    /// spilled into shared system memory. Adds a warning to the status (no
+    /// reload). Later replies are not checked again until the next load.
+    pub fn note_reply_speed(&self, stats: &crate::chat::ChatStats) {
+        let processed = stats.prompt_tokens.unwrap_or(0).saturating_sub(stats.cached_tokens.unwrap_or(0));
+        let (Some(p), Some(g), Some(n)) = (stats.prompt_tokens_per_sec, stats.tokens_per_sec, stats.completion_tokens) else { return };
+        if processed < SPILL_CHECK_MIN_PROMPT_TOKENS || n < SPILL_CHECK_MIN_GEN_TOKENS {
+            return;
+        }
+        let warning = {
+            let mut g_ = self.inner.lock().unwrap();
+            let st = &g_.status;
+            let on_gpu = st.gpu_layers_offloaded.is_some_and(|(n, _)| n > 0);
+            if g_.speed_checked || st.state != EngineState::Loaded || !on_gpu {
+                return;
+            }
+            g_.speed_checked = true;
+            if !prompt_speed_suggests_spill(processed, p, n, g) {
+                return;
+            }
+            let fit = g_.status.config.as_ref().is_some_and(|c| c.fit && c.gpu_layers == crate::config::GpuLayers::Auto && c.fit_target_mib.is_some());
+            let advice = if fit {
+                "Raise the GPU memory margin for fitting (Advanced settings) and reload."
+            } else {
+                "Offload fewer layers (or turn on Share with CPU) and reload."
+            };
+            format!(
+                "The first reply processed its prompt at only {p:.0} tokens/s next to {g:.1} tokens/s generation. A prompt speed this low usually means GPU memory spilled into shared system memory. {advice}"
+            )
+        };
+        tracing::warn!("{warning}");
+        self.set_status(|s| {
+            if !s.warnings.contains(&warning) {
+                s.warnings.push(warning);
+            }
+        });
     }
 }
 
@@ -621,14 +704,71 @@ mod tests {
             f.observe(l);
         }
         assert_eq!(f.devices[0].free_mib, 7031.0);
-        let w = f.spill_warnings();
+        let w = f.spill_warnings(None);
         assert_eq!(w.len(), 1, "{w:?}");
-        assert!(w[0].contains("shared system memory"), "{}", w[0]);
+        assert!(w[0].contains("shared system memory") && w[0].contains("Offload fewer layers"), "{}", w[0]);
+        // When llama.cpp fitted the layers, the advice is a larger margin.
+        let w = f.spill_warnings(Some(1024));
+        assert!(w[0].contains("margin") && w[0].contains("1024 MiB") && !w[0].contains("lower the context"), "{}", w[0]);
         // A model that fits produces no warning.
         let mut ok = LogFacts::default();
         ok.observe("- CUDA0   : NVIDIA GeForce RTX 5060 (8123 MiB, 7031 MiB free)");
         ok.observe("CUDA0 model buffer size =  1208.11 MiB");
-        assert!(ok.spill_warnings().is_empty());
+        assert!(ok.spill_warnings(None).is_empty());
+    }
+
+    #[test]
+    fn prompt_speed_spill_heuristic_matches_the_measured_runs() {
+        // Normal splits on the RTX 5060: no warning.
+        assert!(!prompt_speed_suggests_spill(2000, 1900.0, 200, 25.6)); // Gemma-4-E4B, 12 layers
+        assert!(!prompt_speed_suggests_spill(2000, 401.0, 200, 5.62)); // Qwen3.8-27B, 16 layers
+        assert!(!prompt_speed_suggests_spill(2000, 6240.0, 200, 94.1)); // Gemma all on GPU
+        // The -ngl 28 spill: prompts 51 t/s at ~4 t/s generation.
+        assert!(prompt_speed_suggests_spill(2000, 51.0, 200, 3.9));
+        // Too little to measure: never.
+        assert!(!prompt_speed_suggests_spill(100, 51.0, 200, 3.9));
+        assert!(!prompt_speed_suggests_spill(2000, 51.0, 4, 3.9));
+        assert!(!prompt_speed_suggests_spill(2000, 0.0, 200, 0.0));
+    }
+
+    #[test]
+    fn reply_speed_check_warns_once_per_load_and_only_with_gpu_layers() {
+        let e = Engine::new();
+        let slow = crate::chat::ChatStats {
+            prompt_tokens: Some(3000),
+            cached_tokens: Some(0),
+            completion_tokens: Some(100),
+            prompt_tokens_per_sec: Some(51.0),
+            tokens_per_sec: Some(3.9),
+            ..Default::default()
+        };
+        // Not loaded: nothing.
+        e.note_reply_speed(&slow);
+        assert!(e.status().warnings.is_empty());
+        e.set_status(|s| {
+            s.state = EngineState::Loaded;
+            s.gpu_layers_offloaded = Some((28, 66));
+            s.config = Some(LoadConfig { fit_target_mib: Some(1024), ..Default::default() });
+        });
+        // A cached prompt is too short to judge, and does not use up the check.
+        e.note_reply_speed(&crate::chat::ChatStats { cached_tokens: Some(2900), ..slow.clone() });
+        assert!(e.status().warnings.is_empty());
+        e.note_reply_speed(&slow);
+        let w = e.status().warnings;
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("51 tokens/s") && w[0].contains("margin"), "{}", w[0]);
+        // Checked once per load.
+        e.inner.lock().unwrap().status.warnings.clear();
+        e.note_reply_speed(&slow);
+        assert!(e.status().warnings.is_empty());
+        // CPU only (0 layers on the GPU): CPU prompts are slow anyway, no check.
+        let c = Engine::new();
+        c.set_status(|s| {
+            s.state = EngineState::Loaded;
+            s.gpu_layers_offloaded = Some((0, 66));
+        });
+        c.note_reply_speed(&slow);
+        assert!(c.status().warnings.is_empty());
     }
 
     #[test]

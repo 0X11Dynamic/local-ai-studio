@@ -880,6 +880,8 @@ pub async fn send_with(app: AppHandle, st: SharedState, conversation_id: String,
         emit(&mut pend_c, &mut pend_r);
         match result {
             Ok(out) => {
+                // First long-enough reply after a load: check its speed for a VRAM spill.
+                st.engine.note_reply_speed(&out.stats);
                 let mut stats = base_stats;
                 merge_stats(&mut stats, &out.stats);
                 let reasoning = (!out.reasoning.is_empty()).then_some(out.reasoning.as_str());
@@ -1032,6 +1034,8 @@ impl LoopHooks for ChatHooks {
             r.note_chat_usage(1, 0, stats.completion_tokens.unwrap_or(0), self.started.elapsed().as_millis() as u64);
         }
         let id = self.ids.lock().unwrap().get(segment).cloned().ok_or_else(|| AppError::Other("segment message missing".into()))?;
+        // First long-enough reply after a load: check its speed for a VRAM spill.
+        self.st.engine.note_reply_speed(stats);
         let mut st = self.base_stats.clone();
         merge_stats(&mut st, stats);
         let reasoning = (!reasoning.is_empty()).then_some(reasoning);

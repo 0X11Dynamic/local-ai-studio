@@ -144,6 +144,28 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
       : `${offloaded[0]}/${offloaded[1]} (all on GPU)`
     : "not reported";
   const moeOnCpu = isThis ? status?.config?.n_cpu_moe : null;
+  const fitMargin = cfg.fit_target_mib ?? 1024;
+  // With --fit, llama.cpp picks the layer count at load; the split shown is the app's estimate.
+  const split = est?.share_split;
+  const shareHelp = !split
+    ? "Picked from free VRAM when the model loads."
+    : est?.share_fit && !split.all_fit && split.n_cpu_moe == null && split.gpu_layers > 0
+      ? `Estimate: about ${split.gpu_layers} of ${split.total_layers} layers on the GPU. llama.cpp fits the exact number when the model loads, keeping ${fitMargin} MiB free.`
+      : `Estimate: ${split.summary}`;
+  const kvAuto = !!cfg.cache_type_auto;
+  const setKv = (which: "k" | "v", t: string) => {
+    if (t === "auto") return set({ cache_type_auto: true, cache_type_k: "f16", cache_type_v: "f16" });
+    const k = which === "k" ? t : kvAuto ? "f16" : cfg.cache_type_k;
+    const v = which === "v" ? t : kvAuto ? "f16" : cfg.cache_type_v;
+    set({ cache_type_auto: false, cache_type_k: k, cache_type_v: v });
+  };
+  const autoKvLine = kvAuto && est?.auto_kv
+    ? `${est.auto_kv.summary}.${est.auto_kv.flash_attention_on ? " Flash Attention is turned on for the q8_0 V cache." : ""}`
+    : null;
+  // Speculative decoding with the model's own MTP layers: offered only when
+  // the model has them and the runtime lists draft-mtp.
+  const mtpAvailable = (model.meta.mtp_layers ?? 0) > 0 && !!runtime?.capabilities.spec_types?.includes("draft-mtp");
+  const running = isThis ? status?.config : null;
 
   return (
     <div style={{ display: "grid", gap: 12 }}>
@@ -191,7 +213,7 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
           {sharing ? (
             <>
               <input id="gpu" className="input" value="Chosen automatically" disabled readOnly />
-              <span className="help">{est?.share_split ? `Estimate: ${est.share_split.summary}` : "Picked from free VRAM when the model loads."}</span>
+              <span className="help">{shareHelp}</span>
             </>
           ) : (
             <select id="gpu" className="input" value={cpuRuntime ? "cpu_only" : gpuMode} disabled={disabled || cpuRuntime || !has("--n-gpu-layers")} onChange={(e) => setGpu(e.target.value as GpuMode)}>
@@ -220,16 +242,19 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
         <div className="field">
           <label htmlFor="kvk">KV cache type (K / V)</label>
           <div className="row" style={{ flexWrap: "nowrap" }}>
-            <select id="kvk" className="input" style={{ flex: 1 }} value={cfg.cache_type_k} disabled={disabled || !has("--cache-type-k")} aria-label="K cache type"
-              onChange={(e) => set({ cache_type_k: e.target.value })}>
+            <select id="kvk" className="input" style={{ flex: 1 }} value={kvAuto ? "auto" : cfg.cache_type_k} disabled={disabled || !has("--cache-type-k")} aria-label="K cache type"
+              onChange={(e) => setKv("k", e.target.value)}>
+              <option value="auto">Auto</option>
               {cacheTypes.map((t) => <option key={t}>{t}</option>)}
             </select>
-            <select className="input" style={{ flex: 1 }} value={cfg.cache_type_v} disabled={disabled || !has("--cache-type-v")} aria-label="V cache type"
-              onChange={(e) => set({ cache_type_v: e.target.value })}>
+            <select className="input" style={{ flex: 1 }} value={kvAuto ? "auto" : cfg.cache_type_v} disabled={disabled || !has("--cache-type-v")} aria-label="V cache type"
+              onChange={(e) => setKv("v", e.target.value)}>
+              <option value="auto">Auto</option>
               {cacheTypes.map((t) => <option key={t}>{t}</option>)}
             </select>
           </div>
-          {cfg.cache_type_v !== "f16" && cfg.flash_attention === "off" && <span className="err">A quantized V cache needs Flash Attention.</span>}
+          {autoKvLine && <span className="help">{autoKvLine}</span>}
+          {!kvAuto && cfg.cache_type_v !== "f16" && cfg.flash_attention === "off" && <span className="err">A quantized V cache needs Flash Attention.</span>}
         </div>
         <label className="check wide">
           <input type="checkbox" checked={sharing} disabled={disabled || cpuRuntime || !has("--n-gpu-layers")}
@@ -245,6 +270,13 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
           <input type="checkbox" checked={cfg.kv_offload && !cpuRuntime} disabled={disabled || cpuRuntime || !has("--no-kv-offload")} onChange={(e) => set({ kv_offload: e.target.checked })} />
           Keep the KV cache on the GPU
         </label>
+        {mtpAvailable && (
+          <label className="check wide">
+            <input type="checkbox" checked={cfg.speculative === "draft-mtp"} disabled={disabled}
+              onChange={(e) => set({ speculative: e.target.checked ? "draft-mtp" : null })} />
+            Speculative decoding (MTP): draft tokens with the model's own prediction layers (same output, may be faster)
+          </label>
+        )}
         {defaults?.has_projector && (
           <label className="check wide">
             <input type="checkbox" checked={cfg.load_projector} disabled={disabled} onChange={(e) => set({ load_projector: e.target.checked })} />
@@ -311,6 +343,14 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
             <input type="checkbox" checked={cfg.fit} disabled={disabled || !has("--fit")} onChange={(e) => set({ fit: e.target.checked })} />
             Let llama.cpp shrink settings left on Auto so the model fits in memory
           </label>
+          {has("--fit-target") && (
+            <div className="field">
+              <label htmlFor="fitt">GPU memory margin for fitting (MiB)</label>
+              <input id="fitt" className="input mono" placeholder="1024" value={cfg.fit_target_mib ?? ""} disabled={disabled || !cfg.fit}
+                onChange={(e) => set({ fit_target_mib: numOrNull(e.target.value) })} />
+              <span className="help">VRAM llama.cpp leaves free when it fits the layers (Share with CPU, GPU offload Auto). Raise it if a load spills into shared memory.</span>
+            </div>
+          )}
         </div>
       )}
 
@@ -323,7 +363,7 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
             {!sharing && <><dt>System RAM</dt><dd>{bytes(est.estimate.ram_bytes)} of {bytes(est.available_ram_bytes)} available</dd></>}
             <dt>KV cache</dt><dd>{bytes(est.estimate.kv_cache_bytes)}</dd>
             {sharing && est.share_split ? (
-              <><dt>Split</dt><dd>{est.share_split.summary}</dd></>
+              <><dt>Split (estimate)</dt><dd>{shareHelp.replace(/^Estimate: /, "")}</dd></>
             ) : (
               <><dt>Layers on GPU</dt><dd>{est.estimate.offloaded_layers}/{est.estimate.total_layers}{est.suggested_gpu_layers != null && `, about ${est.suggested_gpu_layers} fit`}</dd></>
             )}
@@ -358,8 +398,11 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
           <div style={{ fontWeight: 500, marginBottom: 6 }}>Running (measured)</div>
           <dl className="kv">
             <dt>Context allocated</dt><dd>{status.props?.n_ctx?.toLocaleString() ?? "?"} tokens</dd>
-            <dt>Layers on GPU</dt><dd>{layersLine}</dd>
+            <dt>Layers on GPU</dt><dd>{layersLine}{running?.gpu_layers.mode === "auto" && running.fit ? " (fitted by llama.cpp)" : ""}</dd>
             {moeOnCpu ? <><dt>MoE experts on CPU</dt><dd>first {moeOnCpu} layers</dd></> : null}
+            {running && <><dt>KV cache</dt><dd>{running.cache_type_k} / {running.cache_type_v}{running.cache_type_auto ? " (auto)" : ""}</dd></>}
+            {running?.threads ? <><dt>CPU threads</dt><dd>{running.threads} generation, {running.threads_batch ?? running.threads} prompt</dd></> : null}
+            {running?.speculative ? <><dt>Speculative decoding</dt><dd>{running.speculative}</dd></> : null}
             {status.buffers.map((b) => (
               <div key={`${b.device}-${b.kind}`} style={{ display: "contents" }}>
                 <dt>{b.device} {b.kind}</dt><dd>{b.mib.toFixed(0)} MiB</dd>

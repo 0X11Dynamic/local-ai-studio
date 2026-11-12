@@ -323,6 +323,11 @@ pub struct EstimateView {
     /// What "Auto (fits your hardware)" context picks right now (estimate).
     /// When the config's n_ctx is 0 the estimate above uses this size.
     pub auto_ctx: AutoCtx,
+    /// What the "Auto" KV cache type picks right now (None: an explicit type).
+    pub auto_kv: Option<AutoKv>,
+    /// Share with CPU is on and the runtime fits the layers itself
+    /// (`--fit`): `share_split` is only an estimate of its choice.
+    pub share_fit: bool,
 }
 
 /// Inputs for an Auto context ([`estimate::auto_n_ctx`]) for a load with `cfg`.
@@ -423,20 +428,35 @@ pub fn free_vram(st: &SharedState) -> Option<u64> {
     st.monitor.hardware_info().gpus.first().map(|g| g.vram_total_bytes.saturating_sub(g.vram_used_bytes))
 }
 
-/// Does the default runtime (setting, else the first installed) support `--n-cpu-moe`?
-pub async fn default_runtime_has_n_cpu_moe(st: &SharedState) -> bool {
+/// The default runtime: the saved setting, else the first installed.
+pub async fn default_runtime(st: &SharedState) -> Option<inference::InstalledRuntime> {
     let installed = st.runtimes.list_installed();
     let want = st.db.get_setting::<String>("runtime.default").await.ok().flatten();
-    let rt = match want {
-        Some(w) => installed.iter().find(|r| r.id == w),
-        None => installed.first(),
-    };
-    rt.is_some_and(|r| r.capabilities.has("--n-cpu-moe"))
+    match want {
+        Some(w) => installed.into_iter().find(|r| r.id == w),
+        None => installed.into_iter().next(),
+    }
+}
+
+/// Can the runtime let llama.cpp fit the GPU layers itself with an explicit
+/// margin (`--fit` and `--fit-target`)?
+pub fn runtime_can_fit(caps: &inference::RuntimeCapabilities) -> bool {
+    caps.has("--fit") && caps.has("--fit-target")
 }
 
 /// Turn the user's "Share with CPU" choice into concrete load settings.
 /// Returns the config to load with (the user's own config is unchanged when
-/// the toggle is off) and the split that was chosen.
+/// the toggle is off) and the split the estimate predicts.
+///
+/// With `can_fit` (the runtime has `--fit` and `--fit-target`), llama.cpp
+/// picks the layer count itself from real allocation sizes: no `-ngl`,
+/// `--fit on`, an explicit `--fit-target` margin (the config's, else 1024
+/// MiB) and `--fit-ctx` equal to the chosen context, which is also passed
+/// explicitly, so fitting never lowers the context. The estimate's split is
+/// then only the UI preview. MoE models the estimate splits keep every layer
+/// on the GPU with `--n-cpu-moe` (unchanged), and when nothing fits at all
+/// the load is CPU only. Without `can_fit`, the estimate's layer count is
+/// passed (`-ngl N`) as before.
 /// `projector_bytes` is what [`projector_bytes`] returns for this load.
 pub fn resolve_share(
     cfg: &LoadConfig,
@@ -445,36 +465,206 @@ pub fn resolve_share(
     projector_bytes: u64,
     free_vram: Option<u64>,
     has_n_cpu_moe: bool,
+    can_fit: bool,
 ) -> (LoadConfig, Option<ShareSplit>) {
     if !cfg.share_with_cpu || matches!(cfg.gpu_layers, GpuLayers::CpuOnly) {
         return (cfg.clone(), None);
     }
     let mut c = cfg.clone();
     c.fit = true;
-    let Some(free) = free_vram else {
-        // No GPU information: let llama.cpp fit the layers itself.
+    let let_llama_fit = |c: &mut LoadConfig| {
         c.gpu_layers = GpuLayers::Auto;
         c.n_cpu_moe = None;
+        if can_fit {
+            c.fit_target_mib = Some(cfg.fit_target_mib.unwrap_or(inference::DEFAULT_FIT_TARGET_MIB));
+            c.fit_ctx = (c.n_ctx > 0).then_some(c.n_ctx);
+        }
+    };
+    let Some(free) = free_vram else {
+        // No GPU information: let llama.cpp fit the layers itself.
+        let_llama_fit(&mut c);
         return (c, None);
     };
     let total = meta.block_count.unwrap_or(0) + 1;
     let mut input = estimate_input(cfg, meta, total, projector_bytes);
     input.gpu_layers = None;
     let split = estimate::share_split(meta, size, &input, free, has_n_cpu_moe);
-    if split.all_fit {
-        c.gpu_layers = GpuLayers::All;
-        c.n_cpu_moe = None;
-    } else if let Some(n) = split.n_cpu_moe {
+    if let Some(n) = split.n_cpu_moe {
         c.gpu_layers = GpuLayers::All;
         c.n_cpu_moe = Some(n as u32);
-    } else if split.gpu_layers == 0 {
+    } else if split.gpu_layers == 0 && !split.all_fit {
         c.gpu_layers = GpuLayers::CpuOnly;
+        c.n_cpu_moe = None;
+    } else if can_fit {
+        let_llama_fit(&mut c);
+    } else if split.all_fit {
+        c.gpu_layers = GpuLayers::All;
         c.n_cpu_moe = None;
     } else {
         c.gpu_layers = GpuLayers::Count(split.gpu_layers as u32);
         c.n_cpu_moe = None;
     }
     (c, Some(split))
+}
+
+/// What the runtime offers for an automatic KV cache type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvSupport {
+    /// `--cache-type-k` / `-v` accept q8_0.
+    pub q8_0: bool,
+    /// `--flash-attn` exists (a quantized V cache needs Flash Attention on).
+    pub flash_attn: bool,
+}
+
+impl KvSupport {
+    pub fn of(caps: &inference::RuntimeCapabilities) -> Self {
+        Self {
+            q8_0: caps.has("--cache-type-k") && caps.has("--cache-type-v") && caps.cache_types.iter().any(|t| t == "q8_0"),
+            flash_attn: caps.has("--flash-attn"),
+        }
+    }
+}
+
+/// The KV cache type "Auto" picked, for the load panel.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AutoKv {
+    pub cache_type_k: String,
+    pub cache_type_v: String,
+    /// Flash Attention was turned on for the quantized V cache.
+    pub flash_attention_on: bool,
+    /// KV cache bytes saved against f16 at the chosen context (estimate).
+    pub saves_bytes: u64,
+    /// Plain description for the UI.
+    pub summary: String,
+}
+
+/// An f16 KV cache bigger than this is worth quantizing when the model has
+/// to share VRAM with the CPU.
+pub const AUTO_KV_Q8_THRESHOLD: u64 = 1 << 30;
+
+/// The Auto KV cache rule: q8_0 when the f16 cache is over ~1 GiB and the
+/// model shares the GPU with the CPU (Share with CPU on, or it does not fit
+/// fully in VRAM), if the runtime takes q8_0. A q8_0 V cache needs Flash
+/// Attention, so it is turned on; when the user turned Flash Attention off
+/// (or the build lacks it), only K is quantized. Never q4_0.
+/// Returns (K type, V type, turn Flash Attention on).
+pub fn auto_kv_choice(cfg: &LoadConfig, f16_kv_bytes: u64, shares_with_cpu: bool, kv: KvSupport) -> Option<(&'static str, &'static str, bool)> {
+    if !cfg.cache_type_auto || matches!(cfg.gpu_layers, GpuLayers::CpuOnly) || !shares_with_cpu || f16_kv_bytes <= AUTO_KV_Q8_THRESHOLD || !kv.q8_0 {
+        return None;
+    }
+    if kv.flash_attn && cfg.flash_attention != inference::FlashAttention::Off {
+        Some(("q8_0", "q8_0", true))
+    } else {
+        Some(("q8_0", "f16", false))
+    }
+}
+
+/// Resolve "Auto" KV cache type (`cache_type_auto`) to concrete types with
+/// [`auto_kv_choice`], before the Auto context is sized (a q8_0 cache lets
+/// Auto reach a larger context). The f16 size is measured at the trained
+/// context for an Auto context, else at the configured one. Configs with an
+/// explicit K/V choice are returned unchanged with None.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_auto_kv(
+    cfg: &LoadConfig,
+    meta: &ModelMetadata,
+    size: u64,
+    projector_bytes: u64,
+    free_vram: Option<u64>,
+    uses_gpu: bool,
+    kv: KvSupport,
+) -> (LoadConfig, Option<AutoKv>) {
+    if !cfg.cache_type_auto {
+        return (cfg.clone(), None);
+    }
+    let mut c = cfg.clone();
+    c.cache_type_k = "f16".into();
+    c.cache_type_v = "f16".into();
+    let total = meta.block_count.unwrap_or(0) + 1;
+    let mut input = estimate_input(&c, meta, total, projector_bytes);
+    if cfg.n_ctx == 0 {
+        input.n_ctx = meta.context_length.filter(|&t| t > 0).unwrap_or(estimate::AUTO_CTX_UNKNOWN_TRAINED);
+    }
+    input.gpu_layers = None;
+    let full = estimate::estimate(meta, size, &input);
+    let gpu = uses_gpu && !matches!(cfg.gpu_layers, GpuLayers::CpuOnly);
+    let shares = gpu && (cfg.share_with_cpu || free_vram.is_some_and(|f| full.vram_bytes > (f as f64 * 0.90) as u64));
+    let auto = match auto_kv_choice(&c, full.kv_cache_bytes, shares, kv) {
+        Some((k, v, fa)) => {
+            c.cache_type_k = k.into();
+            c.cache_type_v = v.into();
+            if fa {
+                c.flash_attention = inference::FlashAttention::On;
+            }
+            AutoKv { cache_type_k: k.into(), cache_type_v: v.into(), flash_attention_on: fa, saves_bytes: 0, summary: String::new() }
+        }
+        None => AutoKv { cache_type_k: "f16".into(), cache_type_v: "f16".into(), flash_attention_on: false, saves_bytes: 0, summary: String::new() },
+    };
+    (c, Some(auto))
+}
+
+/// Fill in what the Auto KV choice saves at the final context of `cfg`
+/// (the config after [`resolve_auto_kv`] and the Auto context).
+pub fn finish_auto_kv(a: &mut AutoKv, cfg: &LoadConfig, meta: &ModelMetadata, size: u64, projector_bytes: u64) {
+    let total = meta.block_count.unwrap_or(0) + 1;
+    let chosen = estimate_input(cfg, meta, total, projector_bytes);
+    let f16 = EstimateInput { cache_type_k: "f16".into(), cache_type_v: "f16".into(), ..chosen.clone() };
+    let kv = |i: &EstimateInput| estimate::estimate(meta, size, i).kv_cache_bytes;
+    a.saves_bytes = kv(&f16).saturating_sub(kv(&chosen));
+    let types = if a.cache_type_k == a.cache_type_v { a.cache_type_k.clone() } else { format!("{} K / {} V", a.cache_type_k, a.cache_type_v) };
+    a.summary = if a.saves_bytes > 0 {
+        format!("KV cache: {types} (auto, saves {:.1} GB)", a.saves_bytes as f64 / 1e9)
+    } else {
+        format!("KV cache: {types} (auto)")
+    };
+}
+
+/// Generation / prompt threads for a hybrid CPU (P- and E-cores) when part
+/// of the model runs on the CPU: generation on the P-cores plus 4 (measured
+/// on a Core Ultra 7 265F, 8P+12E, Qwen3.8-27B split: -t 12 gave 5.79 t/s,
+/// the default 20 gave 5.62, -t 8 5.04), prompt processing on every
+/// physical core (-tb 20: 401 t/s, -tb 12: 373). None when everything is on
+/// the GPU or the CPU is not hybrid: llama.cpp's defaults stay.
+pub fn hybrid_cpu_threads(topo: Option<system_monitor::CoreTopology>, cpu_runs_layers: bool) -> Option<(u32, u32)> {
+    let t = topo?;
+    if !cpu_runs_layers || !t.is_hybrid() {
+        return None;
+    }
+    let all = t.physical_cores();
+    Some(((t.performance_cores + 4).min(all) as u32, all as u32))
+}
+
+/// Apply [`hybrid_cpu_threads`] to the thread counts the user left unset,
+/// when the runtime has the flags.
+pub fn apply_thread_policy(cfg: &LoadConfig, topo: Option<system_monitor::CoreTopology>, cpu_runs_layers: bool, caps: &inference::RuntimeCapabilities) -> LoadConfig {
+    let mut c = cfg.clone();
+    if let Some((t, tb)) = hybrid_cpu_threads(topo, cpu_runs_layers) {
+        if c.threads.is_none() && caps.has("--threads") {
+            c.threads = Some(t);
+        }
+        if c.threads_batch.is_none() && caps.has("--threads-batch") {
+            c.threads_batch = Some(tb);
+        }
+    }
+    c
+}
+
+/// Will part of the model (or its KV cache) run on the CPU with `cfg`?
+/// `split` is the estimate's Share-with-CPU split, `full_gpu_fits` whether
+/// the all-GPU estimate fits free VRAM (None without a reading).
+pub fn cpu_runs_layers(cfg: &LoadConfig, total_layers: u64, uses_gpu: bool, split: Option<&ShareSplit>, full_gpu_fits: Option<bool>) -> bool {
+    if !uses_gpu || !cfg.kv_offload || cfg.n_cpu_moe.is_some_and(|n| n > 0) {
+        return true;
+    }
+    match cfg.gpu_layers {
+        GpuLayers::CpuOnly => true,
+        GpuLayers::Count(n) => (n as u64) < total_layers,
+        GpuLayers::All => false,
+        GpuLayers::Auto => match split {
+            Some(s) => !s.all_fit,
+            None => full_gpu_fits == Some(false),
+        },
+    }
 }
 
 #[tauri::command]
@@ -486,23 +676,25 @@ pub async fn estimate_memory(state: State<'_, SharedState>, id: String, config: 
     let total_layers = meta.block_count.unwrap_or(0) + 1;
     let proj = projector_bytes(&config, m.projector_path.as_deref());
     let free_vram = gpu.map(|g| g.vram_total_bytes.saturating_sub(g.vram_used_bytes));
-    let has_moe_flag = default_runtime_has_n_cpu_moe(state.inner()).await;
+    let rt = default_runtime(state.inner()).await;
+    let has_moe_flag = rt.as_ref().is_some_and(|r| r.capabilities.has("--n-cpu-moe"));
+    let kv_support = rt.as_ref().map(|r| KvSupport::of(&r.capabilities)).unwrap_or(KvSupport { q8_0: false, flash_attn: false });
+    let share_fit = config.share_with_cpu && rt.as_ref().is_some_and(|r| runtime_can_fit(&r.capabilities));
     // Auto context, measured as a load would see it: a loaded model is
     // unloaded first, so its VRAM counts as free.
     let reclaim = loaded_backend_vram(state.inner());
-    let auto_ctx = auto_ctx_for(
-        &config,
-        &meta,
-        m.size as u64,
-        proj,
-        free_vram.map(|f| f.saturating_add(reclaim).min(gpu.map(|g| g.vram_total_bytes).unwrap_or(u64::MAX))),
-        hw.available_ram_bytes,
-        has_moe_flag,
-        !matches!(config.gpu_layers, GpuLayers::CpuOnly),
-    );
+    let free_at_load = free_vram.map(|f| f.saturating_add(reclaim).min(gpu.map(|g| g.vram_total_bytes).unwrap_or(u64::MAX)));
+    let uses_gpu = !matches!(config.gpu_layers, GpuLayers::CpuOnly);
+    // Auto KV cache type first: q8_0 lets the Auto context grow.
+    let (config, mut auto_kv) = resolve_auto_kv(&config, &meta, m.size as u64, proj, free_at_load, uses_gpu, kv_support);
+    let auto_ctx = auto_ctx_for(&config, &meta, m.size as u64, proj, free_at_load, hw.available_ram_bytes, has_moe_flag, uses_gpu);
     let mut input = estimate_input(&config, &meta, total_layers, proj);
     if config.n_ctx == 0 {
         input.n_ctx = auto_ctx.n_ctx;
+    }
+    if let Some(a) = auto_kv.as_mut() {
+        let sized = LoadConfig { n_ctx: input.n_ctx.min(u32::MAX as u64) as u32, ..config.clone() };
+        finish_auto_kv(a, &sized, &meta, m.size as u64, proj);
     }
     let est = estimate::estimate(&meta, m.size as u64, &input);
     let suggested = free_vram.map(|f| {
@@ -558,6 +750,8 @@ pub async fn estimate_memory(state: State<'_, SharedState>, id: String, config: 
         share_split,
         suggest_share,
         auto_ctx,
+        auto_kv,
+        share_fit,
     })
 }
 
@@ -581,8 +775,9 @@ pub async fn get_load_defaults(state: State<'_, SharedState>, id: String) -> Cmd
     } else if let Some(c) = parse(&m.last_config) {
         (c, "last_used")
     } else {
-        // No saved choice: Auto context (fits the hardware at load time).
-        let c = LoadConfig { n_ctx: 0, ..LoadConfig::default() };
+        // No saved choice: Auto context and Auto KV cache type (both fit
+        // the hardware at load time). Speculative decoding stays off.
+        let c = LoadConfig { n_ctx: 0, cache_type_auto: true, ..LoadConfig::default() };
         (c, "app_default")
     };
     Ok(LoadDefaults {
@@ -603,6 +798,209 @@ pub async fn save_model_defaults(state: State<'_, SharedState>, id: String, conf
 #[tauri::command]
 pub async fn reset_model_defaults(state: State<'_, SharedState>, id: String) -> Cmd<()> {
     state.db.clear_model_default_config(&id).await
+}
+
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+    use inference::{FlashAttention, RuntimeCapabilities};
+    use std::path::Path;
+    use system_monitor::CoreTopology;
+
+    const GIB: u64 = 1 << 30;
+
+    fn dense() -> ModelMetadata {
+        ModelMetadata {
+            architecture: Some("llama".into()),
+            block_count: Some(32),
+            embedding_length: Some(4096),
+            head_count: Some(32),
+            head_count_kv: Some(8),
+            vocab_size: Some(128_256),
+            context_length: Some(131_072),
+            ..Default::default()
+        }
+    }
+
+    fn share(n_ctx: u32) -> LoadConfig {
+        LoadConfig { n_ctx, share_with_cpu: true, ..Default::default() }
+    }
+
+    const HELP: &str = "\
+-c,    --ctx-size N                     x
+-t,    --threads N                      x
+-tb,   --threads-batch N                x
+-ngl,  --gpu-layers, --n-gpu-layers N   x
+-fa,   --flash-attn [on|off|auto]       x
+-ctk,  --cache-type-k TYPE              KV cache data type for K
+                                        allowed values: f32, f16, bf16, q8_0, q4_0
+-ctv,  --cache-type-v TYPE              x
+-fit,  --fit [on|off]                   x
+-fitt, --fit-target MiB0,MiB1,MiB2,...
+-fitc, --fit-ctx N                      x
+-ncmoe, --n-cpu-moe N                   x
+";
+
+    fn args(c: &LoadConfig, help: &str) -> Vec<String> {
+        c.to_args(Path::new("m.gguf"), None, 1, &RuntimeCapabilities::parse(help)).args
+    }
+
+    fn val<'a>(a: &'a [String], f: &str) -> Option<&'a str> {
+        a.iter().position(|x| x == f).and_then(|i| a.get(i + 1)).map(String::as_str)
+    }
+
+    #[test]
+    fn share_with_fit_lets_llama_cpp_pick_the_layers_at_our_context() {
+        // 16 GB dense model, 8 GiB free: the estimate splits it, llama.cpp fits it.
+        let (c, s) = resolve_share(&share(32_768), &dense(), 16_000_000_000, 0, Some(8 * GIB), true, true);
+        let s = s.expect("preview split");
+        assert!(!s.all_fit && s.gpu_layers > 0 && s.gpu_layers < 33, "{s:?}");
+        assert_eq!(c.gpu_layers, GpuLayers::Auto);
+        assert_eq!((c.fit, c.fit_target_mib, c.fit_ctx, c.n_ctx, c.n_cpu_moe), (true, Some(1024), Some(32_768), 32_768, None));
+        let a = args(&c, HELP);
+        assert!(!a.iter().any(|x| x == "--n-gpu-layers"), "{a:?}");
+        assert_eq!((val(&a, "--fit"), val(&a, "--fit-target"), val(&a, "--ctx-size"), val(&a, "--fit-ctx")), (Some("on"), Some("1024"), Some("32768"), Some("32768")));
+        // The config's margin (the benchmark's A/B) wins over the default.
+        let (c, _) = resolve_share(&LoadConfig { fit_target_mib: Some(512), ..share(32_768) }, &dense(), 16_000_000_000, 0, Some(8 * GIB), true, true);
+        assert_eq!(val(&args(&c, HELP), "--fit-target"), Some("512"));
+        // A model that fits is fitted the same way (llama.cpp keeps it all on the GPU).
+        let (c, s) = resolve_share(&share(4096), &dense(), 4_900_000_000, 0, Some(12 * GIB), true, true);
+        assert!(s.unwrap().all_fit && c.gpu_layers == GpuLayers::Auto && c.fit_target_mib == Some(1024));
+        // No VRAM reading: fitted too.
+        let (c, s) = resolve_share(&share(4096), &dense(), 4_900_000_000, 0, None, true, true);
+        assert!(s.is_none() && c.gpu_layers == GpuLayers::Auto && c.fit_ctx == Some(4096));
+        // Off: untouched.
+        let off = LoadConfig { n_ctx: 4096, ..Default::default() };
+        assert_eq!(resolve_share(&off, &dense(), 16_000_000_000, 0, Some(8 * GIB), true, true).0, off);
+    }
+
+    #[test]
+    fn share_without_fit_flags_falls_back_to_the_estimated_layer_count() {
+        let (c, s) = resolve_share(&share(32_768), &dense(), 16_000_000_000, 0, Some(8 * GIB), true, false);
+        let s = s.unwrap();
+        assert_eq!(c.gpu_layers, GpuLayers::Count(s.gpu_layers as u32));
+        assert!(c.fit_target_mib.is_none() && c.fit_ctx.is_none());
+        let old_help = "-c, --ctx-size N x\n-ngl,  --gpu-layers, --n-gpu-layers N   x\n-fit,  --fit [on|off]                   x\n";
+        assert!(!runtime_can_fit(&RuntimeCapabilities::parse(old_help)) && runtime_can_fit(&RuntimeCapabilities::parse(HELP)));
+        assert_eq!(val(&args(&c, old_help), "--n-gpu-layers"), Some(s.gpu_layers.to_string().as_str()));
+        // Fits fully: all layers, as before.
+        let (c, _) = resolve_share(&share(4096), &dense(), 4_900_000_000, 0, Some(12 * GIB), true, false);
+        assert_eq!(c.gpu_layers, GpuLayers::All);
+    }
+
+    #[test]
+    fn share_moe_path_is_unchanged() {
+        let moe = ModelMetadata { expert_count: Some(64), ..dense() };
+        for can_fit in [true, false] {
+            let (c, s) = resolve_share(&share(8192), &moe, 16_000_000_000, 0, Some(8 * GIB), true, can_fit);
+            let n = s.unwrap().n_cpu_moe.expect("moe split");
+            assert_eq!((c.gpu_layers, c.n_cpu_moe, c.fit_target_mib), (GpuLayers::All, Some(n as u32), None), "can_fit {can_fit}");
+            assert_eq!(val(&args(&c, HELP), "--n-cpu-moe"), Some(n.to_string().as_str()));
+        }
+        // Nothing fits at all: CPU only, as before.
+        let (c, _) = resolve_share(&share(8192), &dense(), 16_000_000_000, 0, Some(0), true, true);
+        assert_eq!(c.gpu_layers, GpuLayers::CpuOnly);
+    }
+
+    const KV: KvSupport = KvSupport { q8_0: true, flash_attn: true };
+
+    #[test]
+    fn auto_kv_q8_rules() {
+        let auto = LoadConfig { n_ctx: 0, cache_type_auto: true, ..Default::default() };
+        // Big cache, shared with the CPU: q8_0 for K and V with Flash Attention on.
+        assert_eq!(auto_kv_choice(&auto, 2 * GIB, true, KV), Some(("q8_0", "q8_0", true)));
+        // Small cache, fully on the GPU, or no q8_0 in the build: f16 stays.
+        assert_eq!(auto_kv_choice(&auto, GIB, true, KV), None);
+        assert_eq!(auto_kv_choice(&auto, 2 * GIB, false, KV), None);
+        assert_eq!(auto_kv_choice(&auto, 2 * GIB, true, KvSupport { q8_0: false, flash_attn: true }), None);
+        // Flash Attention off (or missing): only K is quantized.
+        let fa_off = LoadConfig { flash_attention: FlashAttention::Off, ..auto.clone() };
+        assert_eq!(auto_kv_choice(&fa_off, 2 * GIB, true, KV), Some(("q8_0", "f16", false)));
+        assert_eq!(auto_kv_choice(&auto, 2 * GIB, true, KvSupport { q8_0: true, flash_attn: false }), Some(("q8_0", "f16", false)));
+        // The user's explicit type always wins, and CPU only is left alone.
+        let explicit = LoadConfig { cache_type_auto: false, ..auto.clone() };
+        assert_eq!(auto_kv_choice(&explicit, 8 * GIB, true, KV), None);
+        assert_eq!(auto_kv_choice(&LoadConfig { gpu_layers: GpuLayers::CpuOnly, ..auto.clone() }, 8 * GIB, true, KV), None);
+    }
+
+    #[test]
+    fn auto_kv_on_the_27b_reaches_a_larger_context() {
+        // Qwen3.8-27B Q4_K_M, 7 GiB free VRAM, 28 GiB available RAM, Share with CPU, Auto context.
+        let m = ModelMetadata {
+            architecture: Some("qwen35".into()),
+            block_count: Some(65),
+            context_length: Some(262_144),
+            embedding_length: Some(5120),
+            head_count: Some(24),
+            head_count_kv: Some(4),
+            key_length: Some(256),
+            value_length: Some(256),
+            vocab_size: Some(248_320),
+            mtp_layers: Some(1),
+            full_attention_interval: Some(4),
+            ..Default::default()
+        };
+        let size = 16_810_714_336;
+        let cfg = LoadConfig { n_ctx: 0, share_with_cpu: true, cache_type_auto: true, ..Default::default() };
+        let (c, a) = resolve_auto_kv(&cfg, &m, size, 0, Some(7 * GIB), true, KV);
+        assert_eq!((c.cache_type_k.as_str(), c.cache_type_v.as_str(), c.flash_attention), ("q8_0", "q8_0", FlashAttention::On));
+        let (sized, _) = resolve_auto_ctx(&c, &m, size, 0, Some(7 * GIB), 28 * GIB, true, true);
+        let f16 = LoadConfig { cache_type_auto: false, ..cfg.clone() };
+        let (sized16, _) = resolve_auto_ctx(&f16, &m, size, 0, Some(7 * GIB), 28 * GIB, true, true);
+        assert!(sized.n_ctx >= sized16.n_ctx, "q8 {} vs f16 {}", sized.n_ctx, sized16.n_ctx);
+        assert!(sized.n_ctx > 131_072, "{}", sized.n_ctx);
+        let mut a = a.unwrap();
+        finish_auto_kv(&mut a, &sized, &m, size, 0);
+        assert!(a.saves_bytes > GIB && a.summary.starts_with("KV cache: q8_0 (auto, saves "), "{a:?}");
+        // Manual KV type: untouched.
+        let manual = LoadConfig { cache_type_auto: false, cache_type_k: "f16".into(), ..cfg.clone() };
+        assert_eq!(resolve_auto_kv(&manual, &m, size, 0, Some(7 * GIB), true, KV), (manual.clone(), None));
+        // Small model fully on the GPU: f16 (auto).
+        let small = LoadConfig { n_ctx: 8192, cache_type_auto: true, ..Default::default() };
+        let (c, a) = resolve_auto_kv(&small, &dense(), 4_900_000_000, 0, Some(12 * GIB), true, KV);
+        assert_eq!((c.cache_type_k.as_str(), a.unwrap().cache_type_k.as_str()), ("f16", "f16"));
+    }
+
+    #[test]
+    fn hybrid_cpu_thread_policy() {
+        let ultra7 = CoreTopology { performance_cores: 8, efficiency_cores: 12 };
+        assert_eq!(hybrid_cpu_threads(Some(ultra7), true), Some((12, 20)));
+        // Everything on the GPU, a non-hybrid CPU or no reading: defaults.
+        assert_eq!(hybrid_cpu_threads(Some(ultra7), false), None);
+        assert_eq!(hybrid_cpu_threads(Some(CoreTopology { performance_cores: 8, efficiency_cores: 0 }), true), None);
+        assert_eq!(hybrid_cpu_threads(None, true), None);
+        // 6P + 2E: P + 4 capped at the physical cores.
+        assert_eq!(hybrid_cpu_threads(Some(CoreTopology { performance_cores: 6, efficiency_cores: 2 }), true), Some((8, 8)));
+        let caps = RuntimeCapabilities::parse(HELP);
+        let c = apply_thread_policy(&LoadConfig::default(), Some(ultra7), true, &caps);
+        assert_eq!((c.threads, c.threads_batch), (Some(12), Some(20)));
+        let a = args(&c, HELP);
+        assert_eq!((val(&a, "--threads"), val(&a, "--threads-batch")), (Some("12"), Some("20")));
+        // The user's own counts win.
+        let mine = apply_thread_policy(&LoadConfig { threads: Some(6), ..Default::default() }, Some(ultra7), true, &caps);
+        assert_eq!((mine.threads, mine.threads_batch), (Some(6), Some(20)));
+        // A build without the flags gets nothing (no "unsupported" noise).
+        let none = apply_thread_policy(&LoadConfig::default(), Some(ultra7), true, &RuntimeCapabilities::parse("-c, --ctx-size N x\n"));
+        assert_eq!((none.threads, none.threads_batch), (None, None));
+    }
+
+    #[test]
+    fn which_loads_run_layers_on_the_cpu() {
+        let split = |all_fit| ShareSplit { gpu_layers: 16, total_layers: 33, n_cpu_moe: None, all_fit, vram_bytes: 0, summary: String::new() };
+        let auto = LoadConfig::default();
+        assert!(cpu_runs_layers(&auto, 33, true, Some(&split(false)), None));
+        assert!(!cpu_runs_layers(&auto, 33, true, Some(&split(true)), None));
+        assert!(!cpu_runs_layers(&auto, 33, true, None, Some(true)));
+        assert!(cpu_runs_layers(&auto, 33, true, None, Some(false)));
+        assert!(!cpu_runs_layers(&auto, 33, true, None, None));
+        assert!(!cpu_runs_layers(&LoadConfig { gpu_layers: GpuLayers::All, ..auto.clone() }, 33, true, None, None));
+        assert!(cpu_runs_layers(&LoadConfig { gpu_layers: GpuLayers::Count(20), ..auto.clone() }, 33, true, None, None));
+        assert!(!cpu_runs_layers(&LoadConfig { gpu_layers: GpuLayers::Count(33), ..auto.clone() }, 33, true, None, None));
+        assert!(cpu_runs_layers(&LoadConfig { gpu_layers: GpuLayers::CpuOnly, ..auto.clone() }, 33, true, None, None));
+        assert!(cpu_runs_layers(&LoadConfig { n_cpu_moe: Some(4), gpu_layers: GpuLayers::All, ..auto.clone() }, 33, true, None, None));
+        assert!(cpu_runs_layers(&LoadConfig { kv_offload: false, ..auto.clone() }, 33, true, None, Some(true)));
+        assert!(cpu_runs_layers(&auto, 33, false, None, None), "CPU runtime");
+    }
 }
 
 #[cfg(test)]

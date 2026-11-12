@@ -52,50 +52,84 @@ pub async fn do_load(st: &SharedState, model_id: String, config: LoadConfig, run
     }
     let runtime = resolve_runtime(&st, runtime_id).await?;
     let meta: model_registry::ModelMetadata = serde_json::from_str(&m.metadata).unwrap_or_default();
+    if config.speculative.as_deref().is_some_and(|s| s.split(',').any(|t| t == "draft-mtp")) && meta.mtp_layers.unwrap_or(0) == 0 {
+        return Err(AppError::InvalidInput(format!("{} has no multi-token-prediction (MTP) layers, so it can't use speculative decoding with draft-mtp", m.display_name)));
+    }
     let projector = super::models::projector_bytes(&config, m.projector_path.as_deref());
     // "Share with CPU" and an Auto context are measured from free memory
     // right now. A model that is already loaded would make VRAM look full,
     // so unload it first (a load replaces it anyway).
-    if (config.n_ctx == 0 || config.share_with_cpu)
+    if (config.n_ctx == 0 || config.share_with_cpu || config.cache_type_auto)
         && runtime.uses_gpu()
         && let Some(pid) = st.engine.backend_pid()
     {
         do_unload(&st).await?;
         wait_for_vram_release(&st, pid).await;
     }
-    // Auto context (n_ctx 0): llama-server would allocate the full trained
-    // context, which can run out of memory, so the app picks the size.
-    let (config_ctx, auto) = super::models::resolve_auto_ctx(
+    let free = super::models::free_vram(&st);
+    let available_ram = st.monitor.hardware_info().available_ram_bytes;
+    let caps = &runtime.capabilities;
+    // "Auto" KV cache type: q8_0 for a big cache on a model that shares the
+    // GPU with the CPU. Decided first, so the Auto context can use the room.
+    let (config_kv, auto_kv) = super::models::resolve_auto_kv(
         &config,
         &meta,
         m.size as u64,
         projector,
-        super::models::free_vram(&st),
-        st.monitor.hardware_info().available_ram_bytes,
-        runtime.capabilities.has("--n-cpu-moe"),
+        free,
+        runtime.uses_gpu(),
+        super::models::KvSupport::of(caps),
+    );
+    // Auto context (n_ctx 0): llama-server would allocate the full trained
+    // context, which can run out of memory, so the app picks the size.
+    let (config_ctx, auto) = super::models::resolve_auto_ctx(
+        &config_kv,
+        &meta,
+        m.size as u64,
+        projector,
+        free,
+        available_ram,
+        caps.has("--n-cpu-moe"),
         runtime.uses_gpu(),
     );
     if let Some(a) = &auto {
         tracing::info!("Auto context: {} tokens ({})", a.n_ctx, a.summary);
     }
-    // "Share with CPU": pick the GPU/CPU split from free VRAM right now.
+    if let Some(mut a) = auto_kv {
+        super::models::finish_auto_kv(&mut a, &config_ctx, &meta, m.size as u64, projector);
+        tracing::info!("{}", a.summary);
+    }
+    // "Share with CPU": llama.cpp fits the layers to free VRAM (--fit), or
+    // on older builds the app's estimate picks the split.
+    let mut split = None;
     let effective = if config.share_with_cpu && runtime.uses_gpu() {
-        let (c, split) = super::models::resolve_share(
+        let (c, s) = super::models::resolve_share(
             &config_ctx,
             &meta,
             m.size as u64,
             projector,
-            super::models::free_vram(&st),
-            runtime.capabilities.has("--n-cpu-moe"),
+            free,
+            caps.has("--n-cpu-moe"),
+            super::models::runtime_can_fit(caps),
         );
-        if let Some(s) = &split {
-            tracing::info!("Share with CPU: {}", s.summary);
+        if let Some(s) = &s {
+            tracing::info!("Share with CPU (estimate): {}", s.summary);
         }
-        c.validate().map_err(AppError::InvalidInput)?;
+        split = s;
         c
     } else {
         config_ctx
     };
+    // Hybrid CPUs: threads on the P-cores when the CPU runs layers.
+    let total_layers = meta.block_count.unwrap_or(0) + 1;
+    let full_gpu_fits = free.map(|f| {
+        let mut i = super::models::estimate_input(&effective, &meta, total_layers, projector);
+        i.gpu_layers = None;
+        model_registry::estimate::estimate(&meta, m.size as u64, &i).vram_bytes <= (f as f64 * 0.90) as u64
+    });
+    let on_cpu = super::models::cpu_runs_layers(&effective, total_layers, runtime.uses_gpu(), split.as_ref(), full_gpu_fits);
+    let effective = super::models::apply_thread_policy(&effective, system_monitor::core_topology(), on_cpu, caps);
+    effective.validate().map_err(AppError::InvalidInput)?;
     // The model's "last used" keeps the user's choice (share_with_cpu, Auto
     // context), not the resolved values, so the next load re-measures.
     let cfg_json = serde_json::to_value(&config)?;

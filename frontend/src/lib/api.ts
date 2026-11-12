@@ -30,7 +30,11 @@ export interface ResourceSnapshot {
 }
 
 // ---------- runtimes ----------
-export interface RuntimeCapabilities { flags: string[]; cache_types: string[]; load_modes: string[] }
+export interface RuntimeCapabilities {
+  flags: string[]; cache_types: string[]; load_modes: string[];
+  /** `--spec-type` values (e.g. "draft-mtp"); empty until the runtime is probed again. */
+  spec_types?: string[];
+}
 export interface InstalledRuntime {
   id: string; tag: string; variant: string; server_path: string; installed_at: string;
   source: string; capabilities: RuntimeCapabilities;
@@ -52,6 +56,8 @@ export interface ModelMetadata {
   embedding_length: number | null; head_count: number | null; head_count_kv: number | null;
   expert_count: number | null; vocab_size: number | null; has_chat_template: boolean;
   split_count: number | null; is_projector: boolean; gguf_version: number;
+  /** Multi-token-prediction (NextN) layers: speculative decoding with `--spec-type draft-mtp`. */
+  mtp_layers?: number | null;
 }
 export interface ModelView {
   id: string; repo_id: string | null; path: string; format: string; quantization: string | null;
@@ -74,6 +80,15 @@ export interface LoadConfig {
   share_with_cpu?: boolean;
   /** MoE: expert weights of the first N layers stay on the CPU (set by the app). */
   n_cpu_moe?: number | null;
+  /** Free VRAM margin `--fit` keeps per device, MiB (null = llama.cpp default 1024). */
+  fit_target_mib?: number | null;
+  /** Smallest context `--fit` may choose (set by the app to the chosen context). */
+  fit_ctx?: number | null;
+  /** KV cache type "Auto": the app picks q8_0 for big caches shared with the CPU. */
+  cache_type_auto?: boolean;
+  /** Speculative decoding type (`--spec-type`), e.g. "draft-mtp"; null = off. */
+  speculative?: string | null;
+  spec_draft_n_max?: number | null;
 }
 export interface LoadDefaults {
   config: LoadConfig; source: "model_default" | "last_used" | "app_default";
@@ -92,6 +107,13 @@ export interface EstimateView {
   suggest_share: boolean;
   /** What "Auto (fits your hardware)" context picks now; the estimate uses it when n_ctx is 0. */
   auto_ctx: AutoCtx;
+  /** What the "Auto" KV cache type picks now (null: an explicit type). */
+  auto_kv: AutoKv | null;
+  /** Share with CPU is on and llama.cpp fits the layers itself: share_split is only an estimate. */
+  share_fit: boolean;
+}
+export interface AutoKv {
+  cache_type_k: string; cache_type_v: string; flash_attention_on: boolean; saves_bytes: number; summary: string;
 }
 export interface AutoCtx {
   n_ctx: number; trained: number | null;

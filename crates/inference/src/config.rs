@@ -86,6 +86,23 @@ pub struct LoadConfig {
     /// MoE models: keep the expert weights of the first N layers on the CPU
     /// (`--n-cpu-moe N`). Set by the app when it resolves Share with CPU.
     pub n_cpu_moe: Option<u32>,
+    /// Free-memory margin per device that `--fit` keeps (`--fit-target`, MiB).
+    /// None = llama.cpp's default (1024). Share with CPU always passes it.
+    pub fit_target_mib: Option<u32>,
+    /// Smallest context `--fit` may pick (`--fit-ctx`). Set by the app to the
+    /// context it chose, so fitting can never trade context for layers
+    /// (`-c` is passed explicitly as well).
+    pub fit_ctx: Option<u32>,
+    /// KV cache type left to the app ("Auto"): for big caches on a model
+    /// that is split with the CPU it picks q8_0 at load time
+    /// (see `resolve_auto_kv` in the app). An explicit K/V choice turns this
+    /// off. Off in configs saved before it existed.
+    pub cache_type_auto: bool,
+    /// Speculative decoding type (`--spec-type`, e.g. "draft-mtp", which uses
+    /// the model's own multi-token-prediction layers). None = off.
+    pub speculative: Option<String>,
+    /// Most tokens drafted per step (`--spec-draft-n-max`); None = llama.cpp default (3).
+    pub spec_draft_n_max: Option<u32>,
 }
 
 impl Default for LoadConfig {
@@ -110,9 +127,17 @@ impl Default for LoadConfig {
             fit: true,
             share_with_cpu: false,
             n_cpu_moe: None,
+            fit_target_mib: None,
+            fit_ctx: None,
+            cache_type_auto: false,
+            speculative: None,
+            spec_draft_n_max: None,
         }
     }
 }
+
+/// llama.cpp's default `--fit-target` margin per device, in MiB.
+pub const DEFAULT_FIT_TARGET_MIB: u32 = 1024;
 
 /// Result of mapping a config to flags: the argv, plus settings the installed
 /// build cannot honour (shown to the user, never silently dropped).
@@ -143,6 +168,17 @@ impl LoadConfig {
                 return Err("thread count must be between 1 and 512".into());
             }
         }
+        if self.fit_target_mib.is_some_and(|m| m > 65_536) {
+            return Err("the fit margin must be at most 65536 MiB".into());
+        }
+        if let Some(s) = &self.speculative
+            && (s.is_empty() || s.len() > 128 || !s.split(',').all(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')))
+        {
+            return Err(format!("unknown speculative decoding type {s:?}"));
+        }
+        if self.spec_draft_n_max.is_some_and(|n| n == 0 || n > 64) {
+            return Err("draft tokens per step must be between 1 and 64".into());
+        }
         Ok(())
     }
 
@@ -168,6 +204,7 @@ impl LoadConfig {
     ) -> BuiltArgs {
         let mut a: Vec<String> = Vec::new();
         let mut unsupported = Vec::new();
+        let mut spec_unsupported = None;
         let mut push = |flag: &str, val: Option<String>, label: &str, a: &mut Vec<String>| {
             if caps.has(flag) {
                 a.push(flag.into());
@@ -186,7 +223,11 @@ impl LoadConfig {
             a.extend(["--alias".into(), name.to_string()]);
         }
         push("--ctx-size", Some(self.n_ctx.to_string()), "context length", &mut a);
+        let fitting = self.fit && caps.has("--fit");
         match self.gpu_layers {
+            // With --fit on, an unset -ngl is what llama.cpp fits to free
+            // memory (`-ngl auto` is the same default); pass none.
+            GpuLayers::Auto if fitting => {}
             GpuLayers::Auto => push("--n-gpu-layers", Some("auto".into()), "GPU layers", &mut a),
             GpuLayers::All => push("--n-gpu-layers", Some("all".into()), "GPU layers", &mut a),
             GpuLayers::Count(n) => push("--n-gpu-layers", Some(n.to_string()), "GPU layers", &mut a),
@@ -250,6 +291,25 @@ impl LoadConfig {
         if caps.has("--fit") {
             a.extend(["--fit".into(), if self.fit { "on" } else { "off" }.into()]);
         }
+        if fitting {
+            if let Some(m) = self.fit_target_mib {
+                push("--fit-target", Some(m.to_string()), "fit margin", &mut a);
+            }
+            if let Some(n) = self.fit_ctx {
+                push("--fit-ctx", Some(n.to_string()), "smallest context for fitting", &mut a);
+            }
+        }
+        if let Some(t) = &self.speculative {
+            let all_known = t.split(',').all(|x| caps.has_spec_type(x));
+            if all_known {
+                push("--spec-type", Some(t.clone()), "speculative decoding", &mut a);
+                if let Some(n) = self.spec_draft_n_max {
+                    push("--spec-draft-n-max", Some(n.to_string()), "draft tokens per step", &mut a);
+                }
+            } else {
+                spec_unsupported = Some(format!("speculative decoding ({t} not in this llama.cpp build's --spec-type)"));
+            }
+        }
         match (self.load_projector, projector) {
             (true, Some(p)) => push("--mmproj", Some(p.to_string_lossy().into_owned()), "vision projector", &mut a),
             _ if caps.has("--no-mmproj") => a.push("--no-mmproj".into()),
@@ -274,6 +334,7 @@ impl LoadConfig {
         if caps.has("--log-colors") {
             a.extend(["--log-colors".into(), "off".into()]);
         }
+        unsupported.extend(spec_unsupported);
         BuiltArgs { args: a, unsupported }
     }
 }
@@ -297,6 +358,10 @@ mod tests {
 -lm,   --load-mode MODE                 x
 -np,   --parallel N                     x
 -fit,  --fit [on|off]                   x
+-fitt, --fit-target MiB0,MiB1,MiB2,...
+-fitc, --fit-ctx N                      x
+--spec-type none,draft-simple,draft-eagle3,draft-mtp,ngram-simple
+--spec-draft-n-max N                    x
 -ncmoe, --n-cpu-moe N                   x
 --jinja, --no-jinja                     x
 --ui,  --webui, --no-ui, --no-webui     x
@@ -336,6 +401,66 @@ mod tests {
         // A config saved before these fields existed still parses.
         let saved: LoadConfig = serde_json::from_str(r#"{"n_ctx": 4096, "gpu_layers": {"mode": "all"}}"#).unwrap();
         assert!(!saved.share_with_cpu && saved.n_cpu_moe.is_none() && saved.n_ctx == 4096);
+    }
+
+    fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(String::as_str)
+    }
+
+    #[test]
+    fn share_mode_fit_args_have_no_ngl_and_an_explicit_context() {
+        // What resolve_share produces on a runtime with --fit-target.
+        let cfg = LoadConfig {
+            n_ctx: 131_072,
+            gpu_layers: GpuLayers::Auto,
+            fit: true,
+            share_with_cpu: true,
+            fit_target_mib: Some(DEFAULT_FIT_TARGET_MIB),
+            fit_ctx: Some(131_072),
+            ..Default::default()
+        };
+        let b = cfg.to_args(Path::new("m.gguf"), None, 1, &caps(NEW_HELP));
+        assert!(!b.args.iter().any(|a| a == "--n-gpu-layers"), "{:?}", b.args);
+        assert_eq!(flag_value(&b.args, "--fit"), Some("on"));
+        assert_eq!(flag_value(&b.args, "--fit-target"), Some("1024"));
+        assert_eq!(flag_value(&b.args, "--fit-ctx"), Some("131072"));
+        assert_eq!(flag_value(&b.args, "--ctx-size"), Some("131072"));
+        assert!(b.unsupported.is_empty(), "{:?}", b.unsupported);
+        // The benchmark's 512 MiB margin.
+        let half = LoadConfig { fit_target_mib: Some(512), ..cfg.clone() };
+        assert_eq!(flag_value(&half.to_args(Path::new("m.gguf"), None, 1, &caps(NEW_HELP)).args, "--fit-target"), Some("512"));
+        // --fit off: Auto layers are passed as before, no margin.
+        let off = LoadConfig { fit: false, ..cfg.clone() };
+        let o = off.to_args(Path::new("m.gguf"), None, 1, &caps(NEW_HELP)).args;
+        assert_eq!(flag_value(&o, "--n-gpu-layers"), Some("auto"));
+        assert!(flag_value(&o, "--fit-target").is_none() && flag_value(&o, "--fit-ctx").is_none());
+        // A build without --fit keeps -ngl auto.
+        let old = cfg.to_args(Path::new("m.gguf"), None, 1, &caps("-c, --ctx-size N x\n-ngl,  --gpu-layers, --n-gpu-layers N   x\n")).args;
+        assert_eq!(flag_value(&old, "--n-gpu-layers"), Some("auto"));
+        // An explicit count is always passed.
+        let n = LoadConfig { gpu_layers: GpuLayers::Count(16), fit_target_mib: None, fit_ctx: None, ..cfg };
+        assert_eq!(flag_value(&n.to_args(Path::new("m.gguf"), None, 1, &caps(NEW_HELP)).args, "--n-gpu-layers"), Some("16"));
+    }
+
+    #[test]
+    fn speculative_decoding_flags_and_validation() {
+        let cfg = LoadConfig { speculative: Some("draft-mtp".into()), spec_draft_n_max: Some(4), ..Default::default() };
+        assert!(cfg.validate().is_ok());
+        let b = cfg.to_args(Path::new("m.gguf"), None, 1, &caps(NEW_HELP));
+        assert_eq!(flag_value(&b.args, "--spec-type"), Some("draft-mtp"));
+        assert_eq!(flag_value(&b.args, "--spec-draft-n-max"), Some("4"));
+        // Off by default: nothing passed.
+        let d = LoadConfig::default().to_args(Path::new("m.gguf"), None, 1, &caps(NEW_HELP)).args;
+        assert!(!d.iter().any(|a| a.starts_with("--spec")), "{d:?}");
+        // A type the build does not list is reported, not passed.
+        let x = LoadConfig { speculative: Some("draft-dflash".into()), ..Default::default() }.to_args(Path::new("m.gguf"), None, 1, &caps(NEW_HELP));
+        assert!(!x.args.iter().any(|a| a == "--spec-type") && x.unsupported.iter().any(|u| u.contains("draft-dflash")), "{:?}", x.unsupported);
+        assert!(LoadConfig { speculative: Some("draft-mtp; rm".into()), ..Default::default() }.validate().is_err());
+        assert!(LoadConfig { spec_draft_n_max: Some(0), ..Default::default() }.validate().is_err());
+        assert!(LoadConfig { fit_target_mib: Some(1 << 20), ..Default::default() }.validate().is_err());
+        // Saved configs from before these fields: all off.
+        let saved: LoadConfig = serde_json::from_str(r#"{"n_ctx": 4096}"#).unwrap();
+        assert!(saved.speculative.is_none() && saved.fit_target_mib.is_none() && !saved.cache_type_auto);
     }
 
     #[test]
