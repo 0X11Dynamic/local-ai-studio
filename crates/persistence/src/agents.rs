@@ -232,9 +232,34 @@ impl Db {
             .await
             .map_err(db_err)?
             .rows_affected();
-        sqlx::query("UPDATE subagents SET state = 'interrupted' WHERE state IN ('queued', 'running', 'waiting')").execute(self.pool()).await.map_err(db_err)?;
+        sqlx::query("UPDATE subagents SET state = 'interrupted' WHERE state IN ('queued', 'running', 'waiting', 'waiting_for_user')").execute(self.pool()).await.map_err(db_err)?;
         sqlx::query("UPDATE agent_steps SET state = 'interrupted', ended_at = ? WHERE state = 'running'").bind(now_rfc3339()).execute(self.pool()).await.map_err(db_err)?;
+        // A task whose main agent asked the user a question stays `waiting_for_user`
+        // (its question can still be answered, which then resumes it). Subagents
+        // are not resumed, so their questions end with them.
+        sqlx::query("UPDATE agent_steps SET state = 'interrupted', ended_at = ? WHERE kind = 'question' AND state = 'waiting' AND parent_agent_id IS NOT NULL")
+            .bind(now_rfc3339())
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?;
         Ok(a)
+    }
+
+    /// Questions (`ask_user`) still waiting for an answer, in every task.
+    pub async fn waiting_questions(&self) -> AppResult<Vec<AgentStepRow>> {
+        sqlx::query_as::<_, AgentStepRow>("SELECT * FROM agent_steps WHERE kind = 'question' AND state = 'waiting' ORDER BY started_at").fetch_all(self.pool()).await.map_err(db_err)
+    }
+
+    /// End a run's waiting questions (cancelled, or answered another way).
+    pub async fn close_waiting_questions(&self, run_id: &str, state: &str) -> AppResult<()> {
+        sqlx::query("UPDATE agent_steps SET state = ?, ended_at = ? WHERE run_id = ? AND kind = 'question' AND state = 'waiting'")
+            .bind(state)
+            .bind(now_rfc3339())
+            .bind(run_id)
+            .execute(self.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(())
     }
 
     // ---------- steps ----------
@@ -405,5 +430,28 @@ mod tests {
         db.delete_run(&id).await.unwrap();
         assert!(db.list_subagents(&id).await.unwrap().is_empty() && db.list_steps(&id).await.unwrap().is_empty());
         assert!(db.grants_for_tool("builtin:local/shell_execute").await.unwrap().is_empty(), "task grants go with the task");
+    }
+
+    #[tokio::test]
+    async fn a_question_waiting_for_the_user_survives_a_restart() {
+        let db = Db::open_in_memory().await.unwrap();
+        let id = db.create_run("Ask", "pick a color", None, &serde_json::json!({}), &serde_json::json!({})).await.unwrap();
+        let sub = db.create_subagent(&id, "A", "paint", &serde_json::json!({}), &serde_json::json!({})).await.unwrap();
+        db.set_run_state(&id, "waiting_for_user", None, None).await.unwrap();
+        db.set_subagent_state(&sub, "waiting_for_user", None, None).await.unwrap();
+        let q1 = db.add_step(&id, None, "question", &serde_json::json!({ "question": "Which?" }), "waiting").await.unwrap();
+        let q2 = db.add_step(&id, Some(&sub), "question", &serde_json::json!({ "question": "Size?" }), "waiting").await.unwrap();
+        assert_eq!(db.waiting_questions().await.unwrap().len(), 2);
+        // Restart: the main agent's question and the run's state stay; the subagent ends.
+        assert_eq!(db.interrupt_running_runs().await.unwrap(), 0, "waiting_for_user is not interrupted");
+        assert_eq!(db.get_run(&id).await.unwrap().state, "waiting_for_user");
+        assert_eq!(db.get_subagent(&sub).await.unwrap().state, "interrupted");
+        let left = db.waiting_questions().await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, q1.id);
+        assert!(db.list_steps(&id).await.unwrap().iter().any(|s| s.id == q2.id && s.state == "interrupted"));
+        // Cancelling closes what is left.
+        db.close_waiting_questions(&id, "cancelled").await.unwrap();
+        assert!(db.waiting_questions().await.unwrap().is_empty());
     }
 }

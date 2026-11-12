@@ -10,3 +10,7 @@ serde.workspace = true
 sysinfo.workspace = true
 nvml-wrapper.workspace = true
 tracing.workspace = true
+
+# DXGI adapter list: finds AMD/Intel GPUs that NVML can't see (for the runtime recommender).
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Graphics_Dxgi"] }

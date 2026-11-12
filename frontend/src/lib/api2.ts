@@ -36,12 +36,14 @@ export interface SamplingParams {
   temperature: number | null; top_p: number | null; top_k: number | null; min_p: number | null;
   repeat_penalty: number | null; max_tokens: number | null; seed: number | null; stop: string[];
 }
-export interface Limits { max_tool_calls: number; max_wall_secs: number }
+export interface Limits { max_tool_calls: number | null; max_wall_secs: number | null }
 export interface ChatSettings {
   profile_id: string | null; sampling: SamplingParams; overflow: "warn" | "drop_oldest"; reserve_tokens: number;
   agent_mode: boolean; tool_servers: string[]; limits: Limits; builtin_tools: boolean; environment_id: string | null; skills: boolean; tool_mode: string;
   /** "chat" | "plan" | "agent"; empty in older chats (then agent_mode decides). Plan = agent_mode + mode "plan". */
   mode?: string;
+  /** MCP server ids turned off for this chat only (Tools menu); servers added later stay on. */
+  disabled_servers?: string[];
   /** Agent mode only: offer spawn_subagents (default off). */
   subagents?: boolean;
   /** Subagents running at once, 1-4 (default 2). */
@@ -66,6 +68,9 @@ export interface MessageStats {
   chat_template_kwargs?: Record<string, unknown> | null;
   /** Files attached to the message this replies to. */
   attachments?: number;
+  /** The reply had no visible answer even after one nudge (Agent/Plan mode); `note` says so. */
+  empty_answer?: boolean;
+  note?: string;
 }
 export interface Message {
   id: string; conversation_id: string; role: "user" | "assistant" | "system" | "tool"; content: string;
@@ -102,7 +107,7 @@ export interface SendStarted { user_message: Message | null; assistant_message_i
 // ---------- system instructions ----------
 export interface Sections { mode: "sections" | "raw"; identity: string; task: string; tool_use: string; formatting: string; raw: string }
 export interface InstructionProfile { id: string; title: string; builtin: boolean; sections: Sections; updated_at: string }
-export interface InstructionSettings { base: string; chat_profile_id: string | null; agent_profile_id: string | null }
+export interface InstructionSettings { base: string; chat_profile_id: string | null; agent_profile_id: string | null; plan_profile_id?: string | null }
 export interface InstructionPart { label: string; text: string; editable: boolean }
 export interface InstructionPreview {
   text: string; parts: InstructionPart[]; chars: number; tokens: number | null; templated_tokens: number | null;
@@ -162,7 +167,7 @@ export const api2 = {
   resetInstructionBase: () => invoke<string>("reset_instruction_base"),
   setModelProfile: (modelId: string, profileId: string | null) => invoke<void>("set_model_instruction_profile", { modelId, profileId }),
   getModelProfile: (modelId: string) => invoke<string | null>("get_model_instruction_profile", { modelId }),
-  previewInstructions: (mode: "chat" | "agent", sections: Sections, base: string | null) =>
+  previewInstructions: (mode: "chat" | "agent" | "plan", sections: Sections, base: string | null) =>
     invoke<InstructionPreview>("preview_instructions", { mode, sections, base }),
   testInstructions: (sections: Sections, base: string | null, prompt: string) =>
     invoke<{ content: string; reasoning: string; stats: ChatStatsOut }>("test_instructions", { sections, base, prompt }),

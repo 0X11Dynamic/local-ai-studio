@@ -24,14 +24,19 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
   const [err, setErr] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
   const [advanced, setAdvanced] = useState(false);
+  // Context: Auto (null; n_ctx 0, sized to free memory at load) or the typed number.
+  const [ctxText, setCtxText] = useState<string | null>(null);
+
+  const applyDefaults = (d: LoadDefaults) => {
+    setDefaults(d);
+    setCfg(d.config);
+    setCtxText(d.config.n_ctx === 0 ? null : String(d.config.n_ctx));
+  };
 
   useEffect(() => {
     setErr(null);
     setSaved(null);
-    api.getLoadDefaults(model.id).then((d) => {
-      setDefaults(d);
-      setCfg(d.config);
-    });
+    api.getLoadDefaults(model.id).then(applyDefaults);
   }, [model.id]);
 
   useEffect(() => {
@@ -64,10 +69,11 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
   const totalLayers = defaults?.total_layers ?? null;
 
   const ctxError = useMemo(() => {
-    if (!cfg) return null;
-    if (cfg.n_ctx !== 0 && cfg.n_ctx < 256) return "Use 0 for the model default, or at least 256.";
+    if (ctxText === null) return null;
+    const n = numOrNull(ctxText.replace(/[,\s]/g, ""));
+    if (n === null || n < 256) return "Enter at least 256 tokens, or choose Auto.";
     return null;
-  }, [cfg]);
+  }, [ctxText]);
 
   if (!cfg) return <div className="skeleton" />;
 
@@ -103,13 +109,31 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
   };
   const reset = async () => {
     await api.resetModelDefaults(model.id);
-    const d = await api.getLoadDefaults(model.id);
-    setDefaults(d);
-    setCfg(d.config);
+    applyDefaults(await api.getLoadDefaults(model.id));
     setSaved("Model default cleared.");
   };
 
   const disabled = loading || loaded;
+  // n_ctx 0 = Auto: the app picks the largest size that fits (resolved again at load).
+  const autoCtx = ctxText === null;
+  const setCtxMode = (mode: string) => {
+    if (mode === "auto") {
+      setCtxText(null);
+      set({ n_ctx: 0 });
+    } else {
+      const n = est?.auto_ctx.n_ctx ?? Math.min(8192, defaults?.trained_context ?? 8192);
+      setCtxText(String(n));
+      set({ n_ctx: n });
+    }
+  };
+  const typeCtx = (v: string) => {
+    setCtxText(v);
+    const n = numOrNull(v.replace(/[,\s]/g, ""));
+    // An invalid entry keeps the last valid size (the error blocks loading).
+    if (n !== null && n >= 256) set({ n_ctx: n });
+    else if (autoCtx) set({ n_ctx: est?.auto_ctx.n_ctx ?? 8192 });
+  };
+  const ctxTokens = autoCtx ? est?.auto_ctx.n_ctx ?? 0 : cfg.n_ctx;
   const sharing = !!cfg.share_with_cpu && !cpuRuntime;
   // Suggest only: the toggle is never switched on for the user.
   const suggestShare = !cpuRuntime && !cfg.share_with_cpu && !!est?.suggest_share;
@@ -138,11 +162,29 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
             {runtimes.map((r) => <option key={r.id} value={r.id}>{r.id}</option>)}
           </select>
         </div>
-        <div className="field">
-          <label htmlFor="ctx">Context length (tokens)</label>
-          <input id="ctx" className="input mono" inputMode="numeric" value={cfg.n_ctx} disabled={disabled}
-            onChange={(e) => set({ n_ctx: numOrNull(e.target.value) ?? 0 })} />
-          {ctxError ? <span className="err">{ctxError}</span> : <span className="help">Trained: {defaults?.trained_context?.toLocaleString() ?? "?"}. 0 uses that.</span>}
+        <div className="field ctx-field">
+          <label htmlFor="ctx-mode">Context length</label>
+          <div className="row ctx-row">
+            <select id="ctx-mode" className="input" value={autoCtx ? "auto" : "manual"} disabled={disabled}
+              onChange={(e) => setCtxMode(e.target.value)}>
+              <option value="auto">Auto (fits your hardware)</option>
+              <option value="manual">Manual</option>
+            </select>
+            <input id="ctx" className="input mono" inputMode="numeric" disabled={disabled}
+              aria-label={autoCtx ? "Context length in tokens (type a number to set it manually)" : "Context length in tokens"}
+              value={ctxText ?? ""} placeholder={autoCtx && est ? est.auto_ctx.n_ctx.toLocaleString() : ""}
+              aria-invalid={!!ctxError} aria-describedby="ctx-help"
+              onChange={(e) => typeCtx(e.target.value)} />
+          </div>
+          {ctxError ? (
+            <span className="err" id="ctx-help">{ctxError}</span>
+          ) : autoCtx ? (
+            <span className="help" id="ctx-help" aria-live="polite">
+              {est ? <><span className={est.auto_ctx.fits ? "ctx-auto-value" : "ctx-auto-value warn"}>Auto: {est.auto_ctx.n_ctx.toLocaleString()} tokens.</span> {est.auto_ctx.summary} Measured again when the model loads.</> : "Auto: picked from free memory when the model loads."}
+            </span>
+          ) : (
+            <span className="help" id="ctx-help">Trained: {defaults?.trained_context?.toLocaleString() ?? "?"}.{est ? ` Auto would pick ${est.auto_ctx.n_ctx.toLocaleString()}.` : ""}</span>
+          )}
         </div>
         <div className="field">
           <label htmlFor="gpu">GPU offload</label>
@@ -251,7 +293,7 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
             <label htmlFor="np">Parallel slots</label>
             <input id="np" className="input mono" value={cfg.parallel} disabled={disabled || !has("--parallel")}
               onChange={(e) => set({ parallel: Math.max(1, numOrNull(e.target.value) ?? 1) })} />
-            {cfg.parallel > 1 && <span className="help">Slots share the context: each gets about {Math.floor(cfg.n_ctx / cfg.parallel).toLocaleString()} tokens.</span>}
+            {cfg.parallel > 1 && <span className="help">Slots share the context: each gets about {Math.floor(ctxTokens / cfg.parallel).toLocaleString()} tokens.</span>}
           </div>
           <div className="field">
             <label htmlFor="rs">RoPE scaling</label>

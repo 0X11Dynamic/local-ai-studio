@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use app_core::{AppError, AppResult};
 use async_trait::async_trait;
 use inference::ToolCall;
-use security::policy::{ApprovalAnswer, Decision, Grant, GrantScope, ToolPolicyInput, decide};
+use security::policy::{ApprovalAnswer, CallFacts, Decision, Grant, GrantScope, ToolPolicyInput, decide_call};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
@@ -39,6 +39,11 @@ pub struct ApprovalRequest {
     /// matches a request to exactly one subagent even when labels repeat.
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// Which answers the card should offer: "any" (once / this chat / always),
+    /// "session" (once / this chat: a place outside the allowed folders) or
+    /// "once" (Plan mode commands, local network addresses).
+    #[serde(default)]
+    pub grant_choice: String,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +68,17 @@ pub trait ToolHost: Send + Sync {
     async fn call(&self, tool: &ExposedTool, call: &ToolCall, args: serde_json::Value, timeout: Duration, cancel: &CancellationToken) -> AppResult<CallResult>;
     /// Live UI events (tool started / waiting / finished).
     fn event(&self, ev: ToolEvent);
+    /// App-owned facts about this call worked out from its arguments (built-in
+    /// tools: places outside the allowed folders, blocked folders, Plan mode,
+    /// local network addresses). Default: none.
+    async fn call_facts(&self, _tool: &ExposedTool, _args: &serde_json::Value) -> CallFacts {
+        CallFacts::default()
+    }
+    /// Run the tool once `facts` were decided (and approved when needed), so
+    /// it may reach exactly the approved places. Default: `call`.
+    async fn call_approved(&self, tool: &ExposedTool, call: &ToolCall, args: serde_json::Value, timeout: Duration, cancel: &CancellationToken, _facts: &CallFacts) -> AppResult<CallResult> {
+        self.call(tool, call, args, timeout, cancel).await
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,8 +175,16 @@ pub async fn dispatch(
         Err(e) => return end(host, &audit_id, call, "error", &format!("Error: {e}"), serde_json::json!({ "decision": "error" }), 0).await,
     };
     let grants = host.grants(&tool.tool_id).await.unwrap_or_default();
-    let decision = decide(&ToolPolicyInput { tool_id: &tool.tool_id, enabled, policy, available }, &grants, conversation_id);
+    let facts = host.call_facts(tool, &args).await;
+    let mut place_grants = vec![];
+    for subject in facts.covered_by.iter().flatten() {
+        place_grants.extend(host.grants(subject).await.unwrap_or_default());
+    }
+    let decision = decide_call(&ToolPolicyInput { tool_id: &tool.tool_id, enabled, policy, available }, &grants, &facts, &place_grants, conversation_id);
     let mut approval = serde_json::json!({ "decision": decision_name(&decision), "reason": decision.reason(), "at": app_core::now_rfc3339() });
+    if !facts.approved.is_empty() {
+        approval["reaches"] = serde_json::json!(facts.approved);
+    }
     match &decision {
         Decision::Deny { reason } => {
             let msg = format!("Permission denied: {reason}. The tool did not run. Do not retry it or work around it with another tool; tell the user.");
@@ -182,6 +206,7 @@ pub async fn dispatch(
                 run_id: None,
                 agent: None,
                 agent_id: None,
+                grant_choice: facts.grant_choice().into(),
             };
             let answer = host.request_approval(req, cancel).await;
             approval["answer"] = serde_json::to_value(answer).unwrap_or_default();
@@ -195,7 +220,16 @@ pub async fn dispatch(
                 let msg = format!("Permission denied: {why}. The tool did not run. Do not retry it or work around it with another tool; tell the user what you wanted to do.");
                 return end(host, &audit_id, call, "denied", &msg, approval, 0).await;
             }
-            if let Some(scope) = answer.grant_scope() {
+            if facts.must_ask.is_some() {
+                // Places that always ask: "this chat" (and "always", which is
+                // narrowed to this chat) grants exactly those places; with no
+                // places to grant, the answer counts for this call only.
+                if answer.grant_scope().is_some() {
+                    for subject in &facts.grant_to {
+                        let _ = host.add_grant(GrantScope::Session, subject, conversation_id).await;
+                    }
+                }
+            } else if let Some(scope) = answer.grant_scope() {
                 let conv = if scope == GrantScope::Session { conversation_id } else { None };
                 let _ = host.add_grant(scope, &tool.tool_id, conv).await;
             }
@@ -206,7 +240,7 @@ pub async fn dispatch(
     // 3. Call.
     let _ = host.audit_status(&audit_id, "running", &approval).await;
     let started = Instant::now();
-    let r = host.call(tool, call, args, Duration::from_secs(tool.timeout_secs.clamp(1, 3600)), cancel).await;
+    let r = host.call_approved(tool, call, args, Duration::from_secs(tool.timeout_secs.clamp(1, 3600)), cancel, &facts).await;
     let ms = started.elapsed().as_millis() as u64;
     match r {
         Ok(out) => {
@@ -269,6 +303,8 @@ mod tests {
         calls: Mutex<Vec<serde_json::Value>>,
         audit: Mutex<Vec<(String, String)>>,
         result: String,
+        facts: CallFacts,
+        asked: Mutex<Vec<ApprovalRequest>>,
     }
 
     #[async_trait]
@@ -283,8 +319,12 @@ mod tests {
         async fn current_policy(&self, _t: &ExposedTool) -> AppResult<(bool, Policy, bool)> {
             Ok((true, self.policy, true))
         }
-        async fn request_approval(&self, _r: ApprovalRequest, _c: &CancellationToken) -> ApprovalAnswer {
+        async fn request_approval(&self, r: ApprovalRequest, _c: &CancellationToken) -> ApprovalAnswer {
+            self.asked.lock().unwrap().push(r);
             self.answer
+        }
+        async fn call_facts(&self, _t: &ExposedTool, _a: &serde_json::Value) -> CallFacts {
+            self.facts.clone()
         }
         async fn audit_start(&self, _t: &ExposedTool, _c: &ToolCall, args: &str, _conv: Option<&str>) -> AppResult<String> {
             self.audit.lock().unwrap().push(("start".into(), args.into()));
@@ -306,7 +346,7 @@ mod tests {
     }
 
     fn host(policy: Policy, answer: ApprovalAnswer, result: &str) -> FakeHost {
-        FakeHost { policy, answer, grants: Mutex::new(vec![]), calls: Mutex::new(vec![]), audit: Mutex::new(vec![]), result: result.into() }
+        FakeHost { policy, answer, grants: Mutex::new(vec![]), calls: Mutex::new(vec![]), audit: Mutex::new(vec![]), result: result.into(), facts: CallFacts::default(), asked: Mutex::new(vec![]) }
     }
 
     fn tools() -> Vec<ExposedTool> {
@@ -370,6 +410,52 @@ mod tests {
         assert!(h.grants.lock().unwrap().is_empty(), "no grant from tool output");
         let audit = h.audit.lock().unwrap();
         assert!(!audit[0].1.contains("sk-1234567890abcdefXYZ"), "args redacted in audit: {}", audit[0].1);
+    }
+
+    fn outside_facts() -> CallFacts {
+        CallFacts {
+            must_ask: Some("Outside your allowed folders: D:/data/a.txt".into()),
+            covered_by: vec![vec!["mcp:s/write outside d:/data".into(), "mcp:s/write outside d:".into()]],
+            grant_to: vec!["mcp:s/write outside d:/data".into()],
+            approved: vec!["D:/data/a.txt".into()],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn outside_places_ask_even_on_allow_and_grants_cover_only_that_place() {
+        let mut h = host(Policy::Allow, ApprovalAnswer::AllowAlways, "ok");
+        h.facts = outside_facts();
+        let o = dispatch(&h, &tools(), &call(r#"{"path": "D:/data/a.txt"}"#), Some("chat-1"), &CancellationToken::new()).await;
+        assert_eq!(o.status, "ok");
+        {
+            let asked = h.asked.lock().unwrap();
+            assert_eq!(asked.len(), 1, "asked although the policy is allow");
+            assert!(asked[0].reason.contains("Outside your allowed folders") && asked[0].grant_choice == "session", "{:?}", asked[0]);
+        }
+        // "Always" is narrowed to this chat and to the place, never the whole tool.
+        let g = h.grants.lock().unwrap().clone();
+        assert_eq!(g.len(), 1);
+        assert_eq!((g[0].scope, g[0].tool_id.as_str(), g[0].conversation_id.as_deref()), (GrantScope::Session, "mcp:s/write outside d:/data", Some("chat-1")));
+        // The same place in the same chat now runs without asking; another chat asks.
+        let o = dispatch(&h, &tools(), &call(r#"{"path": "D:/data/a.txt"}"#), Some("chat-1"), &CancellationToken::new()).await;
+        assert_eq!(o.status, "ok");
+        assert_eq!(h.asked.lock().unwrap().len(), 1);
+        let _ = dispatch(&h, &tools(), &call(r#"{"path": "D:/data/a.txt"}"#), Some("chat-2"), &CancellationToken::new()).await;
+        assert_eq!(h.asked.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn blocked_places_never_run_or_ask_and_ask_once_leaves_no_grant() {
+        let mut h = host(Policy::Allow, ApprovalAnswer::AllowSession, "ok");
+        h.facts = CallFacts { blocked: Some("C:/Windows is a protected folder".into()), ..Default::default() };
+        let o = dispatch(&h, &tools(), &call(r#"{"path": "C:/Windows/x"}"#), Some("c"), &CancellationToken::new()).await;
+        assert!(o.status == "denied" && o.content.contains("protected"), "{o:?}");
+        assert!(h.calls.lock().unwrap().is_empty() && h.asked.lock().unwrap().is_empty());
+        h.facts = CallFacts { must_ask: Some("Plan mode: read-only command requested".into()), ..Default::default() };
+        assert_eq!(dispatch(&h, &tools(), &call(r#"{"path": "a"}"#), Some("c"), &CancellationToken::new()).await.status, "ok");
+        assert_eq!(h.asked.lock().unwrap()[0].grant_choice, "once");
+        assert!(h.grants.lock().unwrap().is_empty(), "an ask-every-time answer is never remembered");
     }
 
     #[test]

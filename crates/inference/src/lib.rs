@@ -18,5 +18,8 @@ pub use capabilities::RuntimeCapabilities;
 pub use chat::{ChatDelta, ChatOutput, ChatStats, SamplingParams, ToolCall};
 pub use client::{Health, LlamaClient, ServerProps};
 pub use config::{FlashAttention, GpuLayers, LoadConfig, LoadMode};
-pub use runtime::{AvailableRuntime, GpuHint, InstallProgress, InstalledRuntime, RuntimeManager};
+pub use runtime::{
+    AvailableRuntime, DriverRequirement, GpuHint, InstallProgress, InstalledRuntime, RuntimeManager, cuda_driver_requirement,
+    driver_text, parse_driver_version,
+};
 pub use supervisor::{Engine, EngineEvent, EngineState, EngineStatus, LoadRequest};

@@ -51,18 +51,37 @@ pub async fn do_load(st: &SharedState, model_id: String, config: LoadConfig, run
         )));
     }
     let runtime = resolve_runtime(&st, runtime_id).await?;
-    // "Share with CPU": pick the GPU/CPU split from free VRAM right now. A
-    // model that is already loaded would make VRAM look full, so unload it
-    // first (a load replaces it anyway).
+    let meta: model_registry::ModelMetadata = serde_json::from_str(&m.metadata).unwrap_or_default();
+    let projector = super::models::projector_bytes(&config, m.projector_path.as_deref());
+    // "Share with CPU" and an Auto context are measured from free memory
+    // right now. A model that is already loaded would make VRAM look full,
+    // so unload it first (a load replaces it anyway).
+    if (config.n_ctx == 0 || config.share_with_cpu)
+        && runtime.uses_gpu()
+        && let Some(pid) = st.engine.backend_pid()
+    {
+        do_unload(&st).await?;
+        wait_for_vram_release(&st, pid).await;
+    }
+    // Auto context (n_ctx 0): llama-server would allocate the full trained
+    // context, which can run out of memory, so the app picks the size.
+    let (config_ctx, auto) = super::models::resolve_auto_ctx(
+        &config,
+        &meta,
+        m.size as u64,
+        projector,
+        super::models::free_vram(&st),
+        st.monitor.hardware_info().available_ram_bytes,
+        runtime.capabilities.has("--n-cpu-moe"),
+        runtime.uses_gpu(),
+    );
+    if let Some(a) = &auto {
+        tracing::info!("Auto context: {} tokens ({})", a.n_ctx, a.summary);
+    }
+    // "Share with CPU": pick the GPU/CPU split from free VRAM right now.
     let effective = if config.share_with_cpu && runtime.uses_gpu() {
-        if let Some(pid) = st.engine.backend_pid() {
-            do_unload(&st).await?;
-            wait_for_vram_release(&st, pid).await;
-        }
-        let meta: model_registry::ModelMetadata = serde_json::from_str(&m.metadata).unwrap_or_default();
-        let projector = super::models::projector_bytes(&config, m.projector_path.as_deref());
         let (c, split) = super::models::resolve_share(
-            &config,
+            &config_ctx,
             &meta,
             m.size as u64,
             projector,
@@ -75,10 +94,10 @@ pub async fn do_load(st: &SharedState, model_id: String, config: LoadConfig, run
         c.validate().map_err(AppError::InvalidInput)?;
         c
     } else {
-        config.clone()
+        config_ctx
     };
-    // The model's "last used" keeps the user's choice (share_with_cpu), not the
-    // resolved layer count, so the next load re-measures free VRAM.
+    // The model's "last used" keeps the user's choice (share_with_cpu, Auto
+    // context), not the resolved values, so the next load re-measures.
     let cfg_json = serde_json::to_value(&config)?;
     let instance_id = st.db.insert_instance(&model_id, &runtime.id, &serde_json::to_value(&effective)?).await?;
     st.db.set_model_configs(&model_id, None, Some(&cfg_json)).await?;

@@ -12,6 +12,7 @@ pub mod paths;
 pub mod process;
 pub mod sandbox;
 pub mod shfs;
+pub mod web_fetch;
 
 use std::collections::BTreeMap;
 use std::time::Duration;

@@ -32,10 +32,19 @@ fn as_text(bytes: Vec<u8>, path: &str) -> AppResult<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// The folder `fs_list` / `fs_search` look in: an empty path (models often send
+/// `""` to mean "here") or `.` is the environment's first allowed folder,
+/// which every environment resolves relative paths against.
+fn folder_or_root(path: &str) -> &str {
+    let p = path.trim();
+    if p.is_empty() || p == "." || p == "./" || p == ".\\" { "." } else { path }
+}
+
 pub async fn list(env: &dyn ExecutionEnvironment, path: &str) -> AppResult<String> {
+    let path = folder_or_root(path);
     let entries = env.list_dir(path).await?;
     if entries.is_empty() {
-        return Ok(format!("{path} is empty"));
+        return Ok(if path == "." { "The allowed folder is empty".into() } else { format!("{path} is empty") });
     }
     let mut out = String::new();
     for e in &entries {
@@ -70,7 +79,7 @@ pub async fn read(env: &dyn ExecutionEnvironment, path: &str, start_line: Option
 pub async fn search(env: &dyn ExecutionEnvironment, path: &str, pattern: &str, file_glob: Option<&str>) -> AppResult<String> {
     let re = regex::RegexBuilder::new(pattern).size_limit(1 << 20).build().map_err(|e| AppError::InvalidInput(format!("bad pattern: {e}")))?;
     let glob = file_glob.map(glob_to_regex).transpose()?;
-    let mut stack = vec![path.to_string()];
+    let mut stack = vec![folder_or_root(path).to_string()];
     let (mut files, mut hits) = (0usize, Vec::<String>::new());
     let mut capped = false;
     while let Some(dir) = stack.pop() {
@@ -207,6 +216,20 @@ mod tests {
         assert!(s.contains("main.rs:2:"), "{s}");
         assert!(search(&e, &root, "nothing-here", None).await.unwrap().starts_with("no matches"));
         assert!(search(&e, &root, "(", None).await.is_err(), "bad regex");
+    }
+
+    #[tokio::test]
+    async fn empty_path_or_dot_is_the_first_allowed_folder() {
+        let (_d, e, root) = env();
+        let full = list(&e, &root).await.unwrap();
+        for p in ["", "  ", ".", "./"] {
+            assert_eq!(list(&e, p).await.unwrap(), full, "fs_list {p:?}");
+            let s = search(&e, p, "println", Some("*.rs")).await.unwrap();
+            assert!(s.contains("main.rs:2:"), "fs_search {p:?}: {s}");
+        }
+        // Reading or writing still needs a real path.
+        assert!(read(&e, "", None, None).await.is_err(), "fs_read with an empty path");
+        assert!(write(&e, "", "x", false).await.is_err(), "fs_write with an empty path");
     }
 
     #[tokio::test]

@@ -23,6 +23,12 @@ pub async fn set_local_roots(state: State<'_, SharedState>, roots: Vec<String>) 
     svc::set_local_roots(state.inner(), roots).await
 }
 
+/// This PC: "Reach outside allowed folders": "ask" (each time) or "off".
+#[tauri::command]
+pub async fn set_local_outside(state: State<'_, SharedState>, mode: String) -> Cmd<String> {
+    svc::set_local_outside(state.inner(), &mode).await
+}
+
 #[tauri::command]
 pub async fn environment_health(state: State<'_, SharedState>, id: String) -> Cmd<Health> {
     svc::health(state.inner(), &id).await

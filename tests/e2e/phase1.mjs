@@ -209,7 +209,13 @@ await check("settings outside the UI allowlist are refused", async () => {
 
 // ---------------- runtimes ----------------
 await check("available builds come from GitHub with the right recommendation", async () => {
-  const av = await cdp.invoke("fetch_available_runtimes");
+  let av;
+  try {
+    av = await cdp.invoke("fetch_available_runtimes");
+  } catch (e) {
+    ids.availableError = String(e?.message ?? e);
+    throw e;
+  }
   const rec = av.filter((r) => r.recommended);
   assert(rec.length === 1 && rec[0].variant.startsWith("cuda-13"), `recommended ${rec.map((r) => r.id)}`);
   assert(rec[0].assets.length === 2 && rec[0].assets.every((a) => a.sha256), "CUDA build must bundle cudart and have checksums");
@@ -220,6 +226,7 @@ await check("available builds come from GitHub with the right recommendation", a
 });
 
 await check("runtime download can be cancelled and resumes from the partial file", async () => {
+  assert(Array.isArray(ids.available), `skipped: available builds were not fetched (${ids.availableError ?? "earlier check failed"})`);
   const big = ids.available.find((r) => r.variant === "cuda-12.4") ?? ids.available.find((r) => !r.recommended && r.variant !== "cpu");
   const asset = big.assets[0];
   const part = path.join(PROFILE_RUNTIMES, ".downloads", asset.name + ".part");
@@ -243,6 +250,7 @@ await check("runtime download can be cancelled and resumes from the partial file
 });
 
 await check("full runtime install, make default, and remove", async () => {
+  assert(Array.isArray(ids.available), `skipped: available builds were not fetched (${ids.availableError ?? "earlier check failed"})`);
   const vk = ids.available.find((r) => r.variant === "vulkan");
   assert(vk, "no vulkan build offered");
   const inst = await cdp.invoke("install_runtime", { runtime: vk });
@@ -332,12 +340,14 @@ await check("remove from library keeps the file on disk", async () => {
   assert(fs.existsSync(path.join(FIX, "single", "fake-llama-Q4_K_M.gguf")), "file was deleted");
 });
 
-await check("delete files needs the exact name typed (UI) and then deletes", async () => {
+await check("delete files needs the confirm box ticked (UI) and then deletes", async () => {
   const f = path.join(FIX, "deleteme", "deleteme-Q4_0.gguf");
   await cdp.invoke("import_models", { path: f });
   const m = await modelByName("deleteme-Q4_0");
-  const e = await cdp.invokeErr("delete_model_files", { id: m.id, confirmName: "wrong" });
-  assert(/does not match/.test(e.message) && fs.existsSync(f), "wrong name must not delete");
+  const e = await cdp.invokeErr("delete_model_files", { id: m.id, confirm: false });
+  assert(/confirm/.test(e.message) && fs.existsSync(f), "confirm: false must not delete");
+  const e0 = await cdp.invokeErr("delete_model_files", { id: m.id });
+  assert(/confirm/.test(e0.message) && fs.existsSync(f), "a call without confirm must not delete");
   await cdp.nav("My Models");
   await cdp.eval("location.reload()");
   await sleep(500);
@@ -346,14 +356,29 @@ await check("delete files needs the exact name typed (UI) and then deletes", asy
   await cdp.eval("[...document.querySelectorAll('tr.selectable')].find(r => r.innerText.includes('deleteme-Q4_0')).click()");
   await cdp.waitFor("[...document.querySelectorAll('button')].some(b => b.innerText.trim() === 'Delete files')");
   await cdp.clickButton("Delete files");
-  assert((await cdp.buttonState("Delete permanently")) === "disabled", "enabled before typing");
-  await cdp.setValue("input[aria-label='Type the model name to confirm']", "deleteme");
-  assert((await cdp.buttonState("Delete permanently")) === "disabled", "enabled with partial name");
-  await cdp.setValue("input[aria-label='Type the model name to confirm']", "deleteme-Q4_0");
-  await cdp.clickButton("Delete permanently");
-  await cdp.waitFor("document.querySelector('.content').innerText.includes('Deleted 1 file')", 5000);
+  assert((await cdp.buttonState("Move to Recycle Bin")) === "disabled", "enabled before ticking the box");
+  await cdp.eval("document.querySelector(\"input[aria-label='Confirm delete']\").click()");
+  await cdp.waitFor(`[...document.querySelectorAll('button')].some(b => b.innerText.trim() === 'Move to Recycle Bin' && !b.disabled)`, 3000, "Move to Recycle Bin enabled");
+  await cdp.clickButton("Move to Recycle Bin");
+  await cdp.waitFor("document.querySelector('.content').innerText.includes('Moved 1 file')", 10000);
   assert(!fs.existsSync(f), "file still exists");
+  // It is in the Recycle Bin (not deleted permanently). This test's own
+  // fixture copy is then removed from the bin so runs don't pile up there.
+  const inBin = recycleBinItems(path.dirname(f), path.basename(f));
+  assert(inBin.length === 1, `in the Recycle Bin: ${inBin.length}`);
+  for (const p of inBin) {
+    fs.rmSync(p, { force: true });
+    fs.rmSync(path.join(path.dirname(p), path.basename(p).replace(/^\$R/, "$I")), { force: true });
+  }
+  return "moved to the Recycle Bin";
 });
+
+/** Recycle Bin paths ($R... files) of items deleted from `dir` with this name. */
+function recycleBinItems(dir, name) {
+  const ps = `$b = (New-Object -ComObject Shell.Application).NameSpace(10); $b.Items() | Where-Object { $_.Name -eq '${name.replace(/'/g, "''")}' -or $_.Name -eq '${path.parse(name).name.replace(/'/g, "''")}' } | Where-Object { $b.GetDetailsOf($_, 1) -eq '${dir.replace(/'/g, "''")}' } | ForEach-Object { $_.Path }`;
+  const out = execFileSync("powershell.exe", ["-NoProfile", "-Command", ps], { encoding: "utf8" });
+  return out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+}
 
 await check("library filter narrows the list", async () => {
   await cdp.nav("My Models");
@@ -425,10 +450,12 @@ await check("UI: backend log is filled and searchable", async () => {
   return shown;
 });
 
-await check("context 0 uses the model's trained context", async () => {
+await check("context 0 (Auto) is sized by the app to fit, up to the trained context", async () => {
   const s = await load(SMALL, { n_ctx: 0, gpu_layers: { mode: "all" } });
-  assert(s.props.n_ctx === 131072, `n_ctx ${s.props.n_ctx}`);
-  return "131,072 tokens";
+  const n = s.props.n_ctx;
+  assert(n >= 2048 && n <= 131072, `n_ctx ${n}`);
+  assert(s.config.n_ctx === n, `launched with ${s.config.n_ctx}, server reports ${n}`);
+  return `${n.toLocaleString()} tokens`;
 });
 
 await check("chosen GPU layer count is honoured", async () => {
@@ -491,7 +518,7 @@ await check("runtime and model in use can't be removed or deleted", async () => 
   assert(e1.code === "conflict", e1.message);
   const e2 = await cdp.invokeErr("remove_model", { id: m.id });
   assert(e2.code === "conflict", e2.message);
-  const e3 = await cdp.invokeErr("delete_model_files", { id: m.id, confirmName: m.display_name });
+  const e3 = await cdp.invokeErr("delete_model_files", { id: m.id, confirm: true });
   assert(e3.code === "conflict", e3.message);
   assert(fs.existsSync(m.path), "LM Studio file touched");
   await unload();

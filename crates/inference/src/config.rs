@@ -54,7 +54,9 @@ impl LoadMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoadConfig {
-    /// Allocated context (`-c`). 0 = the model's trained context.
+    /// Allocated context (`-c`). 0 = Auto: the app picks the largest size that
+    /// fits free memory, up to the trained context, before launching (see
+    /// `model_registry::estimate::auto_n_ctx`); 0 is never passed to llama-server.
     pub n_ctx: u32,
     pub gpu_layers: GpuLayers,
     /// Generation threads (`-t`). None = llama.cpp default.
@@ -123,7 +125,7 @@ pub struct BuiltArgs {
 impl LoadConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.n_ctx != 0 && self.n_ctx < 256 {
-            return Err("context length must be 0 (model default) or at least 256".into());
+            return Err("context length must be 0 (auto) or at least 256".into());
         }
         if self.n_ctx > 4_194_304 {
             return Err("context length above 4M tokens is not supported".into());

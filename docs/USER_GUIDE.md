@@ -6,13 +6,30 @@ Nothing leaves your PC unless you choose to download a model, connect a remote t
 
 ## Install and first run
 
-1. Run the installer (`Local AI Studio_x.y.z_x64-setup.exe`). It installs for your Windows account only and needs no administrator rights.
-2. Windows SmartScreen may say "Windows protected your PC". The app is not code-signed, so this is expected. Click **More info**, then **Run anyway**.
-3. On first start the app:
-   - checks your CPU, RAM and NVIDIA GPU (Overview page)
-   - registers the models LM Studio already downloaded, in place and read-only (no copies)
-   - installs three sample skills (Skills page).
-4. Install a runtime on **Runtimes** (the official llama.cpp build for your GPU), then load a model on **My Models**.
+**What you need:** Windows 10 or 11 (64-bit) and an internet connection for setup. An NVIDIA, AMD or Intel GPU makes models much faster but is not required.
+
+### Install
+
+1. Run the installer, `Local AI Studio_x.y.z_x64-setup.exe`. It installs for your Windows account only (to `%LOCALAPPDATA%\Local AI Studio`) and needs no administrator rights.
+2. Windows SmartScreen may show **"Windows protected your PC"**. That is expected: the app is deliberately not code-signed, so Windows doesn't recognise the publisher. Click **More info**, check that the app name is `Local AI Studio_x.y.z_x64-setup.exe`, then click **Run anyway**. (Your browser may also warn when you download it; choose **Keep**.)
+3. Click through the installer. If Microsoft Edge WebView2 (the component that draws the app's window) is missing, the installer downloads and installs it by itself. Windows 11 already has it.
+4. On the last page, **Create desktop shortcut** is ticked by default; leave it ticked to get a **Local AI Studio** icon on your desktop. A Start menu entry is always created. A silent install (`setup.exe /S`) creates both shortcuts.
+
+### First-run setup
+
+The first time the app starts, a setup screen opens with three steps:
+
+1. **This PC**: your CPU, memory and GPU. For an NVIDIA GPU it also checks the driver: the CUDA 13 runtime needs NVIDIA driver **580 or newer** (NVIDIA ships CUDA 13.5 with driver 620). If your driver is too old, the screen says so, links to the NVIDIA driver download page (https://www.nvidia.com/en-us/drivers/) and offers the **Vulkan** runtime (uses the GPU, works with older drivers) or the **CPU** runtime instead. The app never installs drivers for you.
+2. **Runtime**: the engine that runs models (an official llama.cpp build from GitHub, checked against its published SHA-256). The build recommended for your hardware starts installing by itself, with a progress bar and a Cancel button. **Other runtimes** lists the Vulkan and CPU builds.
+3. **A first model**: one starter model that fits your hardware, for example Qwen3 4B Instruct (2.5 GB) for a GPU with 6-11 GB of VRAM, Qwen3 8B for 12 GB or more, and Qwen3 1.7B (1.1 GB) when models run on the CPU. Nothing downloads until you click **Download**; the download keeps going if you close the screen. **Browse other models** opens Discover instead.
+
+Click **Finish** when done, or **Skip setup** to do it all later from **Runtimes** and **Discover**. Either way the screen doesn't open by itself again; **Settings > Setup > Run setup again** brings it back.
+
+The app also, on first start: registers the models LM Studio already downloaded (if LM Studio is installed), in place and read-only (no copies), and installs three sample skills (Skills page).
+
+### Uninstall
+
+Open Windows **Settings > Apps > Installed apps**, find **Local AI Studio**, and choose **Uninstall** (or run `uninstall.exe` in the install folder). This removes the program, the desktop shortcut and the Start menu entry. Your chats, settings, runtimes and models are **kept** (see [Where your data lives](#where-your-data-lives)); the "Delete the application data" box in the uninstaller only clears the window's WebView2 cache. To remove everything, also delete `%APPDATA%\LocalAIStudio` and `%USERPROFILE%\LocalAIStudio`, and the `LocalAIStudio` entries in Credential Manager.
 
 ## The pages
 

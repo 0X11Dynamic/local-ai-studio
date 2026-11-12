@@ -402,16 +402,29 @@ await check("test instruction runs without saving anything", async () => {
 
 await check("UI: System Instructions page shows editor, unsaved state and token count", async () => {
   await cdp.nav("System Instructions");
-  await cdp.waitFor("document.querySelector('.content').innerText.includes('Effective instruction')", 10000);
-  await cdp.eval("[...document.querySelectorAll('.chat-item')].find(b => b.innerText.includes('Custom')).click()");
-  await cdp.clickButton("Clone");
-  await cdp.waitFor("document.querySelector('#pname') && !document.querySelector('#pname').disabled", 10000);
+  // Two-pane page: list on the left, editor + preview + bottom save bar on the right.
+  await cdp.waitFor("document.querySelector('.instr-nav') && document.querySelectorAll('.instr-item').length > 1", 10000, "instruction list");
+  // Pick a built-in template explicitly (the page may open on any profile or none).
+  await cdp.eval("[...document.querySelectorAll('.instr-item')].find(b => b.innerText.includes('General Assistant')).click()");
+  try {
+    await cdp.waitFor("!!document.querySelector('#sec-identity, #sec-raw')", 10000, "instructions editor");
+  } catch (e) {
+    const seen = await cdp.eval("document.querySelector('.instr-main')?.innerText.slice(0, 500) + ' | ' + document.querySelectorAll('textarea').length + ' textareas: ' + [...document.querySelectorAll('textarea')].map(t => t.id).join(',')");
+    throw new Error(`${e.message}; main shows: ${JSON.stringify(seen)}`);
+  }
+  await cdp.waitFor("document.querySelector('.instr-actions-status')?.innerText.trim().length > 0", 5000, "save bar status");
+  // Make an editable copy (built-in templates are read-only): "Duplicate to edit" or "Duplicate".
+  const dup = await cdp.eval("(() => { const b = [...document.querySelectorAll('.instr-head button')].find(b => /^Duplicate/.test(b.innerText.trim())); if (!b) return false; b.click(); return true })()");
+  if (!dup) throw new Error("no Duplicate button in the editor header");
+  await cdp.waitFor("document.querySelector('input[aria-label=\"Profile name\"]') && !document.querySelector('#sec-identity, #sec-raw')?.readOnly", 10000, "editable copy");
+  await cdp.waitFor("document.querySelector('.instr-actions-status')?.innerText.trim() === 'Saved'", 5000, "clean state before editing");
   await cdp.setValue("#sec-identity", "You are a terse assistant.");
-  await cdp.waitFor("document.querySelector('.content').innerText.includes('Unsaved changes')", 5000);
-  await cdp.waitFor("/[0-9]+ tokens \\(/.test(document.querySelector('.content').innerText)", 10000, "token count");
+  await cdp.waitFor("document.querySelector('.instr-actions-status')?.innerText.includes('Unsaved changes')", 5000, "unsaved state");
+  await cdp.waitFor("/Unsaved/.test(document.querySelector('.instr-head').innerText)", 5000, "unsaved tag in header");
+  await cdp.waitFor("/[0-9][0-9,]* (tokens|characters)/.test(document.querySelector('.instr-actions-tokens').innerText) && /[0-9][0-9,]* (tokens|characters)/.test(document.querySelector('.instr-tokens').innerText)", 10000, "token count");
   await cdp.screenshot(path.join(SHOTS, "instructions.png"));
-  await cdp.clickButton("Save profile");
-  await cdp.waitFor("document.querySelector('.content').innerText.includes('Profile saved')", 5000);
+  await cdp.clickButton("Save");
+  await cdp.waitFor("document.querySelector('.instr-actions-status')?.innerText.trim() === 'Saved' && document.querySelector('.content').innerText.includes('Profile saved')", 5000, "saved state");
 });
 
 // ---------------- local API ----------------

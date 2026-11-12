@@ -8,7 +8,9 @@ Status: **plan only, for Will to approve.** Nothing is built yet. Written 2026-1
 - **Network: both PCs on the same home Wi-Fi.** Will: "At home they use WiFi. When I bring this pc home, they'll both use WiFi." So the measurements happen once this PC is at home, and Wi-Fi is the case to design for.
 - **No Tailscale** (Will: "I'd rather not use tailscale so it's easy for other users to use it"). The app must bring its own secure link: pairing with a one-time code, then an app-to-app encrypted tunnel with pinned keys, with rpc-server bound to localhost behind it (see "Pairing in the app"). Nothing extra to install, and rpc-server is never reachable on the network directly.
 - **Expectation on Wi-Fi:** Option A (one model split across both PCs) sends activations for every token over the network, so on Wi-Fi it is likely slower than one PC for models that fit, and possibly only worth it for models too big for one PC. Option B (whole chats, subagents and file jobs on each PC) tolerates Wi-Fi well. Phase 1 measures both before anything is built.
-- **Not answered yet:** the helper PC's GPU/VRAM and RAM, and which big models he wants to run.
+- **Direction (2026-11-11):** Will: "for bigger models to be offloaded to the other pc to help split the layers up to optimize speed. we can experiment". So: models too big for one PC are split across the PCs (Option A); models that fit run on one PC, and whole jobs (subagents, other chats, file batches) go to the other PCs (Option B); other networks get Option B only.
+- **Next session (2026-11-12):** Will connects to the other PC with TeamViewer and Claude drives it with computer control to run phase 1 (copy the runtime, start rpc-server, measure the 27B split vs this PC alone).
+- **Not answered yet:** the helper PC's GPU/VRAM and RAM (to be read during the TeamViewer session), and which big models he wants to run.
 
 ## Short answer
 
@@ -114,6 +116,26 @@ Anyone who can reach the RPC port can use the helper's GPU and send it data, and
 - One chat can't get faster than one machine.
 - A model too big for both PCs on their own still needs A.
 - Each PC needs the model file. It's copied once and checked by sha256.
+
+## Computers on other networks (over the internet)
+
+Will (2026-11-11): "see if theres a way we can do computers on other networks if we make it so a process runs in the background that runs a local web server or sum and then u connect to it by putting in the computers public ip or sum then port".
+
+**Yes, that works, with three conditions.**
+
+- **How:** the helper PC runs the app in "helper mode" as a small background service. It listens on one port with the app's own TLS (pinned keys from pairing). The main PC connects to `<public IP>:<port>`, or to a name if the helper's IP changes (dynamic DNS). rpc-server and llama-server stay on localhost on the helper; only the app's authenticated tunnel faces the internet.
+- **Condition 1, the helper's router must let the connection in:**
+  - The app tries UPnP / NAT-PMP first, which opens the port automatically on most home routers.
+  - If that fails, the user forwards the port by hand in the router settings; the app shows the exact port and the helper's local IP.
+  - If the helper's internet uses CGNAT (common on mobile hotspots and some ISPs), inbound connections are impossible. The app detects this (its public IP doesn't match the router's WAN IP) and says so. The only fix then is a relay server both PCs connect out to. That needs a small always-on server somewhere, which costs money, so it's not in the plan unless Will wants it.
+- **Condition 2, it must be safe on the open internet:**
+  - Pairing with a one-time code, then mutual TLS with pinned keys. Anyone without the key is dropped before any model code sees a byte.
+  - Rate limiting, a per-helper on/off switch, and "only while the app says Helper is on".
+  - The helper decides which models and how much of its GPU it shares.
+- **Condition 3, what's fast enough over the internet:**
+  - **Option A (one model split across both PCs) is not practical over the internet.** Every generated token waits on a network round trip; at 20-80 ms per trip that's a few tokens per second at best. Keep A for the same Wi-Fi only.
+  - **Option B (whole jobs on the helper) works well over the internet.** The helper runs its own model; the main PC sends a chat turn or a subagent's job and gets the answer streamed back. That's the same as calling a remote OpenAI-compatible API: only text crosses the network. This is how a friend's PC could help.
+- **Build order:** this is phase 2 work (helper mode + pairing + tunnel). The LAN version and the internet version are the same code; the internet adds UPnP, the CGNAT check and dynamic DNS.
 
 ## Which one when (the rule the app will follow)
 

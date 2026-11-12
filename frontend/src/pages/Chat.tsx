@@ -10,12 +10,17 @@ import {
 import { useEngine } from "../lib/engine";
 import { Markdown } from "../components/Markdown";
 import { ToolCard, type ToolCall } from "../components/ToolCard";
-import { api3, type ApprovalAnswer, type ApprovalRequest, type ServerView } from "../lib/api3";
+import { api3, type ApprovalAnswer, type ApprovalRequest } from "../lib/api3";
 import { api4, type EnvView } from "../lib/api4";
 import { OPEN_CHAT_KEY, keptNote, onOpen } from "../lib/api5";
 import { ChatSubagents } from "../components/ChatSubagents";
 import { ThinkingControls, useModelSupport } from "../components/ThinkingControls";
 import { api6, parseAttachments, type Attachment } from "../lib/api6";
+// --- chat mode / tools menus (composer bar) ---
+import { ModeMenu, type ChatMode } from "../components/chat/ModeMenu";
+import { ToolsMenu } from "../components/chat/ToolsMenu";
+import { SubagentControls } from "../components/chat/SubagentControls";
+// --- end chat mode / tools menus ---
 import type { PageId } from "../App";
 
 function parseStats(m: Message): MessageStats | null {
@@ -101,7 +106,8 @@ const EMPTY_SETTINGS: ChatSettings = {
   reserve_tokens: 1024,
   agent_mode: false,
   tool_servers: [],
-  limits: { max_tool_calls: 10, max_wall_secs: 300 },
+  disabled_servers: [],
+  limits: { max_tool_calls: null, max_wall_secs: null },
   builtin_tools: true,
   environment_id: null,
   skills: true,
@@ -113,7 +119,6 @@ const EMPTY_SETTINGS: ChatSettings = {
   reasoning_effort: null,
 };
 
-type ChatMode = "chat" | "plan" | "agent";
 const modeOf = (s: ChatSettings): ChatMode => (!s.agent_mode ? "chat" : s.mode === "plan" ? "plan" : "agent");
 const withMode = (s: ChatSettings, m: ChatMode): ChatSettings => ({ ...s, agent_mode: m !== "chat", mode: m });
 
@@ -129,6 +134,9 @@ export function Chat({ go }: { go: (p: PageId) => void }) {
   const [err, setErr] = useState<string | null>(null);
   const [ctx, setCtx] = useState<ContextReport | null>(null);
   const [ctxErr, setCtxErr] = useState<string | null>(null);
+  // Bumped after chat settings are saved, so the context meter and the
+  // Tools menu recount with what the backend now has.
+  const [ctxTick, setCtxTick] = useState(0);
   const [profiles, setProfiles] = useState<InstructionProfile[]>([]);
   const [settings, setSettings] = useState<ChatSettings>(EMPTY_SETTINGS);
   const [planEdit, setPlanEdit] = useState<{ id: string; text: string } | null>(null);
@@ -139,7 +147,6 @@ export function Chat({ go }: { go: (p: PageId) => void }) {
   const [renaming, setRenaming] = useState<string | null>(null);
   const [approvals, setApprovals] = useState<Record<string, ApprovalRequest>>({});
   const [liveTools, setLiveTools] = useState<Record<string, string>>({});
-  const [servers, setServers] = useState<ServerView[]>([]);
   const [envs, setEnvs] = useState<EnvView[]>([]);
   // Live shell output per tool call, and where each call runs.
   const [liveOut, setLiveOut] = useState<Record<string, string>>({});
@@ -190,7 +197,6 @@ export function Chat({ go }: { go: (p: PageId) => void }) {
       else if (l[0]) open(l[0].id);
     });
     api2.listProfiles().then(setProfiles);
-    api3.listServers().then(setServers);
     api4.list().then(setEnvs).catch(() => {});
     // The approvals indicator can ask an already-open Chat page to switch.
     return onOpen("chat", (id) => {
@@ -319,7 +325,7 @@ export function Chat({ go }: { go: (p: PageId) => void }) {
       api2.chatContext(currentId, draft).then((r) => { setCtx(r); setCtxErr(null); }).catch((e) => setCtxErr(errorMessage(e)));
     }, 350);
     return () => clearTimeout(t);
-  }, [currentId, draft, loaded, current?.messages.length, generating, settings, status?.props?.n_ctx, pending.length]);
+  }, [currentId, draft, loaded, current?.messages.length, generating, settings, status?.props?.n_ctx, pending.length, ctxTick]);
 
   const toBottom = () => {
     const el = scroller.current;
@@ -494,6 +500,21 @@ ${text}`));
     try {
       await api2.updateChatSettings(current.id, next);
       setErr(null);
+      setCtxTick((t) => t + 1);
+    } catch (e) {
+      setErr(errorMessage(e));
+    }
+  };
+
+  // Composer mode menu. With no chat open yet, it makes one first.
+  const setMode = async (m: ChatMode) => {
+    if (current) return saveSettings(withMode(settings, m));
+    try {
+      const id = await ensureChat();
+      const c = await api2.getConversation(id);
+      await api2.updateChatSettings(id, withMode(c.settings_parsed, m));
+      await open(id);
+      refreshList();
     } catch (e) {
       setErr(errorMessage(e));
     }
@@ -651,7 +672,9 @@ ${text}`));
                     </div>
                   ) : null;
                 })()}
-                {m.tool_calls ? null : content ? <Markdown text={content} /> : isLive ? <div className="faint">{reasoning ? "" : "Waiting for the first token"}</div> : stats?.stop_reason === "cancelled" ? <div className="faint">Stopped before any answer text.</div> : null}
+                {m.tool_calls ? null : content ? <Markdown text={content} /> : isLive ? <div className="faint">{reasoning ? "" : "Waiting for the first token"}</div> : stats?.stop_reason === "cancelled" ? <div className="faint">Stopped before any answer text.</div> : stats && stats.stop_reason !== "error" ? (
+                  <div className="notice warn empty-answer" role="status">{stats.note ?? "The model returned no answer."}{reasoning ? " It wrote only reasoning (above)." : ""} Try Regenerate, or ask again.</div>
+                ) : null}
                 {stats && <StatsLine s={stats} />}
                 {!isLive && stats?.mode === "plan" && !m.tool_calls && content && m.id === lastAssistant?.id && stats.stop_reason !== "error" && (
                   <div className="plan-actions">
@@ -696,6 +719,16 @@ ${text}`));
           {dragOver && <div className="drop-hint">Drop files to attach them to your next message</div>}
           <AttachmentChips items={pending} onRemove={generating ? undefined : removeAttachment} />
           <div className="row composer-tools">
+            {/* --- chat mode / tools menus --- */}
+            <ModeMenu mode={modeOf(settings)} onChange={setMode} />
+            {modeOf(settings) === "agent" && (
+              <SubagentControls allowed={!!settings.subagents} max={settings.max_subagents ?? 2}
+                onChange={(allowed, max) => saveSettings({ ...settings, subagents: allowed, max_subagents: max })} />
+            )}
+            <ToolsMenu conversationId={currentId} settings={settings} mode={modeOf(settings)} onChange={saveSettings} onManage={() => go("mcp")}
+              refreshKey={`${status?.instance_id ?? ""}|${modeOf(settings)}|${settings.builtin_tools}|${settings.environment_id ?? ""}|${settings.tool_servers.join(",")}|${(settings.disabled_servers ?? []).join(",")}|${ctxTick}`} />
+            <span className="composer-sep" aria-hidden />
+            {/* --- end chat mode / tools menus --- */}
             <button className="btn sm ghost" aria-label="Attach files" disabled={attaching || generating}
               title={support?.images ? "Attach text, code, PDF or image files (or drop them here)" : "Attach text, code or PDF files (or drop them here)"} onClick={pickFiles}>
               {attaching ? "Attaching..." : "Attach"}
@@ -737,89 +770,45 @@ ${text}`));
       {showSettings && (
         <aside className="chat-inspector">
           <strong style={{ fontWeight: 600 }}>Chat settings</strong>
+          {/* --- tool settings (mode, servers and subagents moved to the composer bar) --- */}
           <div className="panel" style={{ display: "grid", gap: 8, padding: 10 }}>
-            <div className="field">
-              <label htmlFor="cs-mode">Mode</label>
-              <select id="cs-mode" className="input" aria-label="Chat mode" value={modeOf(settings)} onChange={(e) => saveSettings(withMode(settings, e.target.value as ChatMode))}>
-                <option value="chat">Chat (no tools)</option>
-                <option value="plan">Plan (read-only tools, ends with a plan)</option>
-                <option value="agent">Agent (all tools below)</option>
-              </select>
-            </div>
-            <label className="check">
-              <input type="checkbox" aria-label="Agent Mode" checked={settings.agent_mode} onChange={(e) => saveSettings(withMode(settings, e.target.checked ? (modeOf(settings) === "plan" ? "plan" : "agent") : "chat"))} /> Tools on (Agent or Plan mode)
-            </label>
-            <span className="help faint">Chat: plain chat, no tools are sent. Plan: only read-only tools (list, read, search, and MCP tools marked read-only that run without asking); the model looks around and ends with a plan you can run or edit. Agent: the agent instruction and the tools below are offered; tools still ask before running unless you allowed them.</span>
-            {settings.agent_mode && (
-              <>
-                <label className="check">
-                  <input type="checkbox" aria-label="Built-in shell and file tools" checked={settings.builtin_tools} onChange={(e) => saveSettings({ ...settings, builtin_tools: e.target.checked })} /> Built-in shell and file tools
-                </label>
-                {settings.builtin_tools && (
-                  <div className="field">
-                    <label htmlFor="cs-env">Run them on</label>
-                    <select id="cs-env" className="input" value={settings.environment_id ?? "local"}
-                      onChange={(e) => saveSettings({ ...settings, environment_id: e.target.value === "local" ? null : e.target.value })}>
-                      {(envs.length ? envs : [{ id: "local", name: "This PC" } as EnvView]).map((en) => <option key={en.id} value={en.id}>{en.name}{en.kind && en.kind !== "local" ? ` (${en.kind})` : ""}</option>)}
-                    </select>
-                    <span className="help">Set up SSH, Docker and sandboxes on the Execution Environments page.</span>
-                  </div>
-                )}
-                <label className="check">
-                  <input type="checkbox" aria-label="Use skills" checked={settings.skills} onChange={(e) => saveSettings({ ...settings, skills: e.target.checked })} /> Use skills (matching ones are added to the instruction)
-                </label>
-                <div className="field">
-                  <label htmlFor="cs-toolmode">Tool calls</label>
-                  <select id="cs-toolmode" className="input" aria-label="Tool calls" value={settings.tool_mode} onChange={(e) => saveSettings({ ...settings, tool_mode: e.target.value })}>
-                    <option value="auto">Automatic</option>
-                    <option value="native">Native</option>
-                    <option value="xml">Text format (for models without tool calling)</option>
-                  </select>
-                  <span className="help">Automatic uses native tool calls when the model's chat template supports them, otherwise the text format.</span>
-                </div>
-                {servers.length === 0 ? (
-                  <span className="faint">No MCP servers yet. Add one on the MCP Connections page.</span>
-                ) : (
-                  <div style={{ display: "grid", gap: 4 }}>
-                    <span className="faint" style={{ fontSize: 12 }}>Tool servers for this chat (none ticked = all connected)</span>
-                    {servers.map((sv) => (
-                      <label key={sv.id} className="check">
-                        <input type="checkbox" checked={settings.tool_servers.includes(sv.id)}
-                          onChange={(e) => saveSettings({ ...settings, tool_servers: e.target.checked ? [...settings.tool_servers, sv.id] : settings.tool_servers.filter((x) => x !== sv.id) })} />
-                        {sv.name} <span className="faint">({sv.status.state === "connected" ? `${sv.tools.filter((t) => t.enabled && t.policy !== "deny").length} tools` : sv.status.state})</span>
-                      </label>
-                    ))}
-                  </div>
-                )}
-                <div className="field">
-                  <label htmlFor="cs-maxcalls">Tool calls per reply</label>
-                  <input id="cs-maxcalls" className="input mono" value={settings.limits.max_tool_calls}
-                    onChange={(e) => setSettings({ ...settings, limits: { ...settings.limits, max_tool_calls: num(e.target.value) ?? 0 } })} onBlur={() => saveSettings(settings)} />
-                </div>
-                <div className="field">
-                  <label htmlFor="cs-wall">Reply time limit (seconds)</label>
-                  <input id="cs-wall" className="input mono" value={settings.limits.max_wall_secs}
-                    onChange={(e) => setSettings({ ...settings, limits: { ...settings.limits, max_wall_secs: num(e.target.value) ?? 0 } })} onBlur={() => saveSettings(settings)} />
-                </div>
-                {modeOf(settings) === "agent" && (
-                  <div className="chat-subagent-settings">
-                    <label className="check">
-                      <input type="checkbox" aria-label="Allow subagents" checked={!!settings.subagents} onChange={(e) => saveSettings({ ...settings, subagents: e.target.checked })} /> Allow subagents
-                    </label>
-                    {settings.subagents && (
-                      <div className="row" style={{ gap: 6 }}>
-                        <label htmlFor="cs-maxsub" className="faint" style={{ fontSize: 12 }}>at most</label>
-                        <input id="cs-maxsub" type="number" min={1} max={4} className="input mono" style={{ width: 64 }} aria-label="Max subagents at once" value={settings.max_subagents ?? 2}
-                          onChange={(e) => setSettings({ ...settings, max_subagents: num(e.target.value) ?? 0 })} onBlur={() => saveSettings(settings)} />
-                        <span className="faint" style={{ fontSize: 12 }}>at once</span>
-                      </div>
-                    )}
-                    <span className="help">The model can start subagents that work in parallel and share this reply's limits. Stop stops them all. Subagents that edit files can get their own git worktree.</span>
-                  </div>
-                )}
-              </>
+            <span className="faint" style={{ fontSize: 12 }}>Plan and Agent mode. Pick the mode and which tools this chat gets in the bar above the message box.</span>
+            {settings.builtin_tools && (
+              <div className="field">
+                <label htmlFor="cs-env">Run built-in tools on</label>
+                <select id="cs-env" className="input" value={settings.environment_id ?? "local"}
+                  onChange={(e) => saveSettings({ ...settings, environment_id: e.target.value === "local" ? null : e.target.value })}>
+                  {(envs.length ? envs : [{ id: "local", name: "This PC" } as EnvView]).map((en) => <option key={en.id} value={en.id}>{en.name}{en.kind && en.kind !== "local" ? ` (${en.kind})` : ""}</option>)}
+                </select>
+                <span className="help">Set up SSH, Docker and sandboxes on the Execution Environments page.</span>
+              </div>
             )}
+            <label className="check">
+              <input type="checkbox" aria-label="Use skills" checked={settings.skills} onChange={(e) => saveSettings({ ...settings, skills: e.target.checked })} /> Use skills (matching ones are added to the instruction)
+            </label>
+            <div className="field">
+              <label htmlFor="cs-toolmode">Tool calls</label>
+              <select id="cs-toolmode" className="input" aria-label="Tool calls" value={settings.tool_mode} onChange={(e) => saveSettings({ ...settings, tool_mode: e.target.value })}>
+                <option value="auto">Automatic</option>
+                <option value="native">Native</option>
+                <option value="xml">Text format (for models without tool calling)</option>
+              </select>
+              <span className="help">Automatic uses native tool calls when the model's chat template supports them, otherwise the text format.</span>
+            </div>
+            <div className="field">
+              <label htmlFor="cs-maxcalls">Tool calls per reply</label>
+              <input id="cs-maxcalls" className="input mono" placeholder="No limit" value={settings.limits.max_tool_calls ?? ""}
+                onChange={(e) => setSettings({ ...settings, limits: { ...settings.limits, max_tool_calls: num(e.target.value) } })} onBlur={() => saveSettings(settings)} />
+              <span className="help">Empty = no limit.</span>
+            </div>
+            <div className="field">
+              <label htmlFor="cs-wall">Reply time limit (seconds)</label>
+              <input id="cs-wall" className="input mono" placeholder="No limit" value={settings.limits.max_wall_secs ?? ""}
+                onChange={(e) => setSettings({ ...settings, limits: { ...settings.limits, max_wall_secs: num(e.target.value) } })} onBlur={() => saveSettings(settings)} />
+              <span className="help">Empty = no limit.</span>
+            </div>
           </div>
+          {/* --- end tool settings --- */}
           {support && (
             <div className="field">
               <label>Thinking ({support.model_name})</label>

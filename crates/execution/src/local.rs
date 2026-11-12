@@ -106,6 +106,13 @@ impl LocalEnv {
     pub fn powershell(&self) -> &str {
         &self.powershell
     }
+
+    /// The same environment for one call that may also reach `places`
+    /// outside the allowed folders (the user approved them). Protected
+    /// folders, `.git` writes and unsafe path forms stay refused.
+    pub fn with_approved(&self, places: &[PathBuf]) -> Self {
+        Self { policy: self.policy.with_approved(places), trash_dir: self.trash_dir.clone(), powershell: self.powershell.clone() }
+    }
 }
 
 #[async_trait]
@@ -362,5 +369,25 @@ mod tests {
         let moved = e.remove(&f.to_string_lossy(), false).await.unwrap();
         assert!(!f.exists() && std::path::Path::new(&moved).exists(), "moved to trash: {moved}");
         assert!(e.remove(&root.to_string_lossy(), true).await.is_err(), "root itself protected");
+    }
+
+    #[tokio::test]
+    async fn an_approved_outside_place_is_reachable_for_that_call_only() {
+        let (d, e) = env();
+        let outside = d.path().join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        let f = outside.join("a.txt");
+        let one = e.with_approved(std::slice::from_ref(&outside));
+        one.write_file(&f.to_string_lossy(), b"outside", false).await.unwrap();
+        assert_eq!(one.read_file(&f.to_string_lossy(), 100).await.unwrap().0, b"outside");
+        let spec = CommandSpec { cwd: Some(outside.to_string_lossy().into()), ..CommandSpec::new("(Get-Location).Path", Shell::PowerShell) };
+        let r = one.execute(&spec, &CancellationToken::new(), &|_| {}).await.unwrap();
+        assert!(r.stdout.to_lowercase().contains("elsewhere"), "{r:?}");
+        // The environment itself (and every other call) is still confined.
+        assert!(e.read_file(&f.to_string_lossy(), 100).await.is_err());
+        assert!(one.read_file(&d.path().join("trash").to_string_lossy(), 100).await.is_err(), "only the approved place");
+        // Deleting an outside file still goes to the app trash.
+        let moved = one.remove(&f.to_string_lossy(), false).await.unwrap();
+        assert!(!f.exists() && std::path::Path::new(&moved).exists());
     }
 }

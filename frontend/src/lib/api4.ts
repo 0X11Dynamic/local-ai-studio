@@ -24,6 +24,8 @@ export const BLANK_DOCKER: DockerConfig = {
 export const api4 = {
   list: () => invoke<EnvView[]>("list_environments"),
   setLocalRoots: (roots: string[]) => invoke<string[]>("set_local_roots", { roots }),
+  /** This PC: "ask" = paths outside the allowed folders ask each time; "off" = allowed folders only. */
+  setLocalOutside: (mode: "ask" | "off") => invoke<string>("set_local_outside", { mode }),
   health: (id: string) => invoke<Health>("environment_health", { id }),
   addSsh: (name: string, profile: SshProfile, secrets: SshSecrets) => invoke<string>("add_ssh_environment", { name, profile, secrets }),
   updateSsh: (id: string, name: string, profile: SshProfile, secrets: SshSecrets | null) => invoke<void>("update_ssh_environment", { id, name, profile, secrets }),

@@ -91,11 +91,11 @@ pub async fn update_chat_settings(state: State<'_, SharedState>, id: String, set
     if settings.reserve_tokens > 131_072 {
         return Err(AppError::InvalidInput("reserve is too large".into()));
     }
-    if settings.limits.max_tool_calls == 0 || settings.limits.max_tool_calls > 50 {
-        return Err(AppError::InvalidInput("tool calls per reply must be 1-50".into()));
+    if settings.limits.max_tool_calls.is_some_and(|n| n == 0 || n > 1000) {
+        return Err(AppError::InvalidInput("tool calls per reply must be 1-1000, or no limit".into()));
     }
-    if settings.limits.max_wall_secs < 10 || settings.limits.max_wall_secs > 3600 {
-        return Err(AppError::InvalidInput("reply time limit must be 10-3600 seconds".into()));
+    if settings.limits.max_wall_secs.is_some_and(|s| !(10..=86_400).contains(&s)) {
+        return Err(AppError::InvalidInput("reply time limit must be 10-86400 seconds, or no limit".into()));
     }
     if settings.max_subagents == 0 || settings.max_subagents > crate::services::tasks::MAX_PARALLEL_HARD {
         return Err(AppError::InvalidInput(format!("subagents at once must be 1 to {}", crate::services::tasks::MAX_PARALLEL_HARD)));

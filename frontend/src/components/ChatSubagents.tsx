@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { errorMessage } from "../lib/api";
 import type { ApprovalAnswer } from "../lib/api3";
-import { api5, STATE_LABEL, parseJson, type Budgets, type SubagentApproval, type SubagentRow, type SubagentSettings, type TaskEvent, type Usage } from "../lib/api5";
+import { api5, STATE_LABEL, parseJson, usedOf, type Budgets, type SubagentApproval, type SubagentRow, type SubagentSettings, type TaskEvent, type Usage } from "../lib/api5";
 
 const ACTIVE = ["queued", "running", "waiting"];
 
@@ -65,7 +65,7 @@ export function ChatSubagents({
       <ul className="sub-tree">
         {subs.map((s) => {
           const u = parseJson<Usage>(s.usage, { turns: 0, tool_calls: 0, wall_ms: 0, tokens: 0 });
-          const b = parseJson<Budgets>(s.budgets, { max_turns: 0, max_tool_calls: 0, max_wall_secs: 0, max_tokens: 0 });
+          const b = parseJson<Budgets>(s.budgets, { max_turns: null, max_tool_calls: null, max_wall_secs: null, max_tokens: null });
           const wt = parseJson<SubagentSettings>(s.settings, {}).worktree;
           // By the subagent's id: two children may share a label.
           const waiting = approvals.filter((a) => a.run_id === runId && a.agent_id === s.id);
@@ -75,7 +75,7 @@ export function ChatSubagents({
                 <span className="mono">{s.label || "subagent"}</span>
                 <span className={`tag${ACTIVE.includes(s.state) ? " accent" : ""}`} aria-label="Subagent state">{waiting.length ? "Waiting for approval" : STATE_LABEL[s.state] ?? s.state}</span>
                 <span className="faint mono" style={{ fontSize: 11.5 }}>
-                  {u.turns}/{b.max_turns} turns, {u.tool_calls}/{b.max_tool_calls} calls
+                  {usedOf(u.turns, b.max_turns)} turns, {usedOf(u.tool_calls, b.max_tool_calls)} calls
                 </span>
                 <span className="spacer" />
                 {ACTIVE.includes(s.state) && (

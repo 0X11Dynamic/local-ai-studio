@@ -6454,6 +6454,7 @@ dependencies = [
  "serde",
  "sysinfo",
  "tracing",
+ "windows",
 ]
 
 [[package]]

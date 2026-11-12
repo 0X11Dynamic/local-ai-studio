@@ -3,6 +3,7 @@
 //! budgets across replies and subagents on top of this.
 
 pub mod agent_loop;
+pub mod ask;
 pub mod dispatch;
 pub mod task;
 pub mod tools;

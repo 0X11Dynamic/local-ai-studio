@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { errorMessage } from "../lib/api";
 import {
-  api5, OPEN_CHAT_KEY, OPEN_TASK_KEY, STATE_LABEL, openChat, openTask, parseJson,
+  api5, DEFAULT_BUDGETS, OPEN_CHAT_KEY, OPEN_TASK_KEY, STATE_LABEL, openChat, openTask, parseJson, usedOf,
   type Budgets, type ChatRun, type RunSummary, type SubagentRow, type SubagentSettings, type TaskEvent, type Usage,
 } from "../lib/api5";
 import type { PageId } from "../App";
@@ -89,14 +89,14 @@ export function Subagents({ go }: { go: (p: PageId) => void }) {
               <ul className="sub-tree">
                 {g.list.map((s) => {
                   const u = parseJson<Usage>(s.usage, { turns: 0, tool_calls: 0, wall_ms: 0, tokens: 0 });
-                  const b = parseJson<Budgets>(s.budgets, { max_turns: 0, max_tool_calls: 0, max_wall_secs: 0, max_tokens: 0 });
+                  const b = parseJson<Budgets>(s.budgets, DEFAULT_BUDGETS);
                   return (
                     <li key={s.id}>
                       <div className="row">
                         <span className="mono">{s.label || "subagent"}</span>
                         <span className={`tag${ACTIVE.includes(s.state) ? " accent" : ""}`}>{STATE_LABEL[s.state] ?? s.state}</span>
                         <span className="faint mono" style={{ fontSize: 11.5 }}>
-                          {u.turns}/{b.max_turns} turns, {u.tool_calls}/{b.max_tool_calls} calls, {u.tokens.toLocaleString()}/{b.max_tokens.toLocaleString()} tokens
+                          {usedOf(u.turns, b.max_turns)} turns, {usedOf(u.tool_calls, b.max_tool_calls)} calls, {usedOf(u.tokens, b.max_tokens)} tokens
                         </span>
                         <span className="spacer" />
                         {ACTIVE.includes(s.state) && (

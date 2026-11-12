@@ -20,6 +20,13 @@ pub fn kv_bytes_per_element(t: &str) -> f64 {
     }
 }
 
+/// Architectures whose layers are mostly linear attention / recurrent, with
+/// a full-attention (KV cache) layer every [`HYBRID_FULL_ATTENTION_INTERVAL`].
+pub fn is_hybrid_attention(arch: &str) -> bool {
+    matches!(arch, "qwen35" | "qwen35moe" | "qwen3next")
+}
+pub const HYBRID_FULL_ATTENTION_INTERVAL: u64 = 4;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EstimateInput {
     pub n_ctx: u64,
@@ -68,16 +75,26 @@ pub fn estimate(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput) ->
     let head_dim = if head_count > 0 { meta.embedding_length.unwrap_or(0) / head_count } else { 0 };
     let k_len = meta.key_length.unwrap_or(head_dim);
     let v_len = meta.value_length.unwrap_or(head_dim);
+    // Hybrid models (Qwen3.5 / Qwen3-Next): only every 4th layer is full
+    // attention with a KV cache; the others keep a small fixed recurrent state
+    // (llama.cpp's default full_attention_interval is 4). Measured on
+    // Qwen3.5-4B at 16k: KV 512 MiB (a quarter of the dense formula) + RS 50 MiB.
+    let hybrid = meta.architecture.as_deref().is_some_and(is_hybrid_attention);
+    let kv_layers = if hybrid { layers.div_ceil(HYBRID_FULL_ATTENTION_INTERVAL) } else { layers };
     let kv_cache_bytes = if layers > 0 && kv_heads > 0 && k_len > 0 {
         let per_tok_k = (kv_heads * k_len) as f64 * kv_bytes_per_element(&input.cache_type_k);
         let per_tok_v = (kv_heads * v_len) as f64 * kv_bytes_per_element(&input.cache_type_v);
-        (layers as f64 * input.n_ctx as f64 * (per_tok_k + per_tok_v)) as u64
+        let recurrent = if hybrid { file_bytes / 50 * input.parallel.max(1) } else { 0 };
+        (kv_layers as f64 * input.n_ctx as f64 * (per_tok_k + per_tok_v)) as u64 + recurrent
     } else {
         notes.push("KV cache size unknown: header lacks attention dimensions.".into());
         0
     };
     if meta.architecture.as_deref().is_some_and(|a| a.starts_with("gemma") || a.contains("swa")) {
         notes.push("This architecture may use sliding-window attention, so the real KV cache can be smaller.".into());
+    }
+    if hybrid {
+        notes.push("Hybrid attention: only every 4th layer keeps a KV cache, the rest a small fixed state.".into());
     }
     if meta.expert_count.unwrap_or(0) > 0 {
         notes.push("Mixture-of-experts model: all experts must fit in memory even though few are active per token.".into());
@@ -189,11 +206,281 @@ pub fn share_split(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput,
     ShareSplit { gpu_layers: n, total_layers: total, n_cpu_moe: None, all_fit: false, vram_bytes: vram, summary }
 }
 
+/// Smallest context "Auto" ever picks (unless the model was trained on less).
+pub const AUTO_CTX_MIN: u64 = 2048;
+/// Upper bound when the GGUF header does not state the trained context.
+pub const AUTO_CTX_UNKNOWN_TRAINED: u64 = 32_768;
+/// Used when there is a GPU but no memory reading for it.
+pub const AUTO_CTX_NO_GPU_INFO: u64 = 8192;
+/// Share of free VRAM / available RAM an Auto context may fill.
+const AUTO_HEADROOM: f64 = 0.90;
+
+/// Context sizes Auto chooses from, up to `max`: 2k, 4k, 6k, 8k, 12k, 16k,
+/// 24k, 32k, 48k, 64k, 96k, 128k, ... (powers of two and the 1.5x step
+/// between them), plus `max` itself rounded down to a multiple of 1024, so a
+/// trained context like 40,960 can be used in full.
+pub fn ctx_steps(max: u64) -> Vec<u64> {
+    let mut v = Vec::new();
+    let mut p = AUTO_CTX_MIN;
+    while p <= max {
+        v.push(p);
+        if p >= 4096 && p + p / 2 <= max {
+            v.push(p + p / 2);
+        }
+        p *= 2;
+    }
+    let top = max / 1024 * 1024;
+    if top >= AUTO_CTX_MIN && !v.contains(&top) {
+        v.push(top);
+    }
+    v.sort_unstable();
+    v
+}
+
+/// What the machine has right now, for [`auto_n_ctx`].
+#[derive(Debug, Clone, Copy)]
+pub struct AutoCtxEnv {
+    /// Free VRAM on the GPU, None without a reading.
+    pub free_vram: Option<u64>,
+    pub available_ram: u64,
+    /// "Share with CPU" is on: what does not fit in VRAM may go to RAM.
+    pub share_with_cpu: bool,
+    pub has_n_cpu_moe: bool,
+    /// GPU offload is "Auto": llama.cpp moves layers to the CPU itself when
+    /// the whole model cannot be on the GPU.
+    pub auto_layers: bool,
+}
+
+/// The context size "Auto (fits your hardware)" chose.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AutoCtx {
+    pub n_ctx: u64,
+    /// The model's trained context, if the header has it.
+    pub trained: Option<u64>,
+    /// trained | memory | minimum | no_gpu_info
+    pub limited_by: String,
+    /// False when even the minimum does not fit (the load warnings say more).
+    pub fits: bool,
+    /// Plain description for the UI.
+    pub summary: String,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Budget {
+    Ram,
+    Gpu,
+    Shared,
+}
+
+fn fits_budget(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput, env: &AutoCtxEnv, budget: Budget) -> bool {
+    let ram_budget = (env.available_ram as f64 * AUTO_HEADROOM) as u64;
+    let free = env.free_vram.unwrap_or(0);
+    match budget {
+        Budget::Ram | Budget::Gpu => {
+            let e = estimate(meta, file_bytes, input);
+            e.vram_bytes <= (free as f64 * AUTO_HEADROOM) as u64 && e.ram_bytes <= ram_budget
+        }
+        Budget::Shared => {
+            // Same split "Share with CPU" makes (VRAM filled to 90%); the rest
+            // has to fit in RAM.
+            let mut all = input.clone();
+            all.gpu_layers = None;
+            let full = estimate(meta, file_bytes, &all);
+            let split = share_split(meta, file_bytes, &all, free, env.has_n_cpu_moe);
+            let in_ram = (full.weights_bytes + full.kv_cache_bytes + full.projector_bytes).saturating_sub(split.vram_bytes);
+            in_ram <= ram_budget
+        }
+    }
+}
+
+/// "Auto" context: the largest step from [`ctx_steps`] that is no larger than
+/// the trained context and whose estimate (KV cache type, projector and all
+/// included, from `input`) fits with ~10% headroom: in free VRAM when the
+/// model runs fully on the GPU; in free VRAM plus available RAM when Share
+/// with CPU is on (or GPU offload is Auto and the model is too big for the
+/// GPU anyway); in available RAM for CPU-only loads. Never below
+/// [`AUTO_CTX_MIN`]: if even that does not fit, it is used anyway and
+/// `fits` is false. `input.n_ctx` is ignored.
+pub fn auto_n_ctx(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput, env: &AutoCtxEnv) -> AutoCtx {
+    let trained = meta.context_length.filter(|&t| t > 0);
+    let cap = trained.unwrap_or(AUTO_CTX_UNKNOWN_TRAINED);
+    let floor = AUTO_CTX_MIN.min(cap).max(256);
+    let mut steps = ctx_steps(cap);
+    if steps.is_empty() {
+        steps.push(floor);
+    }
+    let top = *steps.last().unwrap();
+    let at = |n: u64| EstimateInput { n_ctx: n, ..input.clone() };
+    let fmt = |n: u64| {
+        let s = n.to_string();
+        let mut out = String::new();
+        for (i, c) in s.chars().enumerate() {
+            if i > 0 && (s.len() - i) % 3 == 0 {
+                out.push(',');
+            }
+            out.push(c);
+        }
+        out
+    };
+    let trained_note = match trained {
+        Some(t) => format!("trained: {}", fmt(t)),
+        None => format!("trained context unknown, capped at {}", fmt(cap)),
+    };
+    let uses_gpu = input.gpu_layers != Some(0);
+    if uses_gpu && env.free_vram.is_none() {
+        let n = AUTO_CTX_NO_GPU_INFO.min(top).max(floor);
+        return AutoCtx {
+            n_ctx: n,
+            trained,
+            limited_by: "no_gpu_info".into(),
+            fits: true,
+            summary: format!("No GPU memory reading, so Auto uses {} tokens ({trained_note}).", fmt(n)),
+        };
+    }
+    // Budgets to try, best first: fully on the GPU before spilling to RAM.
+    let budgets: Vec<Budget> = if !uses_gpu {
+        vec![Budget::Ram]
+    } else if env.share_with_cpu {
+        vec![Budget::Shared]
+    } else if env.auto_layers {
+        vec![Budget::Gpu, Budget::Shared]
+    } else {
+        vec![Budget::Gpu]
+    };
+    for (bi, &b) in budgets.iter().enumerate() {
+        // Auto layers: only fall back to a CPU split when not even the
+        // minimum fits fully on the GPU.
+        if bi > 0 && fits_budget(meta, file_bytes, &at(floor), env, budgets[0]) {
+            break;
+        }
+        if let Some(&n) = steps.iter().rev().find(|&&n| fits_budget(meta, file_bytes, &at(n), env, b)) {
+            let where_ = match b {
+                Budget::Ram => "90% of available RAM",
+                Budget::Gpu => "90% of free VRAM",
+                Budget::Shared => "free VRAM plus 90% of available RAM",
+            };
+            let (limited_by, summary) = if n == top && trained.is_some() {
+                ("trained", format!("The model's full trained context fits in {where_}."))
+            } else {
+                ("memory", format!("Largest size whose estimate fits in {where_} ({trained_note})."))
+            };
+            return AutoCtx { n_ctx: n, trained, limited_by: limited_by.into(), fits: true, summary };
+        }
+    }
+    AutoCtx {
+        n_ctx: floor,
+        trained,
+        limited_by: "minimum".into(),
+        fits: false,
+        summary: format!("Even {} tokens may not fit in memory, so Auto uses the minimum; see the warnings.", fmt(floor)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const GIB: u64 = 1 << 30;
+
+    fn env(free_vram: u64, ram: u64) -> AutoCtxEnv {
+        AutoCtxEnv { free_vram: Some(free_vram), available_ram: ram, share_with_cpu: false, has_n_cpu_moe: true, auto_layers: false }
+    }
+
+    fn trained(t: u64) -> ModelMetadata {
+        ModelMetadata { context_length: Some(t), ..meta() }
+    }
+
+    fn fits_gpu(m: &ModelMetadata, size: u64, i: &EstimateInput, n: u64, free: u64) -> bool {
+        estimate(m, size, &EstimateInput { n_ctx: n, ..i.clone() }).vram_bytes <= free * 9 / 10
+    }
+
+    #[test]
+    fn ctx_steps_are_power_of_two_ish_and_include_the_trained_size() {
+        assert_eq!(ctx_steps(32_768), vec![2048, 4096, 6144, 8192, 12_288, 16_384, 24_576, 32_768]);
+        let s = ctx_steps(40_960);
+        assert_eq!(*s.last().unwrap(), 40_960);
+        assert!(s.contains(&32_768) && !s.contains(&49_152));
+        assert_eq!(*ctx_steps(131_072).last().unwrap(), 131_072);
+        assert!(ctx_steps(1000).is_empty());
+    }
+
+    #[test]
+    fn auto_ctx_small_vram_picks_the_largest_step_that_fits() {
+        // 8B, 4.9 GB, 128 KiB of KV per token: 6 GiB free leaves room for ~4.5k tokens.
+        let m = trained(131_072);
+        let free = 6 * GIB;
+        let a = auto_n_ctx(&m, 4_900_000_000, &input(0), &env(free, 32 * GIB));
+        assert_eq!(a.n_ctx, 4096, "{a:?}");
+        assert!(a.fits && a.limited_by == "memory", "{a:?}");
+        assert!(fits_gpu(&m, 4_900_000_000, &input(0), 4096, free) && !fits_gpu(&m, 4_900_000_000, &input(0), 6144, free));
+        // A quantized KV cache fits more context in the same VRAM.
+        let q = EstimateInput { cache_type_k: "q8_0".into(), cache_type_v: "q8_0".into(), ..input(0) };
+        assert!(auto_n_ctx(&m, 4_900_000_000, &q, &env(free, 32 * GIB)).n_ctx > 4096);
+        // The projector takes VRAM, so less context fits.
+        let p = EstimateInput { projector_bytes: 400_000_000, ..input(0) };
+        assert!(auto_n_ctx(&m, 4_900_000_000, &p, &env(free, 32 * GIB)).n_ctx < 4096);
+    }
+
+    #[test]
+    fn auto_ctx_big_vram_is_capped_by_the_trained_context() {
+        let big = env(24 * GIB, 64 * GIB);
+        let a = auto_n_ctx(&trained(131_072), 4_900_000_000, &input(0), &big);
+        assert_eq!((a.n_ctx, a.limited_by.as_str()), (131_072, "trained"), "{a:?}");
+        // A trained size between steps is used in full.
+        let b = auto_n_ctx(&trained(40_960), 4_900_000_000, &input(0), &big);
+        assert_eq!((b.n_ctx, b.limited_by.as_str()), (40_960, "trained"), "{b:?}");
+        // Unknown trained context: capped at 32k.
+        let c = auto_n_ctx(&meta(), 4_900_000_000, &input(0), &big);
+        assert_eq!((c.n_ctx, c.limited_by.as_str()), (32_768, "memory"), "{c:?}");
+        // 24 GiB but a longer trained context: memory is the limit, below 256k.
+        let d = auto_n_ctx(&trained(1_048_576), 4_900_000_000, &input(0), &big);
+        assert!(d.limited_by == "memory" && d.n_ctx >= 65_536 && d.n_ctx < 262_144, "{d:?}");
+    }
+
+    #[test]
+    fn auto_ctx_never_goes_below_the_minimum() {
+        // The weights alone do not fit in 4 GiB with every layer on the GPU.
+        let a = auto_n_ctx(&trained(131_072), 4_900_000_000, &input(0), &env(4 * GIB, 32 * GIB));
+        assert_eq!((a.n_ctx, a.fits, a.limited_by.as_str()), (AUTO_CTX_MIN, false, "minimum"), "{a:?}");
+        // No GPU reading: a safe fixed size.
+        let n = auto_n_ctx(&trained(131_072), 4_900_000_000, &input(0), &AutoCtxEnv { free_vram: None, ..env(0, 32 * GIB) });
+        assert_eq!((n.n_ctx, n.limited_by.as_str()), (AUTO_CTX_NO_GPU_INFO, "no_gpu_info"));
+    }
+
+    #[test]
+    fn auto_ctx_share_with_cpu_counts_ram_too() {
+        // 16 GB dense model, 8 GiB free VRAM: nothing fits fully on the GPU.
+        let m = trained(131_072);
+        let size = 16_000_000_000;
+        let gpu_only = auto_n_ctx(&m, size, &input(0), &env(8 * GIB, 32 * GIB));
+        assert!(!gpu_only.fits && gpu_only.n_ctx == AUTO_CTX_MIN, "{gpu_only:?}");
+        let share = AutoCtxEnv { share_with_cpu: true, ..env(8 * GIB, 32 * GIB) };
+        let a = auto_n_ctx(&m, size, &input(0), &share);
+        assert!(a.fits && a.n_ctx > AUTO_CTX_MIN && a.limited_by != "minimum", "{a:?}");
+        // The chosen size leaves the RAM part under 90% of available RAM, the next step does not.
+        let in_ram = |n: u64| {
+            let all = EstimateInput { n_ctx: n, ..input(0) };
+            let full = estimate(&m, size, &all);
+            let split = share_split(&m, size, &all, 8 * GIB, true);
+            (full.weights_bytes + full.kv_cache_bytes).saturating_sub(split.vram_bytes)
+        };
+        assert!(in_ram(a.n_ctx) <= 32 * GIB * 9 / 10);
+        if let Some(&next) = ctx_steps(131_072).iter().find(|&&n| n > a.n_ctx) {
+            assert!(in_ram(next) > 32 * GIB * 9 / 10, "{a:?} next {next}");
+        }
+        // Less RAM: less context.
+        let small = auto_n_ctx(&m, size, &input(0), &AutoCtxEnv { share_with_cpu: true, ..env(8 * GIB, 16 * GIB) });
+        assert!(small.n_ctx < a.n_ctx, "{small:?} vs {a:?}");
+        // GPU offload Auto behaves like sharing when the model can't be on the GPU...
+        let auto_layers = auto_n_ctx(&m, size, &input(0), &AutoCtxEnv { auto_layers: true, ..env(8 * GIB, 32 * GIB) });
+        assert_eq!(auto_layers.n_ctx, a.n_ctx);
+        // ...but keeps a model that fits on the GPU there.
+        let fits = auto_n_ctx(&m, 4_900_000_000, &input(0), &AutoCtxEnv { auto_layers: true, ..env(6 * GIB, 32 * GIB) });
+        assert_eq!(fits.n_ctx, 4096, "{fits:?}");
+        // CPU only: RAM is the only budget.
+        let cpu = auto_n_ctx(&m, 4_900_000_000, &EstimateInput { gpu_layers: Some(0), ..input(0) }, &env(0, 16 * GIB));
+        assert!(cpu.fits && cpu.n_ctx >= 65_536, "{cpu:?}");
+    }
 
     #[test]
     fn share_split_fits_splits_moe_and_zero_vram() {
@@ -281,6 +568,20 @@ mod tests {
         let e = estimate(&meta(), 4_900_000_000, &input(8192));
         assert_eq!(e.kv_cache_bytes, 32 * 8192 * 8 * 128 * 2 * 2);
         assert_eq!(e.kv_cache_bytes, 1 << 30); // 1 GiB at 8k context
+    }
+
+    #[test]
+    fn hybrid_attention_models_keep_kv_on_every_fourth_layer() {
+        let dense = estimate(&meta(), 2_800_000_000, &input(16_384)).kv_cache_bytes;
+        let qwen35 = ModelMetadata { architecture: Some("qwen35".into()), ..meta() };
+        let h = estimate(&qwen35, 2_800_000_000, &input(16_384));
+        // 32 layers -> 8 with a KV cache, plus a fixed recurrent state.
+        assert_eq!(h.kv_cache_bytes, dense / 4 + 2_800_000_000 / 50);
+        assert!(h.notes.iter().any(|n| n.contains("Hybrid attention")));
+        // So Auto fits more context in the same VRAM.
+        let e = env(6 * GIB, 32 * GIB);
+        let m = ModelMetadata { context_length: Some(262_144), ..qwen35 };
+        assert!(auto_n_ctx(&m, 2_800_000_000, &input(0), &e).n_ctx > auto_n_ctx(&trained(262_144), 2_800_000_000, &input(0), &e).n_ctx);
     }
 
     #[test]

@@ -1,0 +1,244 @@
+[
+ {
+  "tag_name": "b12319",
+  "name": "b12319",
+  "draft": false,
+  "prerelease": true,
+  "published_at": "2026-11-12T16:34:48Z",
+  "assets": [
+   {
+    "name": "cudart-llama-bin-win-cuda-12.4-x64.zip",
+    "size": 391443627,
+    "digest": "sha256:8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12319/cudart-llama-bin-win-cuda-12.4-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 142
+   },
+   {
+    "name": "cudart-llama-bin-win-cuda-13.5-arm64.zip",
+    "size": 278821062,
+    "digest": "sha256:f89e7b2457f627d052dd99f42205ddfd01964454809754cdc649cffc74320dca",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12319/cudart-llama-bin-win-cuda-13.5-arm64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 15
+   },
+   {
+    "name": "cudart-llama-bin-win-cuda-13.5-x64.zip",
+    "size": 426314199,
+    "digest": "sha256:c2bf4cc202bfbaaa7a0b75f5082457c3811326947bb216059b72839d844e9cba",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12319/cudart-llama-bin-win-cuda-13.5-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 121
+   },
+   {
+    "name": "llama-b12319-bin-win-cpu-arm64.zip",
+    "size": 13434289,
+    "digest": "sha256:9d506ae3b17a74193bc578177ced84291587a1cda849c8abaa5143a8fd274dcc",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12319/llama-b12319-bin-win-cpu-arm64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 8
+   },
+   {
+    "name": "llama-b12319-bin-win-cpu-x64.zip",
+    "size": 25084213,
+    "digest": "sha256:a6a727f1475dc806cb7fe5c8d276af2d1f09d4d68bcd9fa9095b13eca083047a",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12319/llama-b12319-bin-win-cpu-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 222
+   },
+   {
+    "name": "llama-b12319-bin-win-cuda-12.4-x64.zip",
+    "size": 317248396,
+    "digest": "sha256:cc1830988a3b5c903b4335db194458c71cac83efa1f0b515faeee78dbd180e83",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12319/llama-b12319-bin-win-cuda-12.4-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 213
+   },
+   {
+    "name": "llama-b12319-bin-win-cuda-13.5-arm64.zip",
+    "size": 165663226,
+    "digest": "sha256:a17108d649cff900b2917c14b8afc1374efb6513b176210f8e556b5252aec827",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12319/llama-b12319-bin-win-cuda-13.5-arm64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 10
+   },
+   {
+    "name": "llama-b12319-bin-win-cuda-13.5-x64.zip",
+    "size": 178039502,
+    "digest": "sha256:affdebf784dd2e0792913a37d5ed91135b8e98a55179bfb48a1fbca67716e720",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12319/llama-b12319-bin-win-cuda-13.5-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 201
+   },
+   {
+    "name": "llama-b12319-bin-win-opencl-adreno-arm64.zip",
+    "size": 14462337,
+    "digest": "sha256:19d889b1f114687146b1d0a1a0383809f49da643fa8bd8a09977a6f375fe0a8c",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12319/llama-b12319-bin-win-opencl-adreno-arm64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 7
+   },
+   {
+    "name": "llama-b12319-bin-win-openvino-2026.4.1-x64.zip",
+    "size": 105082447,
+    "digest": "sha256:9d9bc8f208d7f21ed2d43773f82bc1893e3dc4a6dcdf8f467dfe43f10bb14781",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12319/llama-b12319-bin-win-openvino-2026.4.1-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 5
+   },
+   {
+    "name": "llama-b12319-bin-win-rocm-10.0-x64.zip",
+    "size": 280058586,
+    "digest": "sha256:614b4eec1e6a330b5c4cf61f3a0d61dd6da8d8d3cb72da04cfebd3cd79810211",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12319/llama-b12319-bin-win-rocm-10.0-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 27
+   },
+   {
+    "name": "llama-b12319-bin-win-sycl-x64.zip",
+    "size": 172277553,
+    "digest": "sha256:54647291a1d047c38a52296e491079d8f415e60303d7f0f6a1e1f03af7ab3d29",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12319/llama-b12319-bin-win-sycl-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 11
+   },
+   {
+    "name": "llama-b12319-bin-win-vulkan-arm64.zip",
+    "size": 25978055,
+    "digest": "sha256:085432c527d7afb90c1e6d6b8ed89bd39ed0cb80292a9439698cc83ce6a192cc",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12319/llama-b12319-bin-win-vulkan-arm64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 6
+   },
+   {
+    "name": "llama-b12319-bin-win-vulkan-x64.zip",
+    "size": 38052665,
+    "digest": "sha256:37604da79b2169c2f0c4e4e38b21cb0c87d31dd056a53a834fe11e9bc9b98ab3",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12319/llama-b12319-bin-win-vulkan-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 169
+   }
+  ]
+ },
+ {
+  "tag_name": "b12318",
+  "name": "b12318",
+  "draft": false,
+  "prerelease": true,
+  "published_at": "2026-11-12T11:36:10Z",
+  "assets": [
+   {
+    "name": "cudart-llama-bin-win-cuda-12.4-x64.zip",
+    "size": 391443627,
+    "digest": "sha256:8c79a9b226de4b3cacfd1f83d24f962d0773be79f1e7b75c6af4ded7e32ae1d6",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12318/cudart-llama-bin-win-cuda-12.4-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 1627
+   },
+   {
+    "name": "cudart-llama-bin-win-cuda-13.5-arm64.zip",
+    "size": 278821062,
+    "digest": "sha256:f89e7b2457f627d052dd99f42205ddfd01964454809754cdc649cffc74320dca",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12318/cudart-llama-bin-win-cuda-13.5-arm64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 76
+   },
+   {
+    "name": "cudart-llama-bin-win-cuda-13.5-x64.zip",
+    "size": 426314199,
+    "digest": "sha256:c2bf4cc202bfbaaa7a0b75f5082457c3811326947bb216059b72839d844e9cba",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12318/cudart-llama-bin-win-cuda-13.5-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 1208
+   },
+   {
+    "name": "llama-b12318-bin-win-cpu-arm64.zip",
+    "size": 13432566,
+    "digest": "sha256:6134cb94a120154381e0c7b3cf021a93e4508cbe3d1e6bd8939d2bb7215631ce",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12318/llama-b12318-bin-win-cpu-arm64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 65
+   },
+   {
+    "name": "llama-b12318-bin-win-cpu-x64.zip",
+    "size": 25084375,
+    "digest": "sha256:df4b8ca49b5d21202238faafe6685affcd3012dcc523be1ad0d74fda6a72c235",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12318/llama-b12318-bin-win-cpu-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 1797
+   },
+   {
+    "name": "llama-b12318-bin-win-cuda-12.4-x64.zip",
+    "size": 317258181,
+    "digest": "sha256:20281408c618dcd13080bc0b3deed250c413bbe6541421a1c989acf5a376e684",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12318/llama-b12318-bin-win-cuda-12.4-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 2690
+   },
+   {
+    "name": "llama-b12318-bin-win-cuda-13.5-arm64.zip",
+    "size": 165662874,
+    "digest": "sha256:084a9a8a026cc4d6cb64023b6650b80ec88540f853ad7ef8a0f9432c4e9141b4",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12318/llama-b12318-bin-win-cuda-13.5-arm64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 72
+   },
+   {
+    "name": "llama-b12318-bin-win-cuda-13.5-x64.zip",
+    "size": 178039491,
+    "digest": "sha256:903bc987753e202b3d0ec133814bc9f4e596e8a1aa44402e76678c1880dc1e8f",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12318/llama-b12318-bin-win-cuda-13.5-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 1685
+   },
+   {
+    "name": "llama-b12318-bin-win-opencl-adreno-arm64.zip",
+    "size": 14461984,
+    "digest": "sha256:bf675702204e9f131db70bc341d83ff2181e7ebefbabb3fd0eb94acb29763f90",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12318/llama-b12318-bin-win-opencl-adreno-arm64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 36
+   },
+   {
+    "name": "llama-b12318-bin-win-openvino-2026.4.1-x64.zip",
+    "size": 105082438,
+    "digest": "sha256:8167678131afbd0d543b5216ff957e4f2487ebeb0333ff795016c992be2737be",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12318/llama-b12318-bin-win-openvino-2026.4.1-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 63
+   },
+   {
+    "name": "llama-b12318-bin-win-rocm-10.0-x64.zip",
+    "size": 280058576,
+    "digest": "sha256:d2c51ee355ee773007d74768b265d92b5c4cb4193198710c2e118f96582c72e2",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12318/llama-b12318-bin-win-rocm-10.0-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 143
+   },
+   {
+    "name": "llama-b12318-bin-win-sycl-x64.zip",
+    "size": 172277650,
+    "digest": "sha256:3af46f4ec5a6d06a89504f0caf9695c3411c44b5a31b26bc58e5d70ef132951d",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12318/llama-b12318-bin-win-sycl-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 87
+   },
+   {
+    "name": "llama-b12318-bin-win-vulkan-arm64.zip",
+    "size": 25977703,
+    "digest": "sha256:3c7da9021a3d21653bf546ca722d8ef22d2e20b618ad05b054c15a0e7f4fb2dd",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12318/llama-b12318-bin-win-vulkan-arm64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 49
+   },
+   {
+    "name": "llama-b12318-bin-win-vulkan-x64.zip",
+    "size": 38052654,
+    "digest": "sha256:bbf0403e8608f8638073842c71a6e8ddeed6bc8aa5d89e4d569994d57ddc8a10",
+    "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/b12318/llama-b12318-bin-win-vulkan-x64.zip",
+    "content_type": "application/json; charset=utf-8",
+    "download_count": 1783
+   }
+  ]
+ }
+]

@@ -90,6 +90,12 @@ export interface EstimateView {
   share_split: ShareSplit | null;
   /** Off, and the model doesn't fit in free VRAM: suggest turning it on. */
   suggest_share: boolean;
+  /** What "Auto (fits your hardware)" context picks now; the estimate uses it when n_ctx is 0. */
+  auto_ctx: AutoCtx;
+}
+export interface AutoCtx {
+  n_ctx: number; trained: number | null;
+  limited_by: "trained" | "memory" | "minimum" | "no_gpu_info"; fits: boolean; summary: string;
 }
 export interface ShareSplit {
   gpu_layers: number; total_layers: number; n_cpu_moe: number | null; all_fit: boolean; vram_bytes: number; summary: string;
@@ -133,7 +139,8 @@ export const api = {
   scanLmStudio: () => invoke<ImportReport>("scan_lmstudio"),
   refreshModels: () => invoke<ModelView[]>("refresh_models"),
   removeModel: (id: string) => invoke<void>("remove_model", { id }),
-  deleteModelFiles: (id: string, confirmName: string) => invoke<string[]>("delete_model_files", { id, confirmName }),
+  /** Permanently deletes the model's GGUF files; `confirm` must be true (the user ticked the box). */
+  deleteModelFiles: (id: string, confirm: boolean) => invoke<string[]>("delete_model_files", { id, confirm }),
   estimateMemory: (id: string, config: LoadConfig) => invoke<EstimateView>("estimate_memory", { id, config }),
   getLoadDefaults: (id: string) => invoke<LoadDefaults>("get_load_defaults", { id }),
   saveModelDefaults: (id: string, config: LoadConfig) => invoke<void>("save_model_defaults", { id, config }),

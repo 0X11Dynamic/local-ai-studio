@@ -24,6 +24,10 @@ pub struct InstructionSettings {
     pub base: String,
     pub chat_profile_id: Option<String>,
     pub agent_profile_id: Option<String>,
+    /// Plan mode profile (the built-in Planner by default). Callers that
+    /// leave it out keep the saved value.
+    #[serde(default)]
+    pub plan_profile_id: Option<String>,
 }
 
 fn validate(title: &str, s: &Sections) -> Cmd<()> {
@@ -65,11 +69,17 @@ pub async fn update_instruction_profile(state: State<'_, SharedState>, id: Strin
 #[tauri::command]
 pub async fn delete_instruction_profile(state: State<'_, SharedState>, id: String) -> Cmd<()> {
     state.db.delete_preset(&id).await?;
-    // Defaults pointing at the deleted profile fall back to General Assistant.
-    for key in ["instructions.chat_profile", "instructions.agent_profile"] {
+    // Defaults pointing at the deleted profile fall back to General Assistant
+    // (the Plan default to the built-in Planner).
+    for key in ["instructions.chat_profile", "instructions.agent_profile", "instructions.plan_profile"] {
         if state.db.get_setting::<String>(key).await?.as_deref() == Some(id.as_str()) {
-            let general = state.db.list_presets(KIND).await?.into_iter().find(|p| p.title == "General Assistant").map(|p| p.id);
-            state.db.set_setting(key, &general).await?;
+            let all = state.db.list_presets(KIND).await?;
+            let fallback = if key == "instructions.plan_profile" {
+                all.iter().find(|p| p.builtin != 0 && p.title.starts_with("Planner"))
+            } else {
+                all.iter().find(|p| p.title == "General Assistant")
+            };
+            state.db.set_setting(key, &fallback.map(|p| p.id.clone())).await?;
         }
     }
     Ok(())
@@ -81,6 +91,7 @@ pub async fn get_instruction_settings(state: State<'_, SharedState>) -> Cmd<Inst
         base: state.db.get_setting("instructions.base").await?.unwrap_or_default(),
         chat_profile_id: state.db.get_setting("instructions.chat_profile").await?,
         agent_profile_id: state.db.get_setting("instructions.agent_profile").await?,
+        plan_profile_id: state.db.get_setting("instructions.plan_profile").await?,
     })
 }
 
@@ -89,12 +100,15 @@ pub async fn set_instruction_settings(state: State<'_, SharedState>, settings: I
     if settings.base.len() > 100_000 {
         return Err(AppError::InvalidInput("base instruction is too long".into()));
     }
-    for id in [&settings.chat_profile_id, &settings.agent_profile_id].into_iter().flatten() {
+    for id in [&settings.chat_profile_id, &settings.agent_profile_id, &settings.plan_profile_id].into_iter().flatten() {
         state.db.get_preset(id).await?;
     }
     state.db.set_setting("instructions.base", &settings.base).await?;
     state.db.set_setting("instructions.chat_profile", &settings.chat_profile_id).await?;
     state.db.set_setting("instructions.agent_profile", &settings.agent_profile_id).await?;
+    if settings.plan_profile_id.is_some() {
+        state.db.set_setting("instructions.plan_profile", &settings.plan_profile_id).await?;
+    }
     Ok(())
 }
 
@@ -144,11 +158,15 @@ pub async fn preview_instructions(
         Some(b) => b,
         None => st.db.get_setting("instructions.base").await?.unwrap_or_default(),
     };
-    let mode = if mode == "agent" { "agent" } else { "chat" };
-    // Agent Mode preview: a new chat's defaults (built-in tools on This PC,
-    // plus every connected MCP server).
+    let plan = mode == "plan";
+    let mode = if mode == "agent" || plan { "agent" } else { "chat" };
+    // Agent / Plan Mode preview: a new chat's defaults (built-in tools on This
+    // PC, plus every connected MCP server; Plan keeps only read-only tools).
     let section = if mode == "agent" {
-        let defaults = crate::services::chat::ChatSettings { agent_mode: true, ..Default::default() };
+        let mut defaults = crate::services::chat::ChatSettings { agent_mode: true, ..Default::default() };
+        if plan {
+            defaults.mode = "plan".into();
+        }
         Some(crate::services::chat::agent_tools(&st, &defaults).await?.1)
     } else {
         None

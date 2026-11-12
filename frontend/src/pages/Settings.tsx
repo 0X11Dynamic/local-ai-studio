@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { invoke } from "@tauri-apps/api/core";
 import { Markdown } from "../components/Markdown";
+import { OPEN_SETUP_EVENT } from "../components/FirstRun";
 import { api, errorMessage, type AppPaths } from "../lib/api";
 import { api2 } from "../lib/api2";
 
@@ -93,6 +94,12 @@ export function Settings() {
           </div>
           <span className="help">Stored in Windows Credential Manager and sent only to huggingface.co. It is never shown again or written to logs.</span>
         </div>
+      </div>
+
+      <h2>Setup</h2>
+      <p className="lede">Check this PC again, install the recommended runtime and get a starter model.</p>
+      <div className="row" style={{ marginBottom: 10 }}>
+        <button className="btn sm" onClick={() => window.dispatchEvent(new Event(OPEN_SETUP_EVENT))}>Run setup again</button>
       </div>
 
       <h2>User guide</h2>

@@ -15,7 +15,16 @@ export interface ToolView extends ToolInfo { enabled: boolean; policy: "allow" |
 export interface ServerView {
   id: string; name: string; transport: string; enabled: boolean; config: ServerConfig;
   secret_env_set: string[]; secret_headers_set: string[]; bearer_set: boolean; status: ServerStatus; tools: ToolView[];
+  /** Background connect (app start, import, turned on); null when none is running or waiting. */
+  auto?: AutoConnect | null;
 }
+export interface AutoConnect { attempt: number; max_attempts: number; retry_in_secs: number | null; gave_up: boolean }
+/** One tool source in a chat's Tools menu: "builtin" or an MCP server. */
+export interface ToolCostEntry {
+  id: string; name: string; kind: "builtin" | "mcp"; state: string; enabled: boolean; in_chat: boolean;
+  tool_count: number; tokens: number; error: string | null;
+}
+export interface ToolCosts { exact: boolean; mode: "chat" | "plan" | "agent"; entries: ToolCostEntry[] }
 export interface SecretsPatch { env?: Record<string, string | null>; headers?: Record<string, string | null>; bearer?: string | null }
 export interface ImportReport { added: string[]; skipped: string[]; secrets_stored: number }
 export interface GrantView {
@@ -66,4 +75,6 @@ export const api3 = {
   answerApproval: (id: string, answer: ApprovalAnswer) => invoke<void>("answer_tool_approval", { id, answer }),
   runToolManually: (serverId: string, tool: string, args: unknown, conversationId: string | null = null) =>
     invoke<{ status: string; content: string; audit_id: string | null }>("run_tool_manually", { serverId, tool, arguments: args, conversationId }),
+  /** Per-source tool count and token cost for one chat (composer Tools menu). */
+  chatToolCosts: (id: string) => invoke<ToolCosts>("chat_tool_costs", { id }),
 };

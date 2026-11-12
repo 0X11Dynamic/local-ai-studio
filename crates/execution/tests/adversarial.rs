@@ -193,6 +193,51 @@ async fn junctions_and_symlinks_out_of_the_root_are_refused_everywhere() {
     }
 }
 
+/// With "Reach outside allowed folders: Ask each time" the app asks instead
+/// of refusing: every trick that reaches outside is classified Outside with
+/// the place it REALLY reaches (what the approval card shows), and only an
+/// approval of that place lets the call through. Always-blocked forms stay
+/// errors, approval or not.
+#[tokio::test]
+async fn outside_tricks_ask_with_the_real_target_and_blocked_forms_never_ask() {
+    use execution::paths::Reach;
+    let f = fx();
+    let p = &f.env.policy;
+    let secret = f.outside.join("secret.txt");
+    let same = |a: &Path, b: &Path| a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase();
+    let link = f.root.join("link");
+    junction(&link, &f.outside);
+    let mut tricks = vec![
+        s(&secret),
+        "../outside_folder_with_a_long_name/secret.txt".to_string(),
+        r"sub/..\..\outside_folder_with_a_long_name/secret.txt".into(),
+        format!("{}\\..\\OUTSIDE_FOLDER_WITH_A_LONG_NAME\\secret.txt", s(&f.root).to_uppercase()),
+        s(&link.join("secret.txt")),
+    ];
+    if let Some(short) = short_name(&f.outside) {
+        tricks.push(format!(r"{short}\secret.txt"));
+    }
+    for t in &tricks {
+        let (real, reach) = p.classify(t).unwrap_or_else(|e| panic!("{t}: {e}"));
+        assert_eq!(reach, Reach::Outside, "{t}");
+        assert!(same(&real, &secret), "{t} must show the real target, got {}", real.display());
+        assert!(f.env.read_file(t, 100).await.is_err(), "{t} without approval");
+    }
+    // Approved for that place: the read goes through (to the real file only).
+    let approved = f.env.with_approved(std::slice::from_ref(&secret));
+    for t in &tricks {
+        assert_eq!(approved.read_file(t, 100).await.unwrap().0, b"TOP SECRET", "{t}");
+    }
+    assert!(approved.read_file(&s(&f.base.join("trash").join("x")), 10).await.is_err(), "nothing else");
+    // Never asked, always refused.
+    let everything = f.env.with_approved(&[PathBuf::from(r"C:\")]);
+    for bad in [r"\\server\share\x.txt", "//server/share/x.txt", r"\\?\C:\Windows\win.ini", r"\\.\PhysicalDrive0", r"C:secret.txt", "notes.txt:hidden", r"C:\PROGRA~1\x.txt", r"C:\WINDOWS\SYSTEM32\..\win.ini"] {
+        assert!(p.classify(bad).is_err(), "{bad} must be blocked, not asked");
+        assert!(everything.read_file(bad, 10).await.is_err(), "{bad} even under an approval of C:\\");
+    }
+    std::process::Command::new("cmd").args(["/c", "rmdir", &s(&link)]).output().unwrap();
+}
+
 #[tokio::test]
 async fn concurrent_writes_are_atomic() {
     let f = fx();

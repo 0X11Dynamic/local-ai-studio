@@ -250,21 +250,29 @@ await check("the bearer token is not in the database files or the log", async ()
   return dbs.join(", ");
 });
 
-await check("mcpServers import/export: secrets to the vault, placeholders on export, imports start off", async () => {
-  const doc = { mcpServers: { "imported-one": { command: "node", args: ["x.js"], env: { HOME_DIR: "C:\\x", MY_API_KEY: "sk-IMPORTEDSECRET9988" } } } };
+await check("mcpServers import/export: secrets to the vault, placeholders on export, imports start on and connect (tools still ask)", async () => {
+  // Imports start turned on and connect in the background (retrying with
+  // backoff); "disabled": true in the file keeps one off. Tools still ask.
+  const doc = { mcpServers: { "imported-one": { command: "node", args: ["x.js"], env: { HOME_DIR: "C:\\x", MY_API_KEY: "sk-IMPORTEDSECRET9988" } }, "imported-off": { command: "node", args: ["y.js"], disabled: true } } };
   const r = await inv("import_mcp_servers", { json: JSON.stringify(doc) });
-  assert(r.added.includes("imported-one") && r.secrets_stored === 1, JSON.stringify(r));
+  assert(r.added.includes("imported-one") && r.added.includes("imported-off") && r.secrets_stored === 1, JSON.stringify(r));
   const s = await server("imported-one");
-  assert(!s.enabled && s.status.state === "disconnected" && s.secret_env_set.includes("MY_API_KEY") && s.config.env.HOME_DIR === "C:\\x", JSON.stringify(s.config));
+  assert(s.enabled && s.secret_env_set.includes("MY_API_KEY") && s.config.env.HOME_DIR === "C:\\x", JSON.stringify(s.config));
+  // x.js doesn't exist: the background connect fails and shows on the server (error + retry state).
+  const failed = await waitFor(async () => { const x = await server("imported-one"); return x.status.state === "error" && x.auto ? x : null; }, 30000, "background connect attempt");
+  assert(failed.auto.max_attempts > 1 && !failed.auto.gave_up && failed.status.error, JSON.stringify(failed.auto));
+  assert(failed.tools.every((t) => t.policy === "ask"), "imported tools must start at ask");
+  const off = await server("imported-off");
+  assert(!off.enabled && off.status.state === "disconnected" && !off.auto, `disabled import: ${JSON.stringify([off.enabled, off.status.state, off.auto])}`);
   const exp = await inv("export_mcp_servers");
   assert(exp.includes("<secret>") && !exp.includes("sk-IMPORTEDSECRET9988"), "secret leaked into export");
   const dup = await inv("import_mcp_servers", { json: JSON.stringify(doc) });
-  assert(dup.added.length === 0 && dup.skipped.length === 1, "duplicate import not skipped");
+  assert(dup.added.length === 0 && dup.skipped.length === 2 && dup.skipped.every((x) => /already exists/.test(x)), `duplicate import not skipped: ${JSON.stringify(dup)}`);
   const badJson = await invErr("import_mcp_servers", { json: "{nope" });
   assert(/JSON/.test(badJson.message), badJson.message);
 });
 
-await check("Will's LM Studio mcp.json imports without connecting anything", async () => {
+await check("Will's LM Studio mcp.json imports turned on (tools still ask) without changing the file", async () => {
   const lm = path.join(process.env.USERPROFILE, ".lmstudio", "mcp.json");
   if (!fs.existsSync(lm)) return "no LM Studio mcp.json on this PC (skipped)";
   const before = fs.readFileSync(lm, "utf8");
@@ -272,9 +280,9 @@ await check("Will's LM Studio mcp.json imports without connecting anything", asy
   assert(fs.readFileSync(lm, "utf8") === before, "LM Studio file was modified");
   for (const n of r.added) {
     const s = await server(n);
-    assert(!s.enabled && s.status.state === "disconnected", `${n} should be off and disconnected`);
+    assert(s.enabled && s.tools.every((t) => t.policy === "ask"), `${n} should be on with every tool at ask`);
   }
-  return `added ${r.added.join(", ")} (off, not connected)`;
+  return `added ${r.added.join(", ")} (on, tools ask)`;
 });
 
 // ---------------- model-driven loop ----------------
@@ -336,6 +344,26 @@ await check("context meter counts tool definitions in Agent Mode", async () => {
   return `${on.tool_count} tools = ${on.tools} tokens of ${on.n_ctx}${on.tools_warning ? " (warning shown)" : ""}`;
 });
 
+await check("a chat can leave out one MCP server: its tools and tokens drop, the others stay on", async () => {
+  const conv = await convWith({ agent_mode: true, mode: "agent", builtin_tools: false, tool_servers: [], disabled_servers: [] });
+  const all = await inv("chat_context", { id: conv, draft: "" });
+  const costs = await inv("chat_tool_costs", { id: conv });
+  const fsc = costs.entries.find((e) => e.id === ids.fs);
+  assert(costs.exact && fsc && fsc.in_chat && fsc.tool_count > 3 && fsc.tokens > 100, JSON.stringify(fsc));
+  assert(costs.entries[0].kind === "builtin" && !costs.entries[0].in_chat, "built-in entry should be first and off");
+  const v = await inv("get_conversation", { id: conv });
+  await inv("update_chat_settings", { id: conv, settings: { ...v.settings_parsed, disabled_servers: [ids.fs] } });
+  const less = await inv("chat_context", { id: conv, draft: "" });
+  assert(less.tool_count === all.tool_count - fsc.tool_count, `tools ${all.tool_count} -> ${less.tool_count}, filesystem ${fsc.tool_count}`);
+  assert(less.tools < all.tools, `tool tokens ${all.tools} -> ${less.tools}`);
+  const c2 = await inv("chat_tool_costs", { id: conv });
+  assert(!c2.entries.find((e) => e.id === ids.fs).in_chat, "filesystem still on");
+  assert(c2.entries.filter((e) => e.kind === "mcp" && e.id !== ids.fs).every((e) => e.in_chat), JSON.stringify(c2.entries.map((e) => [e.name, e.in_chat])));
+  const exposed = (await inv("preview_chat_tools", { toolServers: [] })).tools;
+  assert(exposed.some((t) => t.server_id === ids.fs), "the global server list must be unchanged");
+  return `${all.tool_count} -> ${less.tool_count} tools, ${all.tools} -> ${less.tools} tokens (filesystem about ${fsc.tokens})`;
+});
+
 await check("model lists files through the tool and answers from the real result", async () => {
   await inv("chat_send", { id: ids.agentConv, content: `What files are in the folder ${FSROOT} ? Use the tools.` });
   const c = await waitDone(ids.agentConv);
@@ -368,6 +396,27 @@ await check("UI: approval prompt on the tool card; Allow once in the UI writes t
   assert(JSON.parse(res.stats).status === "ok", res.stats);
   await cdp.waitFor("[...document.querySelectorAll('.tool-card')].some(t => t.innerText.includes('Done'))", 10000, "card shows Done");
   await cdp.screenshot(path.join(SHOTS, "tool-cards.png"));
+});
+
+await check("UI: composer Chat mode and Chat tools menus (untick a server, then tick it again)", async () => {
+  // The agent chat from the previous check is open.
+  await cdp.waitFor(`document.querySelector('[aria-label="Chat mode"]')?.value === "agent"`, 5000, "Chat mode shows agent");
+  const before = (await inv("chat_context", { id: ids.agentConv, draft: "" })).tool_count;
+  await cdp.eval(`document.querySelector('[aria-label="Chat tools"]').click()`);
+  const item = `document.querySelector('[role="menuitemcheckbox"][aria-label="filesystem tools"]')`;
+  await cdp.waitFor(`${item}?.getAttribute('aria-checked') === "true"`, 10000, "filesystem ticked in the Tools menu");
+  await cdp.screenshot(path.join(SHOTS, "chat-tools-menu.png"));
+  await cdp.eval(`${item}.click()`);
+  await waitFor(async () => ((await inv("get_conversation", { id: ids.agentConv })).settings_parsed.disabled_servers ?? []).includes(ids.fs) || null, 5000, "filesystem left out");
+  const fewer = (await inv("chat_context", { id: ids.agentConv, draft: "" })).tool_count;
+  assert(fewer < before, `tool count ${before} -> ${fewer}`);
+  await cdp.waitFor(`${item}?.getAttribute('aria-checked') === "false"`, 5000, "unticked in the menu");
+  await cdp.eval(`${item}.click()`);
+  await waitFor(async () => !((await inv("get_conversation", { id: ids.agentConv })).settings_parsed.disabled_servers ?? []).includes(ids.fs) || null, 5000, "filesystem back on");
+  const back = (await inv("chat_context", { id: ids.agentConv, draft: "" })).tool_count;
+  assert(back === before, `tool count back to ${back}, was ${before}`);
+  await cdp.eval(`document.querySelector('[aria-label="Chat tools"]').click()`);
+  return `${before} -> ${fewer} -> ${back} tools`;
 });
 
 await check("stop while a tool waits for approval: nothing runs", async () => {
@@ -475,8 +524,12 @@ await check("servers reconnect on restart; secrets survive in the vault", async 
     return need.every((x) => x?.status.state === "connected") ? need : null;
   }, 90000, "autoconnect");
   assert(s[2].bearer_set, "token lost");
-  const imported = (await cdp.invoke("list_mcp_servers")).find((x) => x.name === "imported-one");
-  assert(imported.status.state === "disconnected", "a turned-off server autoconnected");
+  const list = await cdp.invoke("list_mcp_servers");
+  // Turned-on imports are tried at start (x.js doesn't exist, so it fails and retries).
+  const imported = list.find((x) => x.name === "imported-one");
+  assert(imported.enabled && imported.status.state !== "connected" && (imported.auto || imported.status.state === "error"), `imported-one: ${imported.status.state} ${JSON.stringify(imported.auto)}`);
+  const off = list.find((x) => x.name === "imported-off");
+  assert(off.status.state === "disconnected" && !off.auto, "a turned-off server autoconnected");
 });
 
 // ---------------- teardown ----------------

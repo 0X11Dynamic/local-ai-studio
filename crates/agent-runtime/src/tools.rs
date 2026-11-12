@@ -83,17 +83,43 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{}...", s.chars().take(max).collect::<String>())
 }
 
-/// Limits for one agent reply.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+/// Limits for one agent reply. `None` (JSON `null`) = no limit, the default.
+/// The reply still stops after `MAX_TURNS_BACKSTOP` model turns, and the
+/// context window caps each generation.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default, from = "LimitsRaw")]
 pub struct Limits {
-    pub max_tool_calls: u32,
-    pub max_wall_secs: u64,
+    pub max_tool_calls: Option<u32>,
+    pub max_wall_secs: Option<u64>,
 }
 
-impl Default for Limits {
-    fn default() -> Self {
-        Self { max_tool_calls: 10, max_wall_secs: 300 }
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct LimitsRaw {
+    max_tool_calls: Option<u32>,
+    max_wall_secs: Option<u64>,
+}
+
+impl From<LimitsRaw> for Limits {
+    /// Chats saved before limits became optional hold the old defaults
+    /// (10 calls, 300 s): those read as "no limit". Any other number is the
+    /// user's own choice and stays.
+    fn from(r: LimitsRaw) -> Self {
+        if (r.max_tool_calls, r.max_wall_secs) == (Some(10), Some(300)) {
+            return Self::default();
+        }
+        Self { max_tool_calls: r.max_tool_calls, max_wall_secs: r.max_wall_secs }
+    }
+}
+
+impl Limits {
+    /// Tool-call limit as a number (no limit = `u32::MAX`).
+    pub fn calls_or_max(&self) -> u32 {
+        self.max_tool_calls.unwrap_or(u32::MAX)
+    }
+    /// Time limit in seconds (no limit = 30 days).
+    pub fn secs_or_max(&self) -> u64 {
+        self.max_wall_secs.unwrap_or(crate::task::NO_TIME_LIMIT_SECS)
     }
 }
 
@@ -114,11 +140,9 @@ pub fn tools_section(tools: &[ExposedTool], limits: &Limits) -> String {
             s.push_str(&format!("- {} ({origin}): {} Permission: {}.\n", t.model_name, if desc.is_empty() { "No description.".to_string() } else { desc }, perm));
         }
     }
-    s.push_str(&format!(
-        "\n## Limits\nAt most {} tool calls per reply. Each call times out after its server's limit (usually 60 seconds). The whole reply stops after {} minutes.",
-        limits.max_tool_calls,
-        (limits.max_wall_secs / 60).max(1)
-    ));
+    let calls = limits.max_tool_calls.map_or("No limit on tool calls per reply.".to_string(), |n| format!("At most {n} tool calls per reply."));
+    let time = limits.max_wall_secs.map_or("No time limit on the reply.".to_string(), |s| format!("The whole reply stops after {} minutes.", (s / 60).max(1)));
+    s.push_str(&format!("\n## Limits\n{calls} Each call times out after its server's limit (usually 60 seconds). {time}"));
     s
 }
 
@@ -150,6 +174,16 @@ mod tests {
     }
 
     #[test]
+    fn default_limits_are_unlimited() {
+        let l = Limits::default();
+        assert_eq!((l.max_tool_calls, l.max_wall_secs), (None, None));
+        // run_reply derives its time and call allowance from these: huge, never zero.
+        assert_eq!((l.calls_or_max(), l.secs_or_max()), (u32::MAX, crate::task::NO_TIME_LIMIT_SECS));
+        assert!(std::time::Duration::from_secs(l.secs_or_max()) > std::time::Duration::from_secs(24 * 3600));
+        assert_eq!(serde_json::to_value(l).unwrap(), serde_json::json!({ "max_tool_calls": null, "max_wall_secs": null }));
+    }
+
+    #[test]
     fn openai_definitions_and_prompt_section() {
         let t = openai_tools(&[tool(Policy::Ask)]);
         assert_eq!(t[0]["function"]["name"], "mcp__fs__read");
@@ -159,7 +193,9 @@ mod tests {
         let s = tools_section(&[tool(Policy::Allow), ExposedTool { model_name: "mcp__fs__write".into(), ..tool(Policy::Ask) }], &Limits::default());
         assert!(s.contains("mcp__fs__read (server \"fs\"): Read a file. Second line. Permission: runs without asking."), "{s}");
         assert!(s.contains("mcp__fs__write") && s.contains("needs the user's approval each time"));
-        assert!(s.contains("At most 10 tool calls"));
+        assert!(s.contains("No limit on tool calls") && s.contains("No time limit") && !s.contains("At most"), "{s}");
+        let l = tools_section(&[], &Limits { max_tool_calls: Some(10), max_wall_secs: Some(300) });
+        assert!(l.contains("At most 10 tool calls") && l.contains("after 5 minutes"), "{l}");
         assert!(tools_section(&[], &Limits::default()).contains("do not try to call any"));
     }
 }

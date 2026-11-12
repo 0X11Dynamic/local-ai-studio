@@ -24,6 +24,67 @@ pub struct HardwareInfo {
     pub gpu_note: Option<String>,
     /// Highest CUDA version the installed driver supports, e.g. "13.1".
     pub cuda_driver_version: Option<String>,
+    /// Every display adapter Windows reports (DXGI), including AMD and Intel
+    /// GPUs that NVML can't see. Software adapters are left out.
+    pub adapters: Vec<DisplayAdapter>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DisplayAdapter {
+    pub name: String,
+    /// NVIDIA | AMD | Intel | other
+    pub vendor: String,
+    pub dedicated_vram_bytes: u64,
+}
+
+impl DisplayAdapter {
+    /// A GPU worth running models on with the Vulkan backend: a non-NVIDIA
+    /// adapter with at least 2 GiB of its own VRAM (Radeon RX, Intel Arc).
+    /// Integrated graphics report little or no dedicated memory.
+    pub fn is_vulkan_candidate(&self) -> bool {
+        self.vendor != "NVIDIA" && self.vendor != "other" && self.dedicated_vram_bytes >= 2 << 30
+    }
+}
+
+fn vendor_name(id: u32) -> &'static str {
+    match id {
+        0x10de => "NVIDIA",
+        0x1002 | 0x1022 => "AMD",
+        0x8086 => "Intel",
+        _ => "other",
+    }
+}
+
+/// Hardware display adapters from DXGI. Empty if DXGI is unavailable.
+#[cfg(windows)]
+pub fn display_adapters() -> Vec<DisplayAdapter> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory1};
+    let mut out = Vec::new();
+    // SAFETY: plain COM calls; every returned interface is owned and released on drop.
+    let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else { return out };
+    for i in 0.. {
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(i) }) else { break };
+        let Ok(d) = (unsafe { adapter.GetDesc1() }) else { continue };
+        if d.Flags & (DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0 {
+            continue;
+        }
+        let len = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+        let a = DisplayAdapter {
+            name: String::from_utf16_lossy(&d.Description[..len]).trim().to_string(),
+            vendor: vendor_name(d.VendorId).into(),
+            dedicated_vram_bytes: d.DedicatedVideoMemory as u64,
+        };
+        // DXGI can list one GPU more than once (one entry per output path).
+        if !out.iter().any(|x: &DisplayAdapter| x.name == a.name && x.dedicated_vram_bytes == a.dedicated_vram_bytes) {
+            out.push(a);
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+pub fn display_adapters() -> Vec<DisplayAdapter> {
+    Vec::new()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,6 +126,8 @@ pub struct SystemMonitor {
     sys: Mutex<System>,
     nvml: Option<Nvml>,
     nvml_error: Option<String>,
+    /// Display adapters don't change while the app runs; read once.
+    adapters: Vec<DisplayAdapter>,
 }
 
 impl SystemMonitor {
@@ -80,7 +143,7 @@ impl SystemMonitor {
                 (None, Some(format!("NVIDIA NVML not available ({e}); GPU metrics disabled")))
             }
         };
-        Ok(Self { sys: Mutex::new(sys), nvml, nvml_error })
+        Ok(Self { sys: Mutex::new(sys), nvml, nvml_error, adapters: display_adapters() })
     }
 
     pub fn hardware_info(&self) -> HardwareInfo {
@@ -143,6 +206,7 @@ impl SystemMonitor {
             gpus,
             gpu_note,
             cuda_driver_version,
+            adapters: self.adapters.clone(),
         }
     }
 
@@ -217,6 +281,9 @@ mod tests {
         assert!(hw.logical_cores > 0);
         assert!(hw.total_ram_bytes > 1 << 30, "expected more than 1 GiB RAM");
         println!("{hw:#?}");
+        // Every Windows PC has at least one hardware display adapter.
+        #[cfg(windows)]
+        assert!(!hw.adapters.is_empty(), "DXGI reported no display adapters");
         let s = m.snapshot(None);
         assert!(s.app_memory_bytes > 0);
     }

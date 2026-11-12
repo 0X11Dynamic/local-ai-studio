@@ -16,7 +16,7 @@ export function Models({ go }: { go: (p: PageId) => void }) {
   const [filter, setFilter] = useState("");
   const [report, setReport] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
-  const [confirmDelete, setConfirmDelete] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const [showDelete, setShowDelete] = useState(false);
   const { status } = useEngine();
 
@@ -84,6 +84,11 @@ export function Models({ go }: { go: (p: PageId) => void }) {
   }, [models, filter]);
 
   const sel = models?.find((m) => m.id === selected) ?? null;
+  // A tick for one model never carries over to another.
+  useEffect(() => {
+    setConfirmDelete(false);
+    setShowDelete(false);
+  }, [selected]);
 
   const removeFromLibrary = async () => {
     if (!sel) return;
@@ -100,9 +105,9 @@ export function Models({ go }: { go: (p: PageId) => void }) {
     if (!sel) return;
     try {
       const gone = await api.deleteModelFiles(sel.id, confirmDelete);
-      setReport(`Deleted ${gone.length} file(s) from disk.`);
+      setReport(`Moved ${gone.length} file(s) to the Recycle Bin. Restore them from there if you change your mind.`);
       setShowDelete(false);
-      setConfirmDelete("");
+      setConfirmDelete(false);
       setSelected(null);
       await reload();
     } catch (e) {
@@ -201,13 +206,17 @@ export function Models({ go }: { go: (p: PageId) => void }) {
               {showDelete && (
                 <div className="notice error" style={{ display: "grid", gap: 8 }}>
                   <span>
-                    This permanently deletes {sel.shards.length} file(s) ({bytes(sel.size)}) from disk
-                    {sel.source === "lmstudio" ? ", including from LM Studio's library" : ""}. Type the model name to confirm.
+                    This moves the files to the Recycle Bin: {sel.shards.length} model file(s) ({bytes(sel.size)})
+                    {sel.projector_path ? ", plus its vision projector if no other model uses it" : ""}
+                    {sel.source === "lmstudio" ? ", including from LM Studio's library" : ""}. The model leaves the library; restore the files from the Recycle Bin to get it back.
+                    If the Recycle Bin can't hold them, nothing is deleted.
                   </span>
-                  <input className="input mono" aria-label="Type the model name to confirm" value={confirmDelete} onChange={(e) => setConfirmDelete(e.target.value)} placeholder={sel.display_name} />
+                  <label className="check">
+                    <input type="checkbox" aria-label="Confirm delete" checked={confirmDelete} onChange={(e) => setConfirmDelete(e.target.checked)} /> I understand this moves the files to the Recycle Bin
+                  </label>
                   <div className="row">
-                    <button className="btn sm danger" disabled={confirmDelete !== sel.display_name} onClick={deleteFiles}>Delete permanently</button>
-                    <button className="btn sm ghost" onClick={() => { setShowDelete(false); setConfirmDelete(""); }}>Keep files</button>
+                    <button className="btn sm danger" disabled={!confirmDelete} onClick={deleteFiles}>Move to Recycle Bin</button>
+                    <button className="btn sm ghost" onClick={() => { setShowDelete(false); setConfirmDelete(false); }}>Keep files</button>
                   </div>
                 </div>
               )}

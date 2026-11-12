@@ -37,6 +37,28 @@ const STATE_LABEL: Record<ServerStatus["state"], string> = {
   error: "Error",
 };
 
+// --- auto-connect status (app start, import, turned on) ---
+/** Short state for the server list, including background connect retries. */
+function stateText(s: ServerView): string {
+  if (!s.enabled) return "Turned off";
+  const a = s.auto;
+  if (a && s.status.state !== "connected") {
+    if (a.gave_up) return "Error, gave up";
+    if (a.retry_in_secs != null) return `Error, retry in ${a.retry_in_secs}s`;
+    if (a.attempt > 1) return `Connecting (${a.attempt} of ${a.max_attempts})`;
+  }
+  return STATE_LABEL[s.status.state];
+}
+
+function AutoNote({ s }: { s: ServerView }) {
+  const a = s.auto;
+  if (!a || !s.enabled || s.status.state === "connected") return null;
+  if (a.gave_up) return <div className="notice warn" role="status">Could not connect after {a.max_attempts} tries. Check the settings and server output, then press Connect.</div>;
+  if (a.retry_in_secs != null) return <div className="notice" role="status">Connecting automatically: try {a.attempt} of {a.max_attempts} failed, next try in {a.retry_in_secs} s.</div>;
+  return <div className="notice" role="status">Connecting automatically (try {Math.max(1, a.attempt)} of {a.max_attempts}).</div>;
+}
+// --- end auto-connect status ---
+
 function hint(annotations: unknown): string | null {
   const a = annotations as Record<string, unknown> | null;
   if (!a || typeof a !== "object") return null;
@@ -102,6 +124,14 @@ export function Mcp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // While a background connect is waiting to retry, refresh the countdown.
+  const retrying = !!servers?.some((s) => s.auto && !s.auto.gave_up && s.status.state !== "connected");
+  useEffect(() => {
+    if (!retrying) return;
+    const t = setInterval(() => api3.listServers().then(setServers).catch(() => {}), 2000);
+    return () => clearInterval(t);
+  }, [retrying]);
+
   useEffect(() => {
     if (tab === "permissions") api3.grants().then(setGrants);
     if (tab === "activity") api3.activity(null, 300).then(setActivity);
@@ -152,6 +182,8 @@ export function Mcp() {
         : await api3.addServer(draft.name, config, secrets, draft.enabled);
       setEditing(false);
       await reload(v.id);
+      // A new server that is turned on connects right away (in the background).
+      if (!draft.id && v.enabled) api3.connect(v.id).then(() => reload(v.id)).catch(() => {});
     }, "Saved. Secret values are stored in Windows Credential Manager.");
 
   const doImport = (fn: () => Promise<{ added: string[]; skipped: string[]; secrets_stored: number }>) =>
@@ -159,7 +191,7 @@ export function Mcp() {
       const r = await fn();
       setImportText(null);
       await reload();
-      setMsg(`Imported ${r.added.length} server(s)${r.added.length ? `: ${r.added.join(", ")}` : ""}. ${r.skipped.length ? `Skipped: ${r.skipped.join("; ")}. ` : ""}${r.secrets_stored ? `${r.secrets_stored} secret value(s) moved to Credential Manager. ` : ""}Imported servers start turned off; check each one, then turn it on and connect.`);
+      setMsg(`Imported ${r.added.length} server(s)${r.added.length ? `: ${r.added.join(", ")}` : ""}. ${r.skipped.length ? `Skipped: ${r.skipped.join("; ")}. ` : ""}${r.secrets_stored ? `${r.secrets_stored} secret value(s) moved to Credential Manager. ` : ""}Imported servers are turned on and connect in the background; every tool asks before it runs until you change its permission. Turn a server off here, or leave it out of a single chat from the chat's Tools menu.`);
     });
 
   const tools = useMemo(() => {
@@ -171,7 +203,7 @@ export function Mcp() {
 
   return (
     <div className="page" style={{ maxWidth: 1400 }}>
-      <p className="lede">MCP servers give the model tools in Agent Mode. A connected server can run code on this PC or reach the network, so only add servers you trust. Every tool asks for your approval until you change its policy.</p>
+      <p className="lede">MCP servers give the model tools in Agent and Plan mode. Servers that are turned on connect when the app starts; a chat can leave any of them out from its Tools menu. A connected server can run code on this PC or reach the network, so only add servers you trust. Every tool asks for your approval until you change its policy.</p>
       <div className="row" style={{ marginBottom: 14 }} role="tablist">
         {(["servers", "permissions", "activity"] as Tab[]).map((t) => (
           <button key={t} role="tab" aria-selected={tab === t} className={`btn sm${tab === t ? " primary" : " ghost"}`} onClick={() => setTab(t)}>
@@ -225,7 +257,7 @@ export function Mcp() {
                   <button key={s.id} className="chat-item" aria-current={s.id === selId && !(!draft.id && editing) ? "true" : undefined} onClick={() => { setEditing(false); setSelId(s.id); }}>
                     <span className="chat-title">{s.name}</span>
                     <span className={`mono ${s.status.state === "error" ? "danger-text" : "faint"}`} style={{ fontSize: 10.5 }}>
-                      {s.enabled ? STATE_LABEL[s.status.state] : "Turned off"}{s.status.state === "connected" ? `, ${s.tools.length} tools` : ""}
+                      {stateText(s)}{s.status.state === "connected" ? `, ${s.tools.length} tools` : ""}
                     </span>
                   </button>
                 ))
@@ -314,7 +346,7 @@ export function Mcp() {
                   <div className="panel" style={{ display: "grid", gap: 10 }}>
                     <div className="row">
                       <strong style={{ fontWeight: 600 }}>{sel.name}</strong>
-                      <span className={`tag${sel.status.state === "connected" ? " accent" : sel.status.state === "error" ? " danger" : ""}`}>{sel.enabled ? STATE_LABEL[sel.status.state] : "Turned off"}</span>
+                      <span className={`tag${sel.status.state === "connected" ? " accent" : sel.status.state === "error" ? " danger" : ""}`}>{stateText(sel)}</span>
                       {sel.status.server_name && <span className="faint mono">{sel.status.server_name} {sel.status.server_version}</span>}
                       <span className="spacer" />
                       {sel.status.state === "connected" ? (
@@ -327,6 +359,11 @@ export function Mcp() {
                           {sel.status.state === "connecting" ? "Connecting" : "Connect"}
                         </button>
                       )}
+                      <label className="check mcp-switch" title="Turned-on servers connect when the app starts. Turning one off disconnects it for every chat.">
+                        <input type="checkbox" role="switch" aria-label={`${sel.name} turned on`} checked={sel.enabled} disabled={busy}
+                          onChange={(e) => { const on = e.target.checked; run(async () => { await api3.updateServer(sel.id, sel.name, sel.config, {}, on); await reload(sel.id); }); }} />
+                        On
+                      </label>
                       <button className="btn sm ghost" onClick={() => setEditing(true)}>Edit</button>
                       <button className="btn sm ghost danger" onClick={() => run(async () => { await api3.deleteServer(sel.id); await reload(null); }, "Server removed, with its tool settings and grants.")}>Remove</button>
                     </div>
@@ -334,7 +371,8 @@ export function Mcp() {
                       {sel.config.transport === "http" ? sel.config.url : [sel.config.command, ...sel.config.args].join(" ")}
                     </div>
                     {sel.status.error && <div className="notice error">{sel.status.error}</div>}
-                    {!sel.enabled && <div className="notice">This server is turned off. Edit it and turn it on to connect.</div>}
+                    {!sel.enabled && <div className="notice">This server is turned off: it does not connect and no chat gets its tools. Turn it on to connect.</div>}
+                    <AutoNote s={sel} />
                   </div>
 
                   {sel.status.state === "connected" && (

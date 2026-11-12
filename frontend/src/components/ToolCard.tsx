@@ -100,10 +100,15 @@ export function ToolCard({
       {approval && (
         <div style={{ display: "grid", gap: 6 }}>
           <span className="dim">{approval.agent ? `${approval.agent} wants to run this tool.` : "The model wants to run this tool."} {approval.reason}.</span>
+          {/* grant_choice: "session" = a place outside the allowed folders (this chat/task, that folder only); "once" = asks every time */}
           <div className="row">
             <button className="btn sm primary" onClick={() => onAnswer(approval.id, "allow_once")}>Allow once</button>
-            <button className="btn sm" onClick={() => onAnswer(approval.id, "allow_session")}>{sessionLabel}</button>
-            <button className="btn sm" onClick={() => onAnswer(approval.id, "allow_always")}>Always allow this tool</button>
+            {(approval as { grant_choice?: string }).grant_choice !== "once" && (
+              <button className="btn sm" onClick={() => onAnswer(approval.id, "allow_session")}>{(approval as { grant_choice?: string }).grant_choice === "session" ? `${sessionLabel} (this folder)` : sessionLabel}</button>
+            )}
+            {!["once", "session"].includes((approval as { grant_choice?: string }).grant_choice ?? "") && (
+              <button className="btn sm" onClick={() => onAnswer(approval.id, "allow_always")}>Always allow this tool</button>
+            )}
             <button className="btn sm danger" onClick={() => onAnswer(approval.id, "deny")}>Deny</button>
           </div>
         </div>

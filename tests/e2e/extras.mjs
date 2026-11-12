@@ -139,14 +139,38 @@ await check("Plan mode chat: read-only tools, a numbered plan, nothing changed o
   const conv = await convWith({ agent_mode: true, mode: "plan", builtin_tools: true, tool_servers: [] });
   ids.planConv = conv;
   const ctx = await inv("chat_context", { id: conv, draft: "" });
-  assert(ctx.agent_mode && ctx.tool_count > 0 && ctx.tool_count <= 4, `plan tool count ${ctx.tool_count}`);
+  // fs_list, fs_read, fs_search, web_fetch and the ask-every-time shell.
+  assert(ctx.agent_mode && ctx.tool_count > 0 && ctx.tool_count <= 5, `plan tool count ${ctx.tool_count}`);
   const agentConv = await convWith({ agent_mode: true, mode: "agent", builtin_tools: true, tool_servers: [] });
   const actx = await inv("chat_context", { id: agentConv, draft: "" });
   assert(actx.tool_count > ctx.tool_count, `agent ${actx.tool_count} vs plan ${ctx.tool_count}`);
+  // Plan mode shell commands ask every time ("Plan mode: read-only command requested"); deny them here.
+  const shellAsks = [];
+  const denyShell = (() => {
+    let stop = false;
+    (async () => {
+      const seen = new Set();
+      while (!stop) {
+        try {
+          for (const p of await inv("pending_tool_approvals")) {
+            if (p.conversation_id === conv && !seen.has(p.id)) {
+              seen.add(p.id);
+              shellAsks.push(p);
+              await inv("answer_tool_approval", { id: p.id, answer: "deny" });
+            }
+          }
+        } catch {}
+        await sleep(300);
+      }
+    })();
+    return { stop: () => { stop = true; } };
+  })();
   await inv("chat_send", { id: conv, content: `In the folder ${WORK}, add a README.md that describes the project (see notes.txt). Make a plan for this.` });
-  const c = await waitDone(conv);
+  const c = await waitDone(conv).finally(denyShell.stop);
   const calls = toolCalls(c);
-  assert(!calls.some((x) => WRITE_TOOLS.test(x.function.name)), `write tool used: ${calls.map((x) => x.function.name)}`);
+  const PLAN_WRITES = /fs_write|fs_delete|fs_move|fs_patch|spawn_subagents|skill_propose_edit|write_file|edit_file|move_file|create_directory/;
+  assert(!calls.some((x) => PLAN_WRITES.test(x.function.name)), `write tool used: ${calls.map((x) => x.function.name)}`);
+  assert(shellAsks.every((p) => p.tool_name !== "shell_execute" || (/^Plan mode: read-only command requested/.test(p.reason) && p.grant_choice === "once")), JSON.stringify(shellAsks.map((p) => p.reason)));
   const text = lastAssistant(c).content;
   assert(/(^|\n)\s*1[.)]/.test(text), `no numbered plan: ${text.slice(0, 300)}`);
   assert(snapshotDir(WORK) === before, "files changed in Plan mode");
@@ -159,9 +183,13 @@ await check("Plan mode UI: mode selector and 'Run this plan' carries out the pla
   await cdp.waitFor(`[...document.querySelectorAll('.chat-item')].some(b => b.querySelector('.chat-title')?.innerText === ${JSON.stringify(title)})`, 10000, "plan chat in list");
   await cdp.eval(`[...document.querySelectorAll('.chat-item')].find(b => b.querySelector('.chat-title')?.innerText === ${JSON.stringify(title)}).click()`);
   await cdp.waitFor(`document.querySelector('.chat-item[aria-current="true"] .chat-title')?.innerText === ${JSON.stringify(title)}`, 10000, "plan chat open");
-  if (!(await cdp.eval(`!!document.querySelector('[aria-label="Chat mode"]')`))) await cdp.clickButton("Chat settings");
+  // The mode menu sits in the composer bar; its button's value is the mode.
   await cdp.waitFor(`!!document.querySelector('[aria-label="Chat mode"]')`, 10000, "Chat mode selector");
   const mode = await cdp.eval(`document.querySelector('[aria-label="Chat mode"]').value`);
+  await cdp.eval(`document.querySelector('[aria-label="Chat mode"]').click()`);
+  const opts = await cdp.waitFor(`[...document.querySelectorAll('[role="menuitemradio"]')].map(b => b.dataset.mode + ':' + b.getAttribute('aria-checked')).join(',')`, 5000, "mode menu items").catch(() => "");
+  await cdp.eval(`document.querySelector('[aria-label="Chat mode"]').click()`);
+  if (opts !== "chat:false,plan:true,agent:false") throw new Error(`mode menu items: ${opts}`);
   const hasRun = await cdp.waitFor(`[...document.querySelectorAll('button')].some(b => b.innerText.trim() === 'Run this plan')`, 10000, "Run this plan button").catch(() => false);
   await cdp.screenshot(path.join(SHOTS, "plan-chat.png"));
   if (!hasRun || mode !== "plan") throw new Error(`selector=${mode} runButton=${hasRun} (open the plan chat in the UI failed?)`);

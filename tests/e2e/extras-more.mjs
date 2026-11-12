@@ -33,7 +33,8 @@ After they finish, reply with their results. Do not create the files yourself.`;
     const off = await inv("chat_context", { id: conv, draft: "" });
     await inv("update_chat_settings", { id: conv, settings: { ...v.settings_parsed, subagents: true, max_subagents: 2 } });
     const on = await inv("chat_context", { id: conv, draft: "" });
-    assert(on.tool_count === off.tool_count + 1, `tools off ${off.tool_count} on ${on.tool_count}`);
+    // spawn_subagents, subagent_status, wait_subagents, stop_subagent
+    assert(on.tool_count === off.tool_count + 4, `tools off ${off.tool_count} on ${on.tool_count}`);
     await inv("update_chat_settings", { id: conv, settings: { ...v.settings_parsed, subagents: true, mode: "plan" } });
     const plan = await inv("chat_context", { id: conv, draft: "" });
     assert(plan.tool_count < off.tool_count, `plan mode offered ${plan.tool_count}`);
@@ -43,14 +44,22 @@ After they finish, reply with their results. Do not create the files yourself.`;
   });
 
   await check("chat subagents in worktrees: each child commits on its own branch, main tree untouched", async () => {
-    const conv = await convWith({ agent_mode: true, mode: "agent", builtin_tools: true, tool_servers: [], subagents: true, max_subagents: 2 });
+    // The small test model sometimes leaves out "isolation": the test is about what the
+    // app does with it, so retry (new chat) up to 3 times until a spawn asks for it.
+    let conv, c, tries = 0;
+    for (; tries < 3; tries++) {
+      conv = await convWith({ agent_mode: true, mode: "agent", builtin_tools: true, tool_servers: [], subagents: true, max_subagents: 2 });
+      const ap = t.autoApprove(null);
+      try {
+        await inv("chat_send", { id: conv, content: SPAWN_PROMPT(true) });
+        await waitDone(conv, 900000);
+      } finally { ap.stop(); }
+      c = await inv("get_conversation", { id: conv });
+      const asked = toolCalls(c).some((x) => x.function.name === "spawn_subagents" && /"isolation"\s*:\s*"worktree"/.test(x.function.arguments || ""));
+      if (asked) break;
+      await inv("delete_conversation", { id: conv }).catch(() => {});
+    }
     ids.wtConv = conv;
-    const ap = t.autoApprove(null);
-    try {
-      await inv("chat_send", { id: conv, content: SPAWN_PROMPT(true) });
-      await waitDone(conv, 900000);
-    } finally { ap.stop(); }
-    const c = await inv("get_conversation", { id: conv });
     const spawn = toolCalls(c).filter((x) => x.function.name === "spawn_subagents");
     assert(spawn.length >= 1, `no spawn call: ${toolCalls(c).map((x) => x.function.name)}`);
     const subs = await inv("chat_subagents", { id: conv });
@@ -121,6 +130,42 @@ After they finish, reply with their results. Do not create the files yourself.`;
     await waitFor(async () => shells() === 0, 20000, "shell processes to exit");
     await inv("delete_conversation", { id: conv });
     return `${subs.subagents.map((r) => `${r.label}:${r.state}`).join(", ")} in ${((Date.now() - t0) / 1000).toFixed(1)} s`;
+  });
+
+  await check("stop_subagent: the main agent stops one background child (and its shell) while the other keeps running", async () => {
+    await inv("set_local_roots", { roots: [PLAIN] });
+    const conv = await convWith({ agent_mode: true, mode: "agent", builtin_tools: true, tool_servers: [], subagents: true, max_subagents: 2 });
+    const ap = t.autoApprove(null);
+    const SHELLS_PS = `$all = Get-CimInstance Win32_Process; $kids = @{}; foreach ($p in $all) { $kids[[int]$p.ParentProcessId] += @($p) }; $n = 0; $q = [System.Collections.Queue]::new(); $q.Enqueue(${t.app.pid}); while ($q.Count) { $id = $q.Dequeue(); foreach ($c in $kids[[int]$id]) { if ($c.Name -eq 'powershell.exe' -or $c.Name -eq 'pwsh.exe') { $n++ }; $q.Enqueue([int]$c.ProcessId) } }; $n`;
+    const shells = () => Number(execFileSync("powershell.exe", ["-NoProfile", "-Command", SHELLS_PS], { encoding: "utf8" }).trim() || 0);
+    const rows = async () => (await inv("chat_subagents", { id: conv })).subagents;
+    let seen;
+    try {
+      await inv("chat_send", { id: conv, content: `Do exactly these steps, one tool call per step:
+1. Call spawn_subagents once with "wait": false and two subagents, labels "w1" and "w2". Each must run the shell command Start-Sleep -Seconds 300 with shell_execute (timeout_secs 600), then report "slept".
+2. Call stop_subagent with "id": "w1" and "reason": "test stop".
+3. Call wait_subagents with "ids": ["w2"] and "timeout_secs": 600.
+4. Reply with what the tools returned.` });
+      // Step 2 done: w1 stopped (cancelled) while w2 still runs with its shell.
+      seen = await waitFor(async () => {
+        const r = await rows();
+        const w1 = r.find((x) => x.label === "w1"), w2 = r.find((x) => x.label === "w2");
+        return w1?.state === "cancelled" && w2?.state === "running" && shells() === 1 ? r : null;
+      }, 400000, "w1 cancelled, w2 running with one shell");
+      const c = await inv("get_conversation", { id: conv });
+      const names = toolCalls(c).map((x) => x.function.name);
+      assert(names.includes("spawn_subagents") && names.includes("stop_subagent"), `calls ${names}`);
+      const stopRes = c.messages.find((m) => m.role === "tool" && /"state": "cancelled"/.test(m.content) && /w1/.test(m.content));
+      assert(stopRes, `stop_subagent result: ${c.messages.filter((m) => m.role === "tool").map((m) => m.content.slice(0, 160))}`);
+      const w1 = seen.find((x) => x.label === "w1");
+      assert(/stopped by the main agent: test stop/.test(w1.error ?? ""), `w1 error ${w1.error}`);
+    } finally { ap.stop(); }
+    await inv("chat_stop", { id: conv });
+    await waitFor(async () => !(await inv("get_conversation", { id: conv })).generating, 60000, "reply to stop");
+    const end = await waitFor(async () => { const r = await rows(); return r.every((x) => !["running", "pending", "queued"].includes(x.state)) ? r : null; }, 60000, "children to stop");
+    await waitFor(async () => shells() === 0, 20000, "shell processes to exit");
+    await inv("delete_conversation", { id: conv });
+    return `after stop_subagent: ${seen.map((r) => `${r.label}:${r.state}`).join(", ")}; at the end ${end.map((r) => `${r.label}:${r.state}`).join(", ")}`;
   });
 
   fs.rmSync(REPO, { recursive: true, force: true });

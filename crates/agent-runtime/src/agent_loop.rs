@@ -27,6 +27,13 @@ pub trait LoopHooks: Send + Sync {
     async fn on_segment(&self, segment: usize, content: &str, reasoning: &str, tool_calls: &[ToolCall], stats: &ChatStats) -> AppResult<String>;
     /// A tool result, stored as a `tool` message for `call`.
     async fn on_tool_result(&self, call: &ToolCall, outcome: &DispatchOutcome) -> AppResult<()>;
+    /// The model gave a final answer. If subagents it started are still running,
+    /// wait for them (at most `remaining` working time) and return what they
+    /// reported, as text to hand back to the model; None = none were running
+    /// (or the time ran out). The loop then generates again.
+    async fn wait_children(&self, _remaining: Duration) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -39,6 +46,8 @@ pub struct LoopOutcome {
     /// Stats of the final segment.
     pub stats: ChatStats,
     pub error: Option<String>,
+    /// The final segment had no visible answer (see `TurnResult::empty_answer`).
+    pub empty_answer: bool,
 }
 
 /// How tools reach the model.
@@ -91,11 +100,67 @@ pub struct TurnResult {
     pub calls_counted: u32,
     /// The call limit was hit during this turn.
     pub limit_hit: bool,
+    /// The reply had no visible text and no tool call (only reasoning, or
+    /// nothing), even after the one nudge when it followed tool results.
+    pub empty_answer: bool,
+}
+
+/// Sent (as a user message) once when a reply after tool results is empty.
+pub const NUDGE: &str = "Continue: give your answer now.";
+
+/// Shown instead of a silent empty reply.
+pub const NO_ANSWER_NOTE: &str = "The model returned no answer.";
+
+/// No visible text and no tool call to run (a refused malformed or cut-off
+/// command is not an empty answer: the model is told and tries again).
+fn is_empty_answer(reply: &inference::ChatOutput, calls: &[ToolCall], refused: bool) -> bool {
+    calls.is_empty() && !refused && reply.content.trim().is_empty() && reply.stats.stop_reason != "cancelled"
+}
+
+/// The last message is a tool result (native `tool`, or the XML-mode result message).
+fn follows_tool_results(messages: &[serde_json::Value], xml: bool) -> bool {
+    let Some(last) = messages.last() else { return false };
+    match last["role"].as_str() {
+        Some("tool") => true,
+        Some("user") if xml => last["content"].as_str().is_some_and(|c| c.starts_with("<result tool=")),
+        _ => false,
+    }
+}
+
+/// Stream one reply, retrying once after a broken stream. This is safe: tool
+/// calls only run after a complete reply, so nothing has happened yet.
+async fn generate(
+    ctx: &TurnCtx<'_>,
+    messages: &[serde_json::Value],
+    send_tools: bool,
+    defs: &serde_json::Value,
+    segment: usize,
+    time_left: Duration,
+) -> Result<inference::ChatOutput, TurnResult> {
+    let msgs = serde_json::Value::Array(messages.to_vec());
+    let mut attempt = 0;
+    loop {
+        let tools_arg = if send_tools { Some(defs) } else { None };
+        let fut = inference::chat::stream_chat_tools(ctx.client, &msgs, tools_arg, ctx.params, ctx.cancel, |d| ctx.hooks.on_delta(segment, &d));
+        let r = match tokio::time::timeout(time_left, fut).await {
+            Ok(r) => r,
+            Err(_) => return Err(TurnResult::stop("time_limit", None)),
+        };
+        match r {
+            Err(e) if attempt == 0 && !ctx.cancel.is_cancelled() && is_transient(&e.to_string()) => {
+                tracing::warn!("agent reply stream broke ({e}); retrying once");
+                attempt += 1;
+                ctx.hooks.reset_segment(segment);
+            }
+            Err(e) => return Err(TurnResult::stop("error", Some(e.to_string()))),
+            Ok(g) => return Ok(g),
+        }
+    }
 }
 
 impl TurnResult {
     fn stop(reason: &str, err: Option<String>) -> Self {
-        Self { end: TurnEnd::Stop(reason.into(), err), message_id: None, content: String::new(), stats: ChatStats::default(), calls_counted: 0, limit_hit: false }
+        Self { end: TurnEnd::Stop(reason.into(), err), message_id: None, content: String::new(), stats: ChatStats::default(), calls_counted: 0, limit_hit: false, empty_answer: false }
     }
 }
 
@@ -108,87 +173,98 @@ pub async fn turn(ctx: &TurnCtx<'_>, messages: &mut Vec<serde_json::Value>, segm
     if let Err(e) = ctx.hooks.begin_segment(segment).await {
         return TurnResult::stop("error", Some(e.to_string()));
     }
-    let msgs = serde_json::Value::Array(messages.clone());
-    let res = {
-        // Wait for a free generation slot (the wait counts against time).
-        let _permit = match ctx.gate {
-            Some(g) => tokio::select! {
-                p = g.acquire() => p.ok(),
-                _ = ctx.cancel.cancelled() => return TurnResult::stop("cancelled", None),
-                _ = tokio::time::sleep(time_left) => return TurnResult::stop("time_limit", None),
-            },
-            None => None,
+    let started = Instant::now();
+    // A reply right after tool results that says nothing (only reasoning, or
+    // nothing at all) and calls no tool is nudged once, then generated again.
+    let after_tools = follows_tool_results(messages, xml);
+    let mut nudged = false;
+    let mut earlier_tokens = 0u64;
+    // Wait for a free generation slot (the wait counts against time).
+    let permit = match ctx.gate {
+        Some(g) => tokio::select! {
+            p = g.acquire() => p.ok(),
+            _ = ctx.cancel.cancelled() => return TurnResult::stop("cancelled", None),
+            _ = tokio::time::sleep(time_left) => return TurnResult::stop("time_limit", None),
+        },
+        None => None,
+    };
+    let (mut reply, calls, mut note, malformed, cut_off) = loop {
+        let left = time_left.saturating_sub(started.elapsed());
+        let reply = match generate(ctx, messages, offer_tools && !xml, &defs, segment, left).await {
+            Ok(r) => r,
+            Err(t) => return t,
         };
-        // A broken stream (connection dropped mid-reply) is retried once. This
-        // is safe: tool calls only run after a complete reply, so nothing has
-        // happened yet for this segment.
-        let mut attempt = 0;
-        loop {
-            let tools_arg = if offer_tools && !xml { Some(&defs) } else { None };
-            let fut = inference::chat::stream_chat_tools(ctx.client, &msgs, tools_arg, ctx.params, ctx.cancel, |d| ctx.hooks.on_delta(segment, &d));
-            let r = match tokio::time::timeout(time_left, fut).await {
-                Ok(r) => r,
-                Err(_) => return TurnResult::stop("time_limit", None),
-            };
-            match &r {
-                Err(e) if attempt == 0 && !ctx.cancel.is_cancelled() && is_transient(&e.to_string()) => {
-                    tracing::warn!("agent reply stream broke ({e}); retrying once");
-                    attempt += 1;
-                    ctx.hooks.reset_segment(segment);
-                    continue;
+        // XML mode: the reply text is the only place a command can come from.
+        let mut note: Option<String> = None;
+        let mut malformed = false;
+        let calls = if !offer_tools {
+            vec![]
+        } else if xml {
+            match crate::xml::parse(&reply.content, &format!("xml-{}", app_core::new_id())) {
+                crate::xml::Parsed::None => vec![],
+                crate::xml::Parsed::Command { call, ignored } => {
+                    if ignored > 0 {
+                        note = Some(format!("Only the first command ran; {ignored} more in the same reply were ignored. Send one command per reply."));
+                    }
+                    vec![call]
                 }
-                _ => break r,
-            }
-        }
-    };
-    let reply = match res {
-        Ok(g) => g,
-        Err(e) => return TurnResult::stop("error", Some(e.to_string())),
-    };
-    // XML mode: the reply text is the only place a command can come from.
-    let mut note: Option<String> = None;
-    let mut malformed = false;
-    let calls = if !offer_tools {
-        vec![]
-    } else if xml {
-        match crate::xml::parse(&reply.content, &format!("xml-{}", app_core::new_id())) {
-            crate::xml::Parsed::None => vec![],
-            crate::xml::Parsed::Command { call, ignored } => {
-                if ignored > 0 {
-                    note = Some(format!("Only the first command ran; {ignored} more in the same reply were ignored. Send one command per reply."));
+                crate::xml::Parsed::Malformed(why) => {
+                    malformed = true;
+                    note = Some(format!("Your command was not run: {why}. Write it exactly in the format from your instructions, or answer without a command."));
+                    vec![]
                 }
-                vec![call]
             }
-            crate::xml::Parsed::Malformed(why) => {
-                malformed = true;
-                note = Some(format!("Your command was not run: {why}. Write it exactly in the format from your instructions, or answer without a command."));
-                vec![]
+        } else if reply.tool_calls.is_empty() {
+            // Safety net for a tool call the server left in the text.
+            let offered: Vec<&str> = ctx.tools.iter().map(|t| t.model_name.as_str()).collect();
+            crate::xml::parse_tool_call_text(&reply.content, &format!("txt-{}", app_core::new_id()), &offered).into_iter().collect()
+        } else {
+            reply.tool_calls.clone()
+        };
+        // A reply cut off at the length limit (often a model repeating itself
+        // until the context is full) is not trusted: none of its tool calls run.
+        let cut_off = reply.stats.stop_reason == "length" && !calls.is_empty();
+        let calls = if cut_off {
+            note = Some(format!(
+                "Your last reply was cut off because it was too long, so none of its {} tool call(s) ran. Reply again, shorter, with only the next tool call(s) you need.",
+                calls.len()
+            ));
+            vec![]
+        } else {
+            calls
+        };
+        let empty = is_empty_answer(&reply, &calls, malformed || cut_off);
+        if empty && after_tools && !nudged && !ctx.cancel.is_cancelled() && !time_left.saturating_sub(started.elapsed()).is_zero() {
+            tracing::info!("segment {segment}: empty reply after tool results ({} reasoning chars); nudging once", reply.reasoning.len());
+            nudged = true;
+            earlier_tokens += reply.stats.completion_tokens.unwrap_or(0);
+            match messages.last_mut() {
+                // XML mode: the tool result is already a user message; add to it
+                // rather than sending two user messages in a row.
+                Some(last) if last["role"] == "user" => {
+                    let c = last["content"].as_str().unwrap_or_default().to_string();
+                    last["content"] = format!("{c}
+
+{NUDGE}").into();
+                }
+                _ => messages.push(serde_json::json!({ "role": "user", "content": NUDGE })),
             }
+            ctx.hooks.reset_segment(segment);
+            continue;
         }
-    } else if reply.tool_calls.is_empty() {
-        // Safety net for a tool call the server left in the text.
-        let offered: Vec<&str> = ctx.tools.iter().map(|t| t.model_name.as_str()).collect();
-        crate::xml::parse_tool_call_text(&reply.content, &format!("txt-{}", app_core::new_id()), &offered).into_iter().collect()
-    } else {
-        reply.tool_calls.clone()
+        break (reply, calls, note, malformed, cut_off);
     };
-    // A reply cut off at the length limit (often a model repeating itself
-    // until the context is full) is not trusted: none of its tool calls run.
-    let cut_off = reply.stats.stop_reason == "length" && !calls.is_empty();
-    let calls = if cut_off {
-        note = Some(format!(
-            "Your last reply was cut off because it was too long, so none of its {} tool call(s) ran. Reply again, shorter, with only the next tool call(s) you need.",
-            calls.len()
-        ));
-        vec![]
-    } else {
-        calls
-    };
+    drop(permit);
+    if earlier_tokens > 0 {
+        // The nudged-away attempt's tokens count too (budgets, usage).
+        reply.stats.completion_tokens = Some(reply.stats.completion_tokens.unwrap_or(0) + earlier_tokens);
+    }
+    let empty_answer = is_empty_answer(&reply, &calls, malformed || cut_off);
     let message_id = match ctx.hooks.on_segment(segment, &reply.content, &reply.reasoning, &calls, &reply.stats).await {
         Ok(id) => Some(id),
         Err(e) => return TurnResult::stop("error", Some(e.to_string())),
     };
-    let mut result = TurnResult { end: TurnEnd::Final, message_id, content: reply.content.clone(), stats: reply.stats.clone(), calls_counted: 0, limit_hit: false };
+    let mut result = TurnResult { end: TurnEnd::Final, message_id, content: reply.content.clone(), stats: reply.stats.clone(), calls_counted: 0, limit_hit: false, empty_answer };
     if reply.stats.stop_reason == "cancelled" {
         result.end = TurnEnd::Stop("cancelled".into(), None);
         return result;
@@ -268,12 +344,16 @@ pub async fn run_reply(
             out.stop_reason = "cancelled".into();
             return out;
         }
-        let remaining = Duration::from_secs(limits.max_wall_secs).saturating_sub(started.elapsed());
+        if segment as u32 >= crate::task::MAX_TURNS_BACKSTOP {
+            out.stop_reason = "turn_limit".into();
+            return out;
+        }
+        let remaining = Duration::from_secs(limits.secs_or_max()).saturating_sub(started.elapsed());
         if remaining.is_zero() {
             out.stop_reason = "time_limit".into();
             return out;
         }
-        let calls_left = limits.max_tool_calls.saturating_sub(out.tool_calls);
+        let calls_left = limits.calls_or_max().saturating_sub(out.tool_calls);
         let t = turn(&ctx, &mut messages, segment, offer_tools, calls_left, remaining).await;
         out.segments = segment + 1;
         out.tool_calls += t.calls_counted;
@@ -288,7 +368,17 @@ pub async fn run_reply(
         }
         match t.end {
             TurnEnd::Final => {
+                // Subagents still working are waited for, not cancelled: their
+                // results go back to the model, which then answers again.
+                if !t.empty_answer
+                    && let Some(text) = hooks.wait_children(Duration::from_secs(limits.secs_or_max()).saturating_sub(started.elapsed())).await
+                {
+                    messages.push(serde_json::json!({ "role": "assistant", "content": t.content }));
+                    messages.push(serde_json::json!({ "role": "user", "content": text }));
+                    continue;
+                }
                 out.stop_reason = if limit_seen { "limit".into() } else { t.stats.stop_reason.clone() };
+                out.empty_answer = t.empty_answer;
                 return out;
             }
             TurnEnd::Continue => {}

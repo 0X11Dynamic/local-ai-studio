@@ -21,6 +21,8 @@ import { Environments } from "./pages/Environments";
 import { AgentTasks } from "./pages/AgentTasks";
 import { Subagents } from "./pages/Subagents";
 import { Skills } from "./pages/Skills";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { FirstRun } from "./components/FirstRun";
 
 export type PageId =
   | "overview" | "chat" | "discover" | "models" | "runtimes" | "agents" | "subagents"
@@ -145,36 +147,44 @@ function Shell() {
         <header className="topbar">
           <h1>{current.label}</h1>
           <div className="topbar-right">
-            <ApprovalsIndicator go={setPage} />
-            <DownloadsIndicator go={setPage} />
-            <EngineIndicator go={setPage} />
+            <ErrorBoundary label="Status bar" scope="inline">
+              <ApprovalsIndicator go={setPage} />
+              <DownloadsIndicator go={setPage} />
+              <EngineIndicator go={setPage} />
+            </ErrorBoundary>
           </div>
         </header>
         <main className={`content${page === "chat" ? " flush" : ""}`}>
-          {page === "chat" && <Chat go={setPage} />}
-          {page === "discover" && <Discover go={setPage} />}
-          {page === "instructions" && <Instructions />}
-          {page === "developer" && <Developer />}
-          {page === "mcp" && <Mcp />}
-          {page === "environments" && <Environments />}
-          {page === "agents" && <AgentTasks />}
-          {page === "subagents" && <Subagents go={setPage} />}
-          {page === "skills" && <Skills />}
-          {page === "overview" && <Overview go={setPage} />}
-          {page === "runtimes" && <Runtimes />}
-          {page === "models" && <Models go={setPage} />}
-          {page === "settings" && <Settings />}
-          {current.phase && <NotBuilt label={current.label} phase={current.phase} />}
+          {/* One boundary per page (keyed by page): a render error shows on that page only. */}
+          <ErrorBoundary key={page} label={current.label}>
+            {page === "chat" && <Chat go={setPage} />}
+            {page === "discover" && <Discover go={setPage} />}
+            {page === "instructions" && <Instructions />}
+            {page === "developer" && <Developer />}
+            {page === "mcp" && <Mcp />}
+            {page === "environments" && <Environments />}
+            {page === "agents" && <AgentTasks />}
+            {page === "subagents" && <Subagents go={setPage} />}
+            {page === "skills" && <Skills />}
+            {page === "overview" && <Overview go={setPage} />}
+            {page === "runtimes" && <Runtimes />}
+            {page === "models" && <Models go={setPage} />}
+            {page === "settings" && <Settings />}
+            {current.phase && <NotBuilt label={current.label} phase={current.phase} />}
+          </ErrorBoundary>
         </main>
       </div>
+      <ErrorBoundary label="Setup" scope="inline"><FirstRun go={setPage} /></ErrorBoundary>
     </div>
   );
 }
 
 export default function App() {
   return (
-    <EngineProvider>
-      <Shell />
-    </EngineProvider>
+    <ErrorBoundary label="app" scope="app">
+      <EngineProvider>
+        <Shell />
+      </EngineProvider>
+    </ErrorBoundary>
   );
 }

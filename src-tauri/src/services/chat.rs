@@ -37,6 +37,11 @@ pub struct ChatSettings {
     pub agent_mode: bool,
     /// MCP server ids whose tools this chat may use (empty = all connected).
     pub tool_servers: Vec<String>,
+    // --- chat tools menu (per-chat MCP off switch) ---
+    /// MCP server ids turned off for this chat only (the composer's Tools
+    /// menu). Applied after `tool_servers`; servers added later stay on.
+    pub disabled_servers: Vec<String>,
+    // --- end chat tools menu ---
     pub limits: Limits,
     /// Built-in shell and file tools in Agent Mode.
     pub builtin_tools: bool,
@@ -77,9 +82,15 @@ impl ChatSettings {
 /// fs_read and fs_search, and MCP tools that are set to "runs without asking"
 /// AND that the server marks read-only (the hint only narrows, never widens).
 /// Never the app's agent tools (spawn_subagents, skill_propose_edit).
+/// "Reads + web + asked commands": the built-in fs_list, fs_read and
+/// fs_search (normal rules: outside the allowed folders they ask), web_fetch,
+/// and shell_execute (which `plan_filter` turns into ask-every-time); MCP
+/// tools only when set to "runs without asking" AND marked read-only by the
+/// server (the hint only narrows, never widens). Never the writes, moves,
+/// deletes or the app's agent tools (spawn_subagents, skill_propose_edit).
 pub fn is_plan_tool(t: &ExposedTool, mcp_read_only: bool) -> bool {
     if t.server_id.starts_with(agent_runtime::BUILTIN_PREFIX) {
-        return matches!(t.tool_name.as_str(), "fs_list" | "fs_read" | "fs_search");
+        return matches!(t.tool_name.as_str(), "fs_list" | "fs_read" | "fs_search" | "web_fetch" | "shell_execute");
     }
     if t.server_id.starts_with(mcp::AGENT_PREFIX) {
         return false;
@@ -87,7 +98,9 @@ pub fn is_plan_tool(t: &ExposedTool, mcp_read_only: bool) -> bool {
     t.policy == security::policy::Policy::Allow && mcp_read_only
 }
 
-/// Keep only the tools Plan mode allows (see `is_plan_tool`).
+/// Keep only the tools Plan mode allows (see `is_plan_tool`). The shell is
+/// marked as Plan mode's (`exec::PLAN_SUFFIX` on its id): every command asks
+/// with "Plan mode: read-only command requested" and no grant applies.
 pub(crate) fn plan_filter(st: &SharedState, tools: Vec<ExposedTool>) -> Vec<ExposedTool> {
     tools
         .into_iter()
@@ -97,7 +110,18 @@ pub(crate) fn plan_filter(st: &SharedState, tools: Vec<ExposedTool>) -> Vec<Expo
                 && st.mcp.status(&t.server_id).tools.iter().find(|x| x.name == t.tool_name).is_some_and(|x| x.annotations["readOnlyHint"].as_bool() == Some(true));
             is_plan_tool(t, read_only)
         })
+        .map(plan_shell)
         .collect()
+}
+
+/// The Plan mode form of a built-in shell tool (others unchanged).
+fn plan_shell(mut t: ExposedTool) -> ExposedTool {
+    if t.server_id.starts_with(agent_runtime::BUILTIN_PREFIX) && t.tool_name == "shell_execute" && !t.tool_id.ends_with(exec::PLAN_SUFFIX) {
+        t.tool_id.push_str(exec::PLAN_SUFFIX);
+        t.policy = security::policy::Policy::Ask;
+        t.description.push_str(" Plan mode: use it only for read-only or auditing commands (listing, reading, git status/log, --version); never change files or settings. Every command asks the user first.");
+    }
+    t
 }
 
 impl Default for ChatSettings {
@@ -109,6 +133,7 @@ impl Default for ChatSettings {
             reserve_tokens: 1024,
             agent_mode: false,
             tool_servers: vec![],
+            disabled_servers: vec![],
             limits: Limits::default(),
             builtin_tools: true,
             environment_id: None,
@@ -353,15 +378,16 @@ fn is_spawn_tool(t: &ExposedTool) -> bool {
     t.server_id.starts_with(mcp::AGENT_PREFIX) && t.tool_name == "spawn_subagents"
 }
 
-/// Offer spawn_subagents when this chat allows it (Agent mode with "Allow
-/// subagents" on; never Plan mode or plain chat). The tool's id is
-/// re-pointed at the chat's run when a reply starts. Returns whether it was added.
+/// Offer the subagent tools (spawn_subagents, subagent_status,
+/// wait_subagents, stop_subagent) when this chat allows it (Agent mode with
+/// "Allow subagents" on; never Plan mode or plain chat). Their ids are
+/// re-pointed at the chat's run when a reply starts. Returns whether they were added.
 pub(crate) fn offer_subagent_tool(tools: &mut Vec<ExposedTool>, s: &ChatSettings) -> bool {
-    tools.retain(|t| !is_spawn_tool(t));
+    tools.retain(|t| !tasks::is_subagent_tool(t));
     if !tasks::chat_offers_subagents(s) {
         return false;
     }
-    tools.push(tasks::spawn_tool("chat"));
+    tools.extend(tasks::subagent_tools("chat"));
     true
 }
 
@@ -399,7 +425,8 @@ pub async fn agent_tools(st: &SharedState, s: &ChatSettings) -> AppResult<(Vec<E
         tools.extend(t);
         env_section = Some(sec);
     }
-    tools.extend(mcp::exposed_tools(st, &s.tool_servers).await?);
+    // Servers turned off for this chat (Tools menu) are left out.
+    tools.extend(mcp::exposed_tools(st, &s.tool_servers).await?.into_iter().filter(|t| !s.disabled_servers.contains(&t.server_id)));
     let plan = s.effective_mode() == "plan";
     if plan {
         tools = plan_filter(st, tools);
@@ -784,6 +811,11 @@ pub async fn send_with(app: AppHandle, st: SharedState, conversation_id: String,
                         }
                         stats["stop_reason"] = out.stop_reason.clone().into();
                         stats["tool_calls_used"] = out.tool_calls.into();
+                        if out.empty_answer {
+                            // No silent empty bubble: the UI shows this note.
+                            stats["empty_answer"] = true.into();
+                            stats["note"] = agent_runtime::agent_loop::NO_ANSWER_NOTE.into();
+                        }
                         let _ = st.db.finish_message(&id, &m.content, m.reasoning.as_deref(), &stats).await;
                     }
                     let _ = st.db.touch_conversation(&conv_id).await;
@@ -944,6 +976,10 @@ impl ChatHooks {
 
 #[async_trait]
 impl LoopHooks for ChatHooks {
+    async fn wait_children(&self, remaining: Duration) -> Option<String> {
+        tasks::await_children(self.run.as_ref()?, remaining).await
+    }
+
     async fn begin_segment(&self, segment: usize) -> AppResult<()> {
         *self.partial.lock().unwrap() = (String::new(), String::new());
         if segment < self.ids.lock().unwrap().len() {
@@ -1248,12 +1284,18 @@ mod tests {
             policy,
             timeout_secs: 60,
         };
-        for n in ["fs_list", "fs_read", "fs_search"] {
+        for n in ["fs_list", "fs_read", "fs_search", "web_fetch", "shell_execute"] {
             assert!(is_plan_tool(&tool("builtin:local", n, Allow), false), "{n}");
         }
-        for n in ["shell_execute", "fs_write", "fs_patch", "fs_move", "fs_delete"] {
+        for n in ["fs_write", "fs_patch", "fs_move", "fs_delete"] {
             assert!(!is_plan_tool(&tool("builtin:local", n, Allow), true), "{n} must not be offered");
         }
+        // The Plan mode shell asks every time and is marked so no grant applies.
+        let sh = plan_shell(tool("builtin:local", "shell_execute", Allow));
+        assert!(sh.tool_id.ends_with(exec::PLAN_SUFFIX) && sh.policy == Ask && sh.description.contains("read-only"), "{sh:?}");
+        assert_eq!(plan_shell(sh.clone()).tool_id, sh.tool_id, "marked once");
+        let rd = plan_shell(tool("builtin:local", "fs_read", Allow));
+        assert!(!rd.tool_id.ends_with(exec::PLAN_SUFFIX) && rd.policy == Allow);
         assert!(!is_plan_tool(&tool("agent:run1", "spawn_subagents", Allow), true));
         assert!(!is_plan_tool(&tool("agent:run1", "skill_propose_edit", Allow), true));
         assert!(is_plan_tool(&tool("srv", "read_file", Allow), true), "MCP allow + read-only hint");
@@ -1286,8 +1328,8 @@ mod tests {
         assert!(tasks::chat_offers_subagents(&agent));
         assert!(offer_subagent_tool(&mut tools, &agent));
         assert!(offer_subagent_tool(&mut tools, &agent));
-        assert_eq!(names(&tools), vec!["spawn_subagents"]);
-        assert!(tools[0].server_id.starts_with(mcp::AGENT_PREFIX));
+        assert_eq!(names(&tools), vec!["spawn_subagents", "subagent_status", "wait_subagents", "stop_subagent"]);
+        assert!(tools.iter().all(|t| t.server_id.starts_with(mcp::AGENT_PREFIX) && !is_plan_tool(t, true)), "never Plan tools");
         // Plan mode and plain chat: never, even with the setting on.
         let plan = ChatSettings { mode: "plan".into(), ..agent.clone() };
         assert!(!tasks::chat_offers_subagents(&plan));
@@ -1297,8 +1339,16 @@ mod tests {
         let chat = ChatSettings { agent_mode: false, ..agent.clone() };
         assert!(!tasks::chat_offers_subagents(&chat));
         // The chat's limits become the children's shared budget.
-        let b = tasks::chat_budgets(&agent_runtime::Limits { max_tool_calls: 12, max_wall_secs: 600 });
-        assert_eq!((b.max_tool_calls, b.max_wall_secs), (12, 600));
+        let b = tasks::chat_budgets(&agent_runtime::Limits { max_tool_calls: Some(12), max_wall_secs: Some(600) });
+        assert_eq!((b.max_tool_calls, b.max_wall_secs, b.max_turns, b.max_tokens), (Some(12), Some(600), None, None));
+        // Default limits: nothing is limited (the 500-turn backstop still applies).
+        assert_eq!(tasks::chat_budgets(&agent_runtime::Limits::default()), agent_runtime::task::Budgets::default());
+        // Old saved chats: the old defaults (10 / 300 s) read as no limit; other numbers stay.
+        let old: agent_runtime::Limits = serde_json::from_str(r#"{"max_tool_calls":10,"max_wall_secs":300}"#).unwrap();
+        assert_eq!(old, agent_runtime::Limits::default());
+        let custom: agent_runtime::Limits = serde_json::from_str(r#"{"max_tool_calls":3,"max_wall_secs":300}"#).unwrap();
+        assert_eq!((custom.max_tool_calls, custom.max_wall_secs), (Some(3), Some(300)));
+        assert_eq!(serde_json::from_str::<agent_runtime::Limits>("{}").unwrap(), agent_runtime::Limits::default());
         // The spawn schema accepts per-child isolation.
         let schema = tasks::spawn_tool("r").input_schema;
         assert!(agent_runtime::validate_args(&schema, &serde_json::json!({ "subagents": [{ "label": "a", "objective": "b", "isolation": "worktree" }] })).is_ok());

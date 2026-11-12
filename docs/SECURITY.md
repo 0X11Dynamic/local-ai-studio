@@ -15,13 +15,17 @@ The short version: the model can only use the tools you turn on, anything that c
 - Chats have no tools until you turn on Agent Mode.
 - MCP tools ask every time. Imported MCP servers start turned off.
 - Built-in tools: reading, listing and searching inside the allowed folders run without asking. Shell commands, writes, moves and deletes ask.
+- web_fetch (built in, runs in the app) reads public web pages without asking. Local network addresses (localhost, 127.x, 10.x, 172.16-31.x, 192.168.x, 169.254.x, fc00::/7, ...) ask every time; the host is resolved and checked before connecting and again on every redirect, and the connection is pinned to the checked address. No cookies, no login headers, no proxy, 15 s, 2 MB.
+- Plan mode offers only fs_list, fs_read, fs_search, web_fetch and the shell, and every shell command asks ("Plan mode: read-only command requested"); no "allow for this chat" applies while planning.
 - The local API is off. When on, it listens on this PC only. The model-management endpoints always need a token, and LAN mode needs it for everything. Web pages from other sites are refused.
 
 ## This PC
 
 - Commands run as you, never as administrator, through PowerShell `-EncodedCommand`, so no quoting tricks can change the command. Each command runs in a Windows Job Object, so a timeout or Stop kills everything it started.
-- File tools are limited to the allowed folders. Paths are checked after resolving `..`, symlinks and junctions. Network (UNC) paths are refused.
-- Always protected: Windows, Program Files, ProgramData, `.ssh`, `.gnupg`, the Windows credential folders, the app's own data and the model folders.
+- Inside the allowed folders each tool's own permission applies. With **Reach outside allowed folders: Ask each time** (the default, Environments > This PC), file tools and shell commands may use other paths too, but every call that reaches outside the folders asks first, whatever the tool's permission says, and the approval names the real path. "Allow for this chat/task" then covers that one tool in that folder (and below it) for that chat or task only; "Always" is narrowed to the same. **Off** keeps the tools inside the allowed folders.
+- A shell command asks first when its working folder is outside the allowed folders. The app can't see which files a command touches once it runs, so a command allowed inside the folders can still change files elsewhere: check commands before allowing them.
+- Paths are checked after resolving `..`, 8.3 short names, symlinks and junctions, so the approval shows where a path really goes. Network (UNC), device, `\\?\`, drive-relative and alternate-data-stream paths are refused.
+- Always refused, even if you approve: Windows, Program Files, ProgramData\Microsoft, `.ssh`, `.gnupg`, the Windows credential folders, the app's own data (database, runtimes, settings, trash) and WebView profile, and the model folders. Writes, moves and deletes never touch `.git` internals, and whole drives and home folders are never moved or deleted.
 - File deletes go to the app's trash and can be restored.
 
 ## Sandbox, SSH and Docker

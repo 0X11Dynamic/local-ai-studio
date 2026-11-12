@@ -40,6 +40,27 @@ pub async fn approve_task_plan(app: tauri::AppHandle, state: State<'_, SharedSta
     svc::approve_plan(state.inner(), &app, &id, plan).await
 }
 
+/// Answer an agent's `ask_user` question (the asking agent, or only that
+/// subagent, continues with the answer as the tool result).
+#[tauri::command]
+pub async fn answer_task_question(app: tauri::AppHandle, state: State<'_, SharedState>, run_id: String, question_id: String, answer: String) -> Cmd<()> {
+    svc::answer_question(state.inner(), &app, &run_id, &question_id, &answer).await
+}
+
+/// Send a message to a task: "answered" (it answered the waiting question),
+/// "queued" (read before the agent's next model turn) or "resumed" (a stopped
+/// task restarted with it; needs `resume`).
+#[tauri::command]
+pub async fn send_task_message(app: tauri::AppHandle, state: State<'_, SharedState>, run_id: String, text: String, resume: Option<bool>, budgets: Option<Budgets>) -> Cmd<String> {
+    svc::send_message(state.inner(), &app, &run_id, &text, resume.unwrap_or(false), budgets).await
+}
+
+/// Questions waiting for the user in any task (the app-wide indicator).
+#[tauri::command]
+pub async fn pending_task_questions(state: State<'_, SharedState>) -> Cmd<Vec<persistence::AgentStepRow>> {
+    svc::waiting_questions(state.inner()).await
+}
+
 #[tauri::command]
 pub async fn cancel_task(app: tauri::AppHandle, state: State<'_, SharedState>, id: String) -> Cmd<()> {
     svc::cancel(state.inner(), &app, &id).await

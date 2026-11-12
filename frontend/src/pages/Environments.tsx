@@ -227,13 +227,27 @@ export function Environments() {
               {sel.kind === "local" && (
                 <div className="panel" style={{ display: "grid", gap: 8 }}>
                   <strong style={{ fontWeight: 600 }}>Allowed folders</strong>
-                  <span className="help faint">Shell commands start in the first folder; file tools refuse paths outside these. Windows, Program Files, ProgramData, .ssh, Credential folders, the app's own data and your model folders are always off limits.</span>
+                  <span className="help faint">Shell commands start in the first folder. Inside these folders each tool's permission below applies. Windows, Program Files, ProgramData\Microsoft, .ssh, Credential folders, the app's own data and your model folders are always off limits, even if you approve.</span>
                   <textarea className="input mono" rows={4} aria-label="Allowed folders, one per line" value={roots} onChange={(e) => setRoots(e.target.value)} />
                   <div className="row">
                     <button className="btn sm primary" disabled={!!busy} onClick={() => run("roots", async () => { await api4.setLocalRoots(lines(roots)); await refresh(); }, "Folders saved.")}>Save folders</button>
                     <button className="btn sm ghost" onClick={async () => { const p = await open({ directory: true }); if (p) setRoots((r) => (r.trim() ? `${r.trim()}\n${p}` : String(p))); }}>Add a folder...</button>
                     <span className="faint mono" style={{ fontSize: 12 }}>Shell: {String(sel.config.shell ?? "powershell.exe")}</span>
                   </div>
+                  {/* reach outside the allowed folders (This PC only) */}
+                  <div className="row" style={{ gap: 8 }}>
+                    <label htmlFor="reach-outside" style={{ fontWeight: 600 }}>Reach outside allowed folders</label>
+                    <select id="reach-outside" className="input" style={{ width: "auto" }} disabled={!!busy} value={String(sel.config.outside ?? "ask")}
+                      onChange={(e) => { const mode = e.target.value as "ask" | "off"; run("outside", async () => { await api4.setLocalOutside(mode); await refresh(); }, mode === "ask" ? "Paths outside the folders now ask each time." : "Tools now stay inside the allowed folders."); }}>
+                      <option value="ask">Ask each time</option>
+                      <option value="off">Off (allowed folders only)</option>
+                    </select>
+                  </div>
+                  <span className="help faint">
+                    {String(sel.config.outside ?? "ask") === "ask"
+                      ? "File tools and shell commands may use other paths on this PC, but every call outside the folders asks you first, whatever the tool's permission says, and the approval names the path. \"Allow for this chat\" then covers that tool in that folder for that chat only. A command can change files anywhere, so check commands before allowing them. Deletes still go to the app's trash."
+                      : "File tools refuse paths outside the allowed folders, and shell commands must start inside them."}
+                  </span>
                 </div>
               )}
 

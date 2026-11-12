@@ -48,20 +48,131 @@ pub fn store_secrets(st: &SharedState, server_id: &str, secrets: &Secrets) -> Ap
 }
 
 pub async fn connect(st: &SharedState, id: &str) -> AppResult<ServerStatus> {
+    // One connect per server at a time (a manual Connect and a background
+    // retry must not start two processes for the same server).
+    let lock = connect_lock(id);
+    let _guard = lock.lock().await;
     let row = st.db.get_mcp_server(id).await?;
     let cfg = config_of(&row);
     let secrets = secrets_of(st, &row);
     st.mcp.connect(id, &cfg, &secrets).await
 }
 
-/// Connect every enabled server in the background (app start).
+// ---------- auto-connect (app start, imports, turning a server on) ----------
+
+/// Attempts per server before giving up (the first try plus retries).
+pub const AUTO_ATTEMPTS: u32 = 4;
+/// Wait before retry n (seconds): 5, 15, 45.
+const AUTO_BACKOFF_SECS: [u64; 3] = [5, 15, 45];
+
+/// Background connect progress for one server (shown on the MCP page).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AutoConnect {
+    /// Attempt in progress or last made (1-based).
+    pub attempt: u32,
+    pub max_attempts: u32,
+    /// Seconds until the next try (None while connecting or after giving up).
+    pub retry_in_secs: Option<u64>,
+    /// All attempts failed; connect by hand.
+    pub gave_up: bool,
+}
+
+struct AutoEntry {
+    generation: u64,
+    attempt: u32,
+    next_at: Option<std::time::Instant>,
+    gave_up: bool,
+}
+
+static AUTO: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, AutoEntry>>> = std::sync::LazyLock::new(Default::default);
+static AUTO_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+type ConnectLocks = std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>;
+static CONNECT_LOCKS: std::sync::LazyLock<std::sync::Mutex<ConnectLocks>> = std::sync::LazyLock::new(Default::default);
+
+fn connect_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    CONNECT_LOCKS.lock().unwrap().entry(id.to_string()).or_default().clone()
+}
+
+/// Background connect state for the MCP page (None = no background connect).
+pub fn auto_status(id: &str) -> Option<AutoConnect> {
+    AUTO.lock().unwrap().get(id).map(|e| AutoConnect {
+        attempt: e.attempt,
+        max_attempts: AUTO_ATTEMPTS,
+        retry_in_secs: e.next_at.map(|t| t.saturating_duration_since(std::time::Instant::now()).as_secs().max(1)),
+        gave_up: e.gave_up,
+    })
+}
+
+/// Stop a server's background retries (a manual connect, disconnect, edit
+/// or removal takes over).
+pub fn cancel_auto(id: &str) {
+    AUTO.lock().unwrap().remove(id);
+}
+
+fn auto_current(id: &str, generation: u64) -> bool {
+    AUTO.lock().unwrap().get(id).is_some_and(|e| e.generation == generation)
+}
+
+fn auto_update(id: &str, generation: u64, f: impl FnOnce(&mut AutoEntry)) {
+    if let Some(e) = AUTO.lock().unwrap().get_mut(id).filter(|e| e.generation == generation) {
+        f(e);
+    }
+}
+
+/// Connect one server in the background, retrying with backoff. Stops when
+/// it connects, the server is turned off or removed, or the user connects or
+/// disconnects it by hand (see `cancel_auto`).
+pub fn auto_connect(st: SharedState, id: String) {
+    let generation = AUTO_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    AUTO.lock().unwrap().insert(id.clone(), AutoEntry { generation, attempt: 0, next_at: None, gave_up: false });
+    tokio::spawn(async move {
+        for attempt in 1..=AUTO_ATTEMPTS {
+            if !auto_current(&id, generation) {
+                return;
+            }
+            let on = st.db.get_mcp_server(&id).await.is_ok_and(|r| r.enabled != 0);
+            if !on || st.mcp.status(&id).state == "connected" {
+                if auto_current(&id, generation) {
+                    cancel_auto(&id);
+                }
+                return;
+            }
+            auto_update(&id, generation, |e| {
+                e.attempt = attempt;
+                e.next_at = None;
+            });
+            let r = connect(&st, &id).await;
+            if !auto_current(&id, generation) {
+                return;
+            }
+            match r {
+                Ok(_) => {
+                    cancel_auto(&id);
+                    return;
+                }
+                Err(e) if attempt == AUTO_ATTEMPTS => {
+                    tracing::warn!("MCP auto-connect of {id} gave up after {attempt} attempts: {e}");
+                    auto_update(&id, generation, |e| e.gave_up = true);
+                    return;
+                }
+                Err(e) => {
+                    let wait = Duration::from_secs(AUTO_BACKOFF_SECS[(attempt - 1) as usize]);
+                    tracing::warn!("MCP auto-connect of {id} failed (attempt {attempt} of {AUTO_ATTEMPTS}), retrying in {}s: {e}", wait.as_secs());
+                    auto_update(&id, generation, |e| e.next_at = Some(std::time::Instant::now() + wait));
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
+    });
+}
+
+/// Connect every turned-on server in the background (app start). Servers
+/// connect in parallel, so a slow one doesn't hold up the others.
 pub fn autoconnect(st: SharedState) {
     tokio::spawn(async move {
         let Ok(rows) = st.db.list_mcp_servers().await else { return };
         for r in rows.into_iter().filter(|r| r.enabled != 0) {
-            if let Err(e) = connect(&st, &r.id).await {
-                tracing::warn!("MCP autoconnect of '{}' failed: {e}", r.name);
-            }
+            auto_connect(st.clone(), r.id);
         }
     });
 }
@@ -120,7 +231,8 @@ impl AppToolHost {
     }
 }
 
-/// `server_id` prefix of the app's own agent tools (spawn_subagents, skill_propose_edit).
+/// `server_id` prefix of the app's own agent tools (spawn_subagents,
+/// subagent_status, wait_subagents, stop_subagent, ask_user, skill_propose_edit).
 pub const AGENT_PREFIX: &str = "agent:";
 
 #[async_trait]
@@ -238,6 +350,10 @@ impl ToolHost for AppToolHost {
         if tool.server_id.starts_with(AGENT_PREFIX) {
             return match tool.tool_name.as_str() {
                 "spawn_subagents" => crate::services::tasks::spawn_subagents(self, call, args, timeout, cancel).await,
+                "subagent_status" => crate::services::tasks::subagent_status(self, args).await,
+                "wait_subagents" => crate::services::tasks::wait_subagents(self, args, timeout, cancel).await,
+                "stop_subagent" => crate::services::tasks::stop_subagent_tool(self, args).await,
+                "ask_user" => crate::services::tasks::ask_user(self, call, args, cancel).await,
                 "skill_propose_edit" => match tokio::time::timeout(timeout, crate::services::skills::propose_from_agent(&self.st, &args, self.run_id.as_deref().or(self.conversation_id.as_deref()))).await {
                     Ok(r) => r,
                     Err(_) => Err(AppError::Runtime(format!("the tool did not finish within {} s", timeout.as_secs()))),
@@ -256,6 +372,22 @@ impl ToolHost for AppToolHost {
     fn event(&self, ev: ToolEvent) {
         let _ = self.app.emit("tool://event", &serde_json::json!({ "conversation_id": self.conversation_id, "run_id": self.run_id, "agent_id": self.agent_id, "event": ev }));
     }
+
+    // --- built-in tool approvals: places outside the allowed folders, Plan mode, local network ---
+    async fn call_facts(&self, tool: &ExposedTool, args: &serde_json::Value) -> security::policy::CallFacts {
+        crate::services::exec::call_facts(&self.st, tool, args).await
+    }
+
+    async fn call_approved(&self, tool: &ExposedTool, call: &ToolCall, args: serde_json::Value, timeout: Duration, cancel: &CancellationToken, facts: &security::policy::CallFacts) -> AppResult<CallResult> {
+        match tool.server_id.strip_prefix(agent_runtime::BUILTIN_PREFIX) {
+            Some(env_id) if !facts.approved.is_empty() => {
+                let emit = |stream: &str, text: &str| self.event(ToolEvent::Output { call_id: call.id.clone(), stream: stream.into(), text: text.into() });
+                crate::services::exec::call_approved(&self.st, env_id, &tool.tool_name, args, timeout, cancel, &emit, &facts.approved).await
+            }
+            _ => self.call(tool, call, args, timeout, cancel).await,
+        }
+    }
+    // --- end built-in tool approvals ---
 }
 
 /// Answer a pending approval from the UI.

@@ -1,80 +1,112 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+// System Instructions: left, the defaults / templates / my profiles list;
+// right, the selected item's editor with its preview, test and actions.
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { Copy, Export, LockSimple, Trash } from "@phosphor-icons/react";
 import { api, errorMessage, type ModelView } from "../lib/api";
 import { api2, type InstructionPreview, type InstructionProfile, type InstructionSettings, type Sections } from "../lib/api2";
 import { Editor } from "../components/Editor";
+import { DEFAULTS, InstructionNav, usageText, type DefaultKey, type Selection } from "../components/instructions/InstructionNav";
+import { UsedBy } from "../components/instructions/UsedBy";
+import { PreviewPanel, TestPanel, tokenSummary, type PreviewMode } from "../components/instructions/PreviewPanel";
 
 const BLANK: Sections = { mode: "sections", identity: "", task: "", tool_use: "", formatting: "", raw: "" };
+
+const FIELDS: { key: "identity" | "task" | "tool_use" | "formatting"; label: string; help: string }[] = [
+  { key: "identity", label: "Identity and personality", help: "Who the assistant is and how it sounds." },
+  { key: "task", label: "Task instructions", help: "What it should do and how carefully." },
+  { key: "tool_use", label: "Tool-use instructions", help: "How to use tools in Agent and Plan mode. The tools themselves are listed by the app, not here." },
+  { key: "formatting", label: "Formatting", help: "Markdown, length, code blocks." },
+];
+
+const same = (a: Selection | null, b: Selection | null) =>
+  !!a && !!b && a.kind === b.kind && (a.kind === "base" || (b.kind === "profile" && a.id === b.id));
 
 export function Instructions() {
   const [profiles, setProfiles] = useState<InstructionProfile[]>([]);
   const [settings, setSettings] = useState<InstructionSettings | null>(null);
-  const [savedBase, setSavedBase] = useState("");
-  const [selId, setSelId] = useState<string | null>(null);
+  const [baseDraft, setBaseDraft] = useState("");
+  const [models, setModels] = useState<ModelView[]>([]);
+  const [modelProfiles, setModelProfiles] = useState<Record<string, string | null>>({});
+  const [selection, setSelection] = useState<Selection | null>(null);
   const [title, setTitle] = useState("");
   const [sections, setSections] = useState<Sections>(BLANK);
-  const [mode, setMode] = useState<"chat" | "agent">("chat");
+  const [previewMode, setPreviewMode] = useState<PreviewMode>("chat");
   const [preview, setPreview] = useState<InstructionPreview | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [testPrompt, setTestPrompt] = useState("");
   const [testOut, setTestOut] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
-  const [models, setModels] = useState<ModelView[]>([]);
-  const [modelId, setModelId] = useState("");
-  const [modelProfile, setModelProfile] = useState<string>("");
+  const [pending, setPending] = useState<(() => void) | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const testRef = useRef<HTMLDivElement>(null);
 
-  const sel = profiles.find((p) => p.id === selId) ?? null;
-  const dirty = !!sel && (title !== sel.title || JSON.stringify(sections) !== JSON.stringify(sel.sections));
-  const baseDirty = !!settings && settings.base !== savedBase;
+  const sel = selection?.kind === "profile" ? profiles.find((p) => p.id === selection.id) ?? null : null;
+  const onBase = selection?.kind === "base";
+  const profileDirty = !!sel && !sel.builtin && (title !== sel.title || JSON.stringify(sections) !== JSON.stringify(sel.sections));
+  const baseDirty = !!settings && baseDraft !== settings.base;
+  const dirty = onBase ? baseDirty : profileDirty;
 
-  const reload = useCallback(async (keep?: string) => {
-    const [ps, s] = await Promise.all([api2.listProfiles(), api2.getInstructionSettings()]);
-    setProfiles(ps);
-    setSettings(s);
-    setSavedBase(s.base);
-    const id = keep ?? s.chat_profile_id ?? ps[0]?.id ?? null;
-    const p = ps.find((x) => x.id === id) ?? ps[0];
-    if (p) {
-      setSelId(p.id);
-      setTitle(p.title);
-      setSections(p.sections);
-    }
-  }, []);
+  /** The profile a mode uses by default (for the base instruction's preview and test). */
+  const defaultSections = useCallback(
+    (mode: PreviewMode) => {
+      const key: DefaultKey = mode === "agent" ? "agent_profile_id" : mode === "plan" ? "plan_profile_id" : "chat_profile_id";
+      return profiles.find((p) => p.id === settings?.[key])?.sections ?? BLANK;
+    },
+    [profiles, settings],
+  );
 
-  useEffect(() => {
-    reload();
-    api.listModels().then((m) => {
-      setModels(m);
-      if (m[0]) setModelId(m[0].id);
-    });
-  }, [reload]);
-
-  useEffect(() => {
-    if (modelId) api2.getModelProfile(modelId).then((p) => setModelProfile(p ?? ""));
-  }, [modelId]);
-
-  // Live preview (unsaved edits included).
-  useEffect(() => {
-    if (!settings) return;
-    const t = setTimeout(() => {
-      api2.previewInstructions(mode, sections, settings.base).then(setPreview).catch((e) => setErr(errorMessage(e)));
-    }, 300);
-    return () => clearTimeout(t);
-  }, [sections, settings, mode]);
-
-  const pick = (p: InstructionProfile) => {
-    if (dirty && p.id !== selId) {
-      setErr("This profile has unsaved changes. Save or discard them first.");
-      return;
-    }
-    setSelId(p.id);
-    setTitle(p.title);
-    setSections(p.sections);
+  const show = useCallback((s: Selection, ps: InstructionProfile[], st: InstructionSettings | null) => {
+    setSelection(s);
     setMsg(null);
     setErr(null);
     setTestOut(null);
-  };
+    setConfirmDelete(false);
+    if (s.kind === "profile") {
+      const p = ps.find((x) => x.id === s.id);
+      if (p) {
+        setTitle(p.title);
+        setSections(p.sections);
+      }
+      // Preview in the mode this profile is used for, if any.
+      setPreviewMode(st?.plan_profile_id === s.id && st?.chat_profile_id !== s.id && st?.agent_profile_id !== s.id ? "plan"
+        : st?.agent_profile_id === s.id && st?.chat_profile_id !== s.id ? "agent" : "chat");
+    }
+  }, []);
+
+  const reload = useCallback(async (keep?: Selection) => {
+    const [ps, s] = await Promise.all([api2.listProfiles(), api2.getInstructionSettings()]);
+    setProfiles(ps);
+    setSettings(s);
+    setBaseDraft(s.base);
+    const fallback: Selection | null = s.chat_profile_id ? { kind: "profile", id: s.chat_profile_id } : ps[0] ? { kind: "profile", id: ps[0].id } : null;
+    const want = keep && (keep.kind === "base" || ps.some((p) => p.id === keep.id)) ? keep : fallback;
+    if (want) show(want, ps, s);
+  }, [show]);
+
+  useEffect(() => {
+    reload().catch((e) => setErr(errorMessage(e)));
+    api.listModels().then(async (ms) => {
+      setModels(ms);
+      const pairs = await Promise.all(ms.map(async (m) => [m.id, await api2.getModelProfile(m.id).catch(() => null)] as const));
+      setModelProfiles(Object.fromEntries(pairs));
+    }).catch(() => {});
+  }, [reload]);
+
+  // Live preview (unsaved edits included), debounced.
+  const previewSections = onBase ? defaultSections(previewMode) : sections;
+  const previewBase = onBase ? baseDraft : settings?.base ?? null;
+  const previewKey = JSON.stringify([previewMode, previewSections, previewBase]);
+  useEffect(() => {
+    if (!settings || !selection) return;
+    const t = setTimeout(() => {
+      api2.previewInstructions(previewMode, previewSections, previewBase).then(setPreview).catch((e) => setErr(errorMessage(e)));
+    }, 300);
+    return () => clearTimeout(t);
+    // previewKey covers the inputs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [previewKey, settings, selection]);
 
   const run = async (fn: () => Promise<unknown>, ok: string) => {
     setErr(null);
@@ -82,36 +114,117 @@ export function Instructions() {
     try {
       await fn();
       setMsg(ok);
+      return true;
     } catch (e) {
       setErr(errorMessage(e));
+      return false;
     }
   };
 
-  const saveProfile = () => run(async () => { await api2.updateProfile(sel!.id, title, sections); await reload(sel!.id); }, "Profile saved.");
-  const cloneProfile = () => run(async () => { const id = await api2.createProfile(`${title} copy`.slice(0, 80), sections); await reload(id); }, "Copy created. Edit it and save.");
-  const newProfile = () => run(async () => { const id = await api2.createProfile("New profile", BLANK); await reload(id); }, "New profile created.");
-  const deleteProfile = () => run(async () => { await api2.deleteProfile(sel!.id); await reload(); }, "Profile deleted.");
-  const saveBase = () => run(async () => { await api2.setInstructionSettings(settings!); setSavedBase(settings!.base); }, "Base instruction saved. It applies to new replies.");
-  const setDefault = (which: "chat" | "agent") =>
+  /** Run `next` now, or after the user saves or discards unsaved edits. */
+  const guard = (next: () => void) => {
+    if (dirty) setPending(() => next);
+    else next();
+  };
+  const select = (s: Selection) => {
+    if (same(s, selection)) return;
+    guard(() => show(s, profiles, settings));
+  };
+
+  const discard = () => {
+    if (onBase && settings) setBaseDraft(settings.base);
+    else if (sel) {
+      setTitle(sel.title);
+      setSections(sel.sections);
+    }
+  };
+  const saveCurrent = async () => {
+    if (onBase && settings) {
+      return run(async () => {
+        const next = { ...settings, base: baseDraft };
+        await api2.setInstructionSettings(next);
+        setSettings(next);
+      }, "Base instruction saved. It applies to new replies.");
+    }
+    if (sel && !sel.builtin) {
+      return run(async () => {
+        await api2.updateProfile(sel.id, title, sections);
+        const ps = await api2.listProfiles();
+        setProfiles(ps);
+      }, "Profile saved. It applies to new replies.");
+    }
+    return true;
+  };
+  const resolvePending = async (how: "save" | "discard" | "cancel") => {
+    const next = pending;
+    if (how === "cancel") return setPending(null);
+    if (how === "save" && !(await saveCurrent())) return;
+    if (how === "discard") discard();
+    setPending(null);
+    next?.();
+  };
+
+  const setDefault = (key: DefaultKey, id: string) => {
+    if (!settings || !id) return;
+    const label = DEFAULTS.find((d) => d.key === key)?.label.toLowerCase();
     run(async () => {
-      const next = { ...settings!, base: savedBase, [which === "chat" ? "chat_profile_id" : "agent_profile_id"]: sel!.id };
+      const next = { ...settings, [key]: id };
       await api2.setInstructionSettings(next);
-      setSettings({ ...settings!, [which === "chat" ? "chat_profile_id" : "agent_profile_id"]: sel!.id });
-    }, `Set as the ${which} default.`);
+      setSettings(next);
+    }, `${profiles.find((p) => p.id === id)?.title ?? "Profile"} is now the ${label}.`);
+  };
+  const setModel = (modelId: string, profileId: string | null) => {
+    const name = models.find((m) => m.id === modelId)?.display_name ?? "the model";
+    run(async () => {
+      await api2.setModelProfile(modelId, profileId);
+      setModelProfiles((m) => ({ ...m, [modelId]: profileId }));
+    }, profileId ? `${name} now uses this profile in Chat mode.` : `${name} uses the Chat default again.`);
+  };
+
+  const createFrom = (name: string, s: Sections, ok: string) =>
+    run(async () => {
+      const id = await api2.createProfile(name.trim().slice(0, 80) || "New profile", s);
+      await reload({ kind: "profile", id });
+    }, ok);
+  // The copy takes unsaved edits with it, so there is nothing to ask about.
+  const duplicate = () => {
+    if (!sel) return;
+    const [name, s] = profileDirty ? [title, sections] : [sel.title, sel.sections];
+    createFrom(`${name.slice(0, 75)} copy`, s, profileDirty ? "Copy created with your unsaved edits; the original is unchanged." : "Copy created under My profiles. Edit it, then save.");
+  };
+  const newProfile = () => guard(() => createFrom("New profile", BLANK, "New profile created. Name it, write it, then save."));
+  const deleteProfile = () => {
+    if (!sel) return;
+    run(async () => {
+      await api2.deleteProfile(sel.id);
+      setModelProfiles((m) => Object.fromEntries(Object.entries(m).map(([k, v]) => [k, v === sel.id ? null : v])));
+      await reload();
+    }, `Deleted ${sel.title}.`);
+  };
   const exportProfile = async () => {
-    const path = await save({ defaultPath: `${title.replace(/[\\/:*?"<>|]/g, "_")}.json`, filters: [{ name: "Profile JSON", extensions: ["json"] }, { name: "Markdown", extensions: ["md"] }] });
-    if (path) run(() => api2.exportProfile(sel!.id, path), `Exported to ${path}`);
+    if (!sel) return;
+    const path = await save({ defaultPath: `${sel.title.replace(/[\\/:*?"<>|]/g, "_")}.json`, filters: [{ name: "Profile JSON", extensions: ["json"] }, { name: "Markdown", extensions: ["md"] }] });
+    if (path) run(() => api2.exportProfile(sel.id, path), `Exported to ${path}${profileDirty ? " (saved version; unsaved edits are not included)" : ""}`);
   };
-  const importProfile = async () => {
-    const path = await open({ multiple: false, filters: [{ name: "Profile", extensions: ["json", "md", "txt"] }] });
-    if (path) run(async () => { const id = await api2.importProfile(path); await reload(id); }, "Imported.");
-  };
+  const importProfile = () =>
+    guard(async () => {
+      const path = await open({ multiple: false, filters: [{ name: "Profile", extensions: ["json", "md", "txt"] }] });
+      if (path) run(async () => { const id = await api2.importProfile(path); await reload({ kind: "profile", id }); }, "Imported into My profiles.");
+    });
+  const resetBase = () =>
+    run(async () => {
+      const b = await api2.resetInstructionBase();
+      setSettings((s) => (s ? { ...s, base: b } : s));
+      setBaseDraft(b);
+    }, "Base instruction reset to the app default.");
+
   const test = async () => {
     setTesting(true);
     setTestOut(null);
     setErr(null);
+    testRef.current?.scrollIntoView({ block: "nearest", behavior: "smooth" });
     try {
-      const r = await api2.testInstructions(sections, settings?.base ?? null, testPrompt);
+      const r = await api2.testInstructions(onBase ? defaultSections("chat") : sections, onBase ? baseDraft : settings?.base ?? null, testPrompt);
       setTestOut(r.content || "(no answer text; the model produced only reasoning)");
     } catch (e) {
       setErr(errorMessage(e));
@@ -120,147 +233,140 @@ export function Instructions() {
     }
   };
 
-  const tokenText = useMemo(() => {
-    if (!preview) return "";
-    if (preview.tokens == null) return `${preview.chars.toLocaleString()} characters. Load a model to count tokens with its tokenizer.`;
-    return `${preview.tokens.toLocaleString()} tokens (${preview.templated_tokens ?? "?"} with chat-template markers) of ${preview.n_ctx?.toLocaleString() ?? "?"} context, counted with the loaded model.`;
-  }, [preview]);
+  const modelCounts = useMemo(() => {
+    const c: Record<string, number> = {};
+    for (const v of Object.values(modelProfiles)) if (v) c[v] = (c[v] ?? 0) + 1;
+    return c;
+  }, [modelProfiles]);
 
-  const field = (k: keyof Sections, label: string, help: string) => (
-    <div className="field">
-      <label htmlFor={`sec-${k}`}>{label}</label>
-      <Editor id={`sec-${k}`} label={label} rows={4} value={sections[k] as string} readOnly={sel?.builtin} onChange={(v) => setSections({ ...sections, [k]: v })} />
-      <span className="help">{help}</span>
-    </div>
-  );
+  const readOnly = !!sel?.builtin;
+  const setMode = (mode: Sections["mode"]) =>
+    setSections({
+      ...sections,
+      mode,
+      raw: mode === "raw" && !sections.raw ? [sections.identity, sections.task, sections.tool_use, sections.formatting].filter((s) => s.trim()).join("\n\n") : sections.raw,
+    });
+
+  const header = onBase ? (
+    <header className="instr-head">
+      <h2 id="instr-title">Base instruction</h2>
+      {baseDirty && <span className="tag accent">Unsaved</span>}
+      <span className="spacer" />
+      <button type="button" className="btn ghost sm" onClick={resetBase}>Reset to app default</button>
+    </header>
+  ) : sel ? (
+    <header className="instr-head">
+      {readOnly ? (
+        <h2 id="instr-title"><LockSimple size={14} aria-hidden /> {sel.title}</h2>
+      ) : (
+        <input id="instr-title" className="input instr-title-input" aria-label="Profile name" maxLength={80} value={title} onChange={(e) => setTitle(e.target.value)} />
+      )}
+      {readOnly && <span className="tag">Built-in, read-only</span>}
+      {profileDirty && <span className="tag accent">Unsaved</span>}
+      {usageText(sel.id, settings, modelCounts[sel.id] ?? 0) && <span className="tag">{usageText(sel.id, settings, modelCounts[sel.id] ?? 0)}</span>}
+      <span className="spacer" />
+      <button type="button" className={readOnly ? "btn primary sm" : "btn sm"} onClick={duplicate}>
+        <Copy size={14} aria-hidden /> {readOnly ? "Duplicate to edit" : "Duplicate"}
+      </button>
+      <button type="button" className="btn ghost sm" onClick={exportProfile}><Export size={14} aria-hidden /> Export</button>
+      {!readOnly && (confirmDelete ? (
+        <>
+          <button type="button" className="btn danger sm" onClick={deleteProfile}>Delete {sel.title}?</button>
+          <button type="button" className="btn ghost sm" onClick={() => setConfirmDelete(false)}>Keep</button>
+        </>
+      ) : (
+        <button type="button" className="btn ghost sm" aria-label={`Delete ${sel.title}`} onClick={() => setConfirmDelete(true)}><Trash size={14} aria-hidden /> Delete</button>
+      ))}
+    </header>
+  ) : null;
 
   return (
-    <div className="page" style={{ maxWidth: 1400 }}>
+    <div className="page instr-page">
       <p className="lede">
-        System instructions are sent as the system message, encoded by each model's own chat template. Safety rules for tools are enforced by the app itself, so nothing written here can loosen them.
+        The system message every reply starts with: the base instruction, then the profile for the mode. Each model's own chat template encodes it. Tool safety rules are enforced by the app, so nothing here can loosen them.
       </p>
-      {err && <div className="notice error" style={{ marginBottom: 10 }}>{err}</div>}
-      {msg && <div className="notice" style={{ marginBottom: 10 }}>{msg}</div>}
+      <div className="instr-shell">
+        <InstructionNav profiles={profiles} settings={settings} selection={selection} modelCounts={modelCounts}
+          onSelect={select} onSetDefault={setDefault} onNew={newProfile} onImport={importProfile} />
 
-      <h2>Base instruction</h2>
-      <p className="faint" style={{ marginTop: 0 }}>Comes first in every chat, before the profile.</p>
-      {settings && (
-        <>
-          <Editor label="Base instruction" rows={3} value={settings.base} onChange={(v) => setSettings({ ...settings, base: v })} />
-          <div className="row" style={{ marginTop: 6 }}>
-            <button className="btn sm primary" disabled={!baseDirty} onClick={saveBase}>Save base</button>
-            <button className="btn sm ghost" disabled={!baseDirty} onClick={() => setSettings({ ...settings, base: savedBase })}>Discard changes</button>
-            <button className="btn sm ghost" onClick={() => run(async () => { const b = await api2.resetInstructionBase(); setSettings({ ...settings, base: b }); setSavedBase(b); }, "Base reset to the app default.")}>Reset to default</button>
-            {baseDirty && <span style={{ color: "var(--accent)" }}>Unsaved changes</span>}
-          </div>
-        </>
-      )}
+        <section className="instr-main" aria-labelledby="instr-title">
+          {header}
+          {err && <div className="notice error" role="alert">{err}</div>}
+          {msg && <div className="notice" role="status">{msg}</div>}
 
-      <h2>Profiles</h2>
-      <div className="instr-layout">
-        <div className="instr-list">
-          {profiles.map((p) => (
-            <button key={p.id} className="chat-item" aria-current={p.id === selId ? "true" : undefined} onClick={() => pick(p)}>
-              <span className="chat-title">{p.title}</span>
-              <span className="faint mono" style={{ fontSize: 10.5 }}>
-                {[p.builtin ? "template" : null, settings?.chat_profile_id === p.id ? "chat default" : null, settings?.agent_profile_id === p.id ? "agent default" : null].filter(Boolean).join(", ")}
-              </span>
-            </button>
-          ))}
-          <div className="row" style={{ padding: 8 }}>
-            <button className="btn sm" onClick={newProfile}>New</button>
-            <button className="btn sm ghost" onClick={importProfile}>Import</button>
-          </div>
-        </div>
-
-        {sel && (
-          <div style={{ display: "grid", gap: 12, minWidth: 0 }}>
-            <div className="row">
-              <div className="field" style={{ flex: 1 }}>
-                <label htmlFor="pname">Profile name</label>
-                <input id="pname" className="input" value={title} disabled={sel.builtin} onChange={(e) => setTitle(e.target.value)} />
-              </div>
-              <div className="field">
-                <label htmlFor="pmode">Editor</label>
-                <select id="pmode" className="input" value={sections.mode} disabled={sel.builtin}
-                  onChange={(e) => setSections({ ...sections, mode: e.target.value as Sections["mode"], raw: e.target.value === "raw" && !sections.raw ? [sections.identity, sections.task, sections.tool_use, sections.formatting].filter((s) => s.trim()).join("\n\n") : sections.raw })}>
-                  <option value="sections">Separate fields</option>
-                  <option value="raw">Single raw editor</option>
-                </select>
-              </div>
+          {onBase && settings && (
+            <div className="field">
+              <label htmlFor="instr-base">Base instruction text</label>
+              <Editor id="instr-base" label="Base instruction" rows={8} value={baseDraft} onChange={setBaseDraft} />
+              <span className="help">Comes first in Chat, Agent and Plan mode, before the profile. The preview below uses each mode's default profile.</span>
             </div>
-            {sel.builtin && <div className="notice">Built-in templates are read-only. Clone it to make your own version.</div>}
-            {sections.mode === "raw" ? (
-              <div className="field">
-                <label htmlFor="sec-raw">Instruction</label>
-                <Editor id="sec-raw" label="Instruction" rows={14} value={sections.raw} readOnly={sel.builtin} onChange={(v) => setSections({ ...sections, raw: v })} />
-              </div>
-            ) : (
-              <>
-                {field("identity", "Identity and personality", "Who the assistant is and how it sounds.")}
-                {field("task", "Task instructions", "What it should do and how carefully.")}
-                {field("tool_use", "Tool-use instructions", "How to use tools in Agent Mode. Tools themselves are listed by the app, not here.")}
-                {field("formatting", "Formatting", "Markdown, length, code blocks.")}
-              </>
-            )}
-            <div className="row">
-              {!sel.builtin && <button className="btn primary sm" disabled={!dirty} onClick={saveProfile}>Save profile</button>}
-              {!sel.builtin && <button className="btn sm ghost" disabled={!dirty} onClick={() => { setTitle(sel.title); setSections(sel.sections); }}>Discard changes</button>}
-              <button className="btn sm" onClick={cloneProfile}>Clone</button>
-              <button className="btn sm ghost" onClick={exportProfile}>Export</button>
-              {!sel.builtin && <button className="btn sm ghost danger" onClick={deleteProfile}>Delete</button>}
-              <span className="spacer" />
-              <button className="btn sm ghost" disabled={settings?.chat_profile_id === sel.id} onClick={() => setDefault("chat")}>Use for new chats</button>
-              <button className="btn sm ghost" disabled={settings?.agent_profile_id === sel.id} onClick={() => setDefault("agent")}>Use for Agent Mode</button>
-            </div>
-            {dirty && <div style={{ color: "var(--accent)" }}>Unsaved changes. Edits apply to future replies, not past ones.</div>}
+          )}
 
-            <div className="panel" style={{ display: "grid", gap: 8 }}>
-              <div className="row">
-                <strong style={{ fontWeight: 600 }}>Effective instruction (read-only preview)</strong>
-                <span className="spacer" />
-                <select className="input" aria-label="Preview mode" value={mode} onChange={(e) => setMode(e.target.value as "chat" | "agent")}>
-                  <option value="chat">Chat Mode (no tools)</option>
-                  <option value="agent">Agent Mode</option>
-                </select>
-              </div>
-              {preview?.parts.map((p) => (
-                <div key={p.label}>
-                  <div className="faint" style={{ fontSize: 11.5 }}>{p.label}{p.editable ? "" : " (generated by the app, not editable)"}</div>
-                  <pre className="preview-text">{p.text}</pre>
+          {sel && (
+            <>
+              {readOnly && (
+                <div className="notice">Built-in templates can't be changed. Use <strong>Duplicate to edit</strong> to make your own copy under My profiles.</div>
+              )}
+              <div className="instr-layout-row">
+                <span className="instr-usedby-label" id="instr-layout-l">Layout</span>
+                <div className="instr-seg" role="group" aria-labelledby="instr-layout-l">
+                  <button type="button" aria-pressed={sections.mode === "sections"} disabled={readOnly} onClick={() => setMode("sections")}>Separate fields</button>
+                  <button type="button" aria-pressed={sections.mode === "raw"} disabled={readOnly} onClick={() => setMode("raw")}>One text box</button>
                 </div>
-              ))}
-              {preview && preview.parts.length === 0 && <div className="faint">Empty: the model gets no system message.</div>}
-              <div className="mono faint" style={{ fontSize: 11.5 }}>{tokenText}</div>
-            </div>
-
-            <div className="panel" style={{ display: "grid", gap: 8 }}>
-              <strong style={{ fontWeight: 600 }}>Test this instruction</strong>
-              <div className="row" style={{ flexWrap: "nowrap" }}>
-                <input className="input" style={{ flex: 1 }} aria-label="Test prompt" placeholder="Introduce yourself in two sentences." value={testPrompt} onChange={(e) => setTestPrompt(e.target.value)} />
-                <button className="btn sm" onClick={test} disabled={testing}>{testing ? "Running" : "Run test"}</button>
               </div>
-              <span className="help faint">Uses the unsaved text above with the loaded model. Nothing is saved to any chat.</span>
-              {testOut && <pre className="preview-text">{testOut}</pre>}
-            </div>
-          </div>
-        )}
-      </div>
+              {sections.mode === "raw" ? (
+                <div className="field">
+                  <label htmlFor="sec-raw">Instruction</label>
+                  <Editor id="sec-raw" label="Instruction" rows={16} value={sections.raw} readOnly={readOnly} onChange={(v) => setSections({ ...sections, raw: v })} />
+                </div>
+              ) : (
+                FIELDS.map((f) => (
+                  <div className="field" key={f.key}>
+                    <label htmlFor={`sec-${f.key}`}>{f.label}</label>
+                    <Editor id={`sec-${f.key}`} label={f.label} rows={4} value={sections[f.key]} readOnly={readOnly} onChange={(v) => setSections({ ...sections, [f.key]: v })} />
+                    <span className="help">{f.help}</span>
+                  </div>
+                ))
+              )}
+              <UsedBy profile={sel} profiles={profiles} settings={settings} models={models} modelProfiles={modelProfiles}
+                onSetDefault={setDefault} onSetModel={setModel} />
+            </>
+          )}
 
-      <h2>Per-model default</h2>
-      <p className="faint" style={{ marginTop: 0 }}>Overrides the app default for chats with that model. A chat's own setting overrides both.</p>
-      <div className="row">
-        <select className="input" aria-label="Model" value={modelId} onChange={(e) => setModelId(e.target.value)} style={{ minWidth: 320 }}>
-          {models.map((m) => <option key={m.id} value={m.id}>{m.display_name}</option>)}
-        </select>
-        <select className="input" aria-label="Profile for this model" value={modelProfile} onChange={(e) => {
-          const v = e.target.value;
-          setModelProfile(v);
-          run(() => api2.setModelProfile(modelId, v || null), v ? "Model default set." : "Model default removed.");
-        }}>
-          <option value="">No override (app default)</option>
-          {profiles.map((p) => <option key={p.id} value={p.id}>{p.title}</option>)}
-        </select>
+          {selection && (
+            <>
+              <PreviewPanel preview={preview} mode={previewMode} onMode={setPreviewMode} />
+              <div ref={testRef}>
+                <TestPanel prompt={testPrompt} onPrompt={setTestPrompt} out={testOut} testing={testing} onRun={test} />
+              </div>
+            </>
+          )}
+
+          {selection && (
+            <footer className="instr-actions" aria-label="Save and test">
+              {pending ? (
+                <>
+                  <span className="instr-actions-status" role="alert">You have unsaved changes.</span>
+                  <span className="spacer" />
+                  <button type="button" className="btn ghost sm" onClick={() => resolvePending("cancel")}>Keep editing</button>
+                  <button type="button" className="btn sm" onClick={() => resolvePending("discard")}>Discard</button>
+                  {!readOnly && <button type="button" className="btn primary sm" onClick={() => resolvePending("save")}>Save and continue</button>}
+                </>
+              ) : (
+                <>
+                  <span className={dirty ? "instr-actions-status accent" : "instr-actions-status"}>
+                    {readOnly ? "Read-only template" : dirty ? "Unsaved changes (apply to future replies)" : "Saved"}
+                  </span>
+                  <span className="mono faint instr-actions-tokens">{tokenSummary(preview)} · {previewMode}</span>
+                  <span className="spacer" />
+                  <button type="button" className="btn sm" onClick={test} disabled={testing}>{testing ? "Testing…" : "Test"}</button>
+                  {!readOnly && <button type="button" className="btn ghost sm" disabled={!dirty} onClick={discard}>Discard</button>}
+                  {!readOnly && <button type="button" className="btn primary sm" disabled={!dirty} onClick={saveCurrent}>Save</button>}
+                </>
+              )}
+            </footer>
+          )}
+        </section>
       </div>
     </div>
   );

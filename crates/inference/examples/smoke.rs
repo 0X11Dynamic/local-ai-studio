@@ -39,6 +39,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (a, b) = c.split_once('.')?;
             Some((a.parse().ok()?, b.parse().ok()?))
         }),
+        driver_version: gpu.and_then(|g| g.driver_version.as_deref()).and_then(inference::parse_driver_version),
+        vulkan_gpu: false,
     };
     println!("GPU hint: {hint:?}");
     let http = reqwest::Client::builder().build()?;

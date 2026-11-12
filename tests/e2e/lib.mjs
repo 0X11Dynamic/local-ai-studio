@@ -33,6 +33,17 @@ export class Cdp {
     };
     // Wait until React has rendered the shell.
     await this.waitFor("!!document.querySelector('.sidebar')", 60000);
+    // Backstop for an app build that ignores LOCALAISTUDIO_SKIP_SETUP: mark
+    // setup done and close the screen. Set keepSetup to test the screen itself.
+    if (!this.keepSetup) {
+      await sleep(300);
+      const open = await this.eval("!!document.querySelector('.firstrun')");
+      const done = await this.eval(`window.__TAURI_INTERNALS__.invoke("finish_setup", { skipped: true }).then(() => true, () => false)`);
+      if (open && done) {
+        await this.eval(`[...document.querySelectorAll('.firstrun button')].find(b => b.innerText.trim() === 'Skip setup')?.click()`);
+        await this.waitFor("!document.querySelector('.firstrun')", 5000, "setup screen closed");
+      }
+    }
   }
   close() { try { this.ws?.close(); } catch {} }
   send(method, params = {}) {
@@ -106,13 +117,21 @@ export function exePath(root) {
   return process.env.LAS_E2E_EXE || path.join(root, "target", "debug", "local-ai-studio.exe");
 }
 
-export function launchApp(exe, dataDir, port) {
+/**
+ * First-run setup is kept closed in test profiles (LOCALAISTUDIO_SKIP_SETUP=1)
+ * so it can't cover the UI or start a runtime download. Pass
+ * `{ setup: true }` to test the setup screen itself (tests/e2e/firstrun.mjs).
+ */
+export function launchApp(exe, dataDir, port, { setup = false } = {}) {
+  const env = {
+    ...process.env,
+    LOCALAISTUDIO_DATA_DIR: dataDir,
+    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port}`,
+  };
+  if (setup) delete env.LOCALAISTUDIO_SKIP_SETUP;
+  else env.LOCALAISTUDIO_SKIP_SETUP = "1";
   const child = spawn(exe, [], {
-    env: {
-      ...process.env,
-      LOCALAISTUDIO_DATA_DIR: dataDir,
-      WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port}`,
-    },
+    env,
     stdio: "ignore",
     detached: false,
   });

@@ -3,10 +3,13 @@ import { invoke } from "@tauri-apps/api/core";
 import type { SamplingParams } from "./api2";
 import type { ApprovalRequest } from "./api3";
 
-export interface Budgets { max_turns: number; max_tool_calls: number; max_wall_secs: number; max_tokens: number }
+/** A task's limits; null = no limit (the default). Old runs hold numbers. */
+export interface Budgets { max_turns: number | null; max_tool_calls: number | null; max_wall_secs: number | null; max_tokens: number | null }
 export interface Usage { turns: number; tool_calls: number; wall_ms: number; tokens: number }
 export interface TaskSettings {
   environment_id: string | null; builtin_tools: boolean; mcp_tools: boolean; tool_servers: string[];
+  /** MCP server ids turned off for this task ("Task tools" picker); servers added later are on. */
+  disabled_servers?: string[];
   skills_mode: "auto" | "off" | "manual"; skills: string[]; subagents: boolean; max_parallel: number;
   tool_mode: "auto" | "native" | "xml"; sampling: SamplingParams;
   /** Read-only planning phase first; the task waits in awaiting_plan_approval. */
@@ -45,7 +48,21 @@ export type TaskEvent =
   | { run_id: string; agent_id: string | null; type: "reset"; step_id: string | null }
   | { run_id: string; agent_id: string | null; type: "usage"; usage: Usage }
   | { run_id: string; agent_id?: string | null; type: "state"; state: string; error?: string | null; answer?: string | null }
-  | { run_id: string; agent_id: string; type: "subagent_state"; state: string; usage?: Usage };
+  | { run_id: string; agent_id: string; type: "subagent_state"; state: string; usage?: Usage }
+  /** An agent called ask_user (its entry is a step of kind "question", state "waiting"). */
+  | { run_id: string; agent_id?: string | null; type: "question"; question_id: string }
+  /** A question was answered, cancelled or closed (state done | cancelled). */
+  | { run_id: string; agent_id?: string | null; type: "question_closed"; question_id?: string; state: string };
+
+/** The data of a step of kind "question" (an agent's ask_user call). */
+export interface QuestionData {
+  question_id: string; question: string; options: string[]; allow_text: boolean; call_id: string; agent_label: string;
+  answer: string | null; answered_at?: string; cancelled?: boolean;
+}
+/** The data of a step of kind "user" (a message sent to the task). */
+export interface UserMessageData { text: string; delivered: boolean; note?: string }
+/** What send_task_message did: answered the waiting question, queued the message, or resumed a stopped task. */
+export type MessageOutcome = "answered" | "queued" | "resumed";
 
 export interface FileView { path: string; sha256: string; size: number; enabled: boolean; changed: boolean }
 export interface SkillView {
@@ -55,7 +72,13 @@ export interface SkillView {
 export interface SkillRevision { id: string; skill_id: string; version: string; content_hash: string; content: string; note: string | null; created_at: string; state: string; proposed_by: string | null }
 export interface SkillMatch { name: string; score: number; reason: string }
 
-export const DEFAULT_BUDGETS: Budgets = { max_turns: 40, max_tool_calls: 60, max_wall_secs: 1800, max_tokens: 60000 };
+/** New tasks: no limits (Stop always works; a 500-turn safety stop per start still applies). */
+export const DEFAULT_BUDGETS: Budgets = { max_turns: null, max_tool_calls: null, max_wall_secs: null, max_tokens: null };
+/** The numbers a limit starts at when its "Limit" box is ticked. */
+export const SUGGESTED_LIMITS = { max_turns: 40, max_tool_calls: 60, max_wall_secs: 1800, max_tokens: 60000 } as const;
+/** "12/40" with a limit, "12" with none (null). */
+export const usedOf = (used: number, max: number | null | undefined, fmt: (n: number) => string = (n) => n.toLocaleString()) =>
+  max == null ? fmt(used) : `${fmt(used)}/${fmt(max)}`;
 
 export const api5 = {
   startTask: (title: string, objective: string, settings: TaskSettings, budgets: Budgets) => invoke<string>("start_task", { title, objective, settings, budgets }),
@@ -67,6 +90,12 @@ export const api5 = {
   /** Approve a "Plan first" task's plan (null = as written) and run it. */
   approveTaskPlan: (id: string, plan: string | null = null) => invoke<void>("approve_task_plan", { id, plan }),
   deleteTask: (id: string) => invoke<DeleteResult>("delete_task", { id }),
+  /** Answer an agent's ask_user question; that agent (or only that subagent) continues. */
+  answerTaskQuestion: (runId: string, questionId: string, answer: string) => invoke<void>("answer_task_question", { runId, questionId, answer }),
+  /** Message a task: read before its next model turn; answers a waiting question; with resume, restarts a stopped task. */
+  sendTaskMessage: (runId: string, text: string, resume = false, budgets: Budgets | null = null) => invoke<MessageOutcome>("send_task_message", { runId, text, resume, budgets }),
+  /** Questions waiting for the user in any task (steps of kind "question"). */
+  pendingTaskQuestions: () => invoke<StepRow[]>("pending_task_questions"),
   listChatRuns: () => invoke<ChatRun[]>("list_chat_runs"),
   /** A chat's subagents (settings.call_id says which spawn call started each). */
   chatSubagents: (conversationId: string) => invoke<ChatSubagents>("chat_subagents", { id: conversationId }),
@@ -86,16 +115,34 @@ export const api5 = {
   matchSkills: (text: string) => invoke<SkillMatch[]>("match_skills", { text }),
 };
 
+const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/**
+ * Parse a JSON column. Rows can hold partial shapes (a new run's usage is "{}"
+ * until its first turn is saved; "null"; older rows lack newer fields), so an
+ * object fallback is merged under the parsed object: missing or null fields
+ * keep the fallback's value. A value of the wrong kind gives the fallback.
+ */
 export function parseJson<T>(s: string | null | undefined, fallback: T): T {
+  let v: unknown;
   try {
-    return s ? (JSON.parse(s) as T) : fallback;
+    v = s ? JSON.parse(s) : null;
   } catch {
     return fallback;
   }
+  if (v == null) return fallback;
+  if (isObj(fallback)) {
+    if (!isObj(v)) return fallback;
+    const out: Record<string, unknown> = { ...fallback };
+    for (const [k, x] of Object.entries(v)) if (x != null || !(k in fallback)) out[k] = x;
+    return out as T;
+  }
+  if (Array.isArray(fallback) && !Array.isArray(v)) return fallback;
+  return v as T;
 }
 
 export const STATE_LABEL: Record<string, string> = {
-  queued: "Queued", running: "Running", waiting: "Waiting for approval", paused: "Paused", completed: "Completed", failed: "Failed",
+  queued: "Queued", running: "Running", waiting: "Waiting for approval", waiting_for_user: "Needs your answer", paused: "Paused", completed: "Completed", failed: "Failed",
   cancelled: "Cancelled", budget_exhausted: "Budget used up", interrupted: "Interrupted", awaiting_plan_approval: "Plan ready for review",
 };
 

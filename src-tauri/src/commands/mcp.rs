@@ -38,6 +38,9 @@ pub struct ServerView {
     pub bearer_set: bool,
     pub status: ServerStatus,
     pub tools: Vec<ToolView>,
+    /// Background connect progress (app start / import / turned on): None
+    /// when no background connect is running or waiting.
+    pub auto: Option<svc::AutoConnect>,
 }
 
 fn validate_name(name: &str) -> Cmd<String> {
@@ -81,6 +84,7 @@ async fn view(st: &SharedState, id: &str) -> Cmd<ServerView> {
         config,
         status,
         tools,
+        auto: svc::auto_status(id),
     })
 }
 
@@ -154,11 +158,16 @@ pub async fn update_mcp_server(state: State<'_, SharedState>, id: String, name: 
     let name = validate_name(&name)?;
     config.validate().map_err(AppError::InvalidInput)?;
     let row = st.db.get_mcp_server(&id).await?;
+    let was_on = row.enabled != 0;
     let sec = apply_patch(svc::secrets_of(&st, &row), &mut config, secrets.unwrap_or_default());
     let cref = svc::store_secrets(&st, &id, &sec)?;
     st.db.update_mcp_server(&id, &name, &config.transport, &serde_json::to_value(&config)?, cref.as_deref(), enabled).await?;
     if !enabled {
+        svc::cancel_auto(&id);
         st.mcp.disconnect(&id).await;
+    } else if !was_on {
+        // Turned on: connect in the background (retries with backoff).
+        svc::auto_connect(st.clone(), id.clone());
     }
     view(&st, &id).await
 }
@@ -166,6 +175,7 @@ pub async fn update_mcp_server(state: State<'_, SharedState>, id: String, name: 
 #[tauri::command]
 pub async fn delete_mcp_server(state: State<'_, SharedState>, id: String) -> Cmd<()> {
     let st = state.inner().clone();
+    svc::cancel_auto(&id);
     st.mcp.disconnect(&id).await;
     st.mcp.forget(&id);
     st.credentials.delete(&svc::cred_ref(&id))?;
@@ -179,6 +189,8 @@ pub async fn connect_mcp_server(state: State<'_, SharedState>, id: String) -> Cm
     if row.enabled == 0 {
         return Err(AppError::InvalidInput("this server is turned off; turn it on first".into()));
     }
+    // A manual connect replaces any background retries.
+    svc::cancel_auto(&id);
     // A failed connect is reported in the returned status, not as an error.
     let _ = svc::connect(&st, &id).await;
     view(&st, &id).await
@@ -187,6 +199,7 @@ pub async fn connect_mcp_server(state: State<'_, SharedState>, id: String) -> Cm
 #[tauri::command]
 pub async fn disconnect_mcp_server(state: State<'_, SharedState>, id: String) -> Cmd<ServerView> {
     let st = state.inner().clone();
+    svc::cancel_auto(&id);
     st.mcp.disconnect(&id).await;
     view(&st, &id).await
 }
@@ -209,7 +222,7 @@ pub struct ImportReport {
     pub secrets_stored: usize,
 }
 
-async fn import_doc(st: &SharedState, json: &str, connect: bool) -> Cmd<ImportReport> {
+async fn import_doc(st: &SharedState, json: &str) -> Cmd<ImportReport> {
     let servers = mcp_client::parse_mcp_servers(json).map_err(AppError::InvalidInput)?;
     let existing: Vec<String> = st.db.list_mcp_servers().await?.into_iter().map(|r| r.name).collect();
     let mut report = ImportReport { added: vec![], skipped: vec![], secrets_stored: 0 };
@@ -223,25 +236,30 @@ async fn import_doc(st: &SharedState, json: &str, connect: bool) -> Cmd<ImportRe
             continue;
         }
         let mut cfg = s.config.clone();
-        // Imported servers start turned off unless asked: nothing runs until the user connects it.
-        let id = st.db.insert_mcp_server(&name, &cfg.transport, &serde_json::to_value(&cfg)?, None, connect && !s.disabled).await?;
+        // Imported servers start turned on (unless the file says "disabled")
+        // and connect in the background; every tool still starts at "ask".
+        let on = !s.disabled;
+        let id = st.db.insert_mcp_server(&name, &cfg.transport, &serde_json::to_value(&cfg)?, None, on).await?;
         let sec = s.secrets.clone();
         if !sec.is_empty() {
             report.secrets_stored += sec.env.len() + sec.headers.len() + usize::from(sec.bearer.is_some());
         }
         cfg.bearer = sec.bearer.is_some() || cfg.bearer;
         let cref = svc::store_secrets(st, &id, &sec)?;
-        st.db.update_mcp_server(&id, &name, &cfg.transport, &serde_json::to_value(&cfg)?, cref.as_deref(), connect && !s.disabled).await?;
+        st.db.update_mcp_server(&id, &name, &cfg.transport, &serde_json::to_value(&cfg)?, cref.as_deref(), on).await?;
+        if on {
+            svc::auto_connect(st.clone(), id.clone());
+        }
         report.added.push(name);
     }
     Ok(report)
 }
 
 /// Import an `mcpServers` JSON document (pasted text). Imported servers are
-/// off until the user turns them on and connects.
+/// on and connect in the background; their tools ask before running.
 #[tauri::command]
 pub async fn import_mcp_servers(state: State<'_, SharedState>, json: String) -> Cmd<ImportReport> {
-    import_doc(state.inner(), &json, false).await
+    import_doc(state.inner(), &json).await
 }
 
 /// One-click import from another app's config file: "lmstudio" or "claude".
@@ -254,7 +272,7 @@ pub async fn import_mcp_from(state: State<'_, SharedState>, source: String) -> C
         _ => return Err(AppError::InvalidInput("source must be lmstudio or claude".into())),
     };
     let text = tokio::fs::read_to_string(&path).await.map_err(|_| AppError::NotFound(format!("{} was not found", path.display())))?;
-    import_doc(state.inner(), &text, false).await
+    import_doc(state.inner(), &text).await
 }
 
 #[tauri::command]
@@ -264,7 +282,7 @@ pub async fn import_mcp_file(state: State<'_, SharedState>, path: String) -> Cmd
         return Err(AppError::InvalidInput("file is too large for an MCP config".into()));
     }
     let text = tokio::fs::read_to_string(&path).await?;
-    import_doc(state.inner(), &text, false).await
+    import_doc(state.inner(), &text).await
 }
 
 fn dirs_home() -> Cmd<PathBuf> {
@@ -376,4 +394,101 @@ pub async fn run_tool_manually(
     let call = inference::ToolCall { id: format!("manual-{}", app_core::new_id()), name: t.model_name.clone(), arguments: arguments.to_string() };
     let host = svc::AppToolHost::chat(st.clone(), app, conversation_id.clone());
     Ok(agent_runtime::dispatch(&host, &tools, &call, conversation_id.as_deref(), &tokio_util::sync::CancellationToken::new()).await)
+}
+
+// ---------- chat tools menu: per-server token cost for one chat ----------
+
+#[derive(Debug, Serialize)]
+pub struct ToolCostEntry {
+    /// "builtin" for the built-in tools, else the MCP server id.
+    pub id: String,
+    pub name: String,
+    /// builtin | mcp
+    pub kind: String,
+    /// MCP connection state (built-in: "connected", or "error").
+    pub state: String,
+    /// Turned on globally (MCP page switch).
+    pub enabled: bool,
+    /// Offered in this chat (not unticked in its Tools menu).
+    pub in_chat: bool,
+    /// Tools this source would add (Plan mode: only read-only ones).
+    pub tool_count: usize,
+    /// Tokens their definitions take (the loaded model's tokenizer when a
+    /// model is loaded, else about 4 characters per token).
+    pub tokens: u64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ToolCosts {
+    /// Counted with the loaded model's tokenizer.
+    pub exact: bool,
+    /// chat | plan | agent
+    pub mode: String,
+    pub entries: Vec<ToolCostEntry>,
+}
+
+/// What each tool source (built-in tools, each MCP server) would cost this
+/// chat, and whether it is on for it. For the composer's Tools menu.
+#[tauri::command]
+pub async fn chat_tool_costs(state: State<'_, SharedState>, id: String) -> Cmd<ToolCosts> {
+    use crate::services::{chat, exec};
+    let st = state.inner().clone();
+    let conv = st.db.get_conversation(&id).await?;
+    let s = chat::settings_of(&conv);
+    let mode = s.effective_mode();
+    let plan = mode == "plan";
+    let client = chat::loaded(&st).ok().map(|x| x.0);
+    let exact = client.is_some();
+    let mut entries = vec![];
+    // Built-in shell and file tools for the chat's environment.
+    let env_id = s.environment_id.clone().unwrap_or_else(|| exec::LOCAL_ID.to_string());
+    let label = if env_id == exec::LOCAL_ID { "This PC".to_string() } else { exec::meta(&st, &env_id).await.map(|m| m.label).unwrap_or_else(|_| "removed environment".into()) };
+    let (builtin, berr) = match exec::exposed(&st, &env_id).await {
+        Ok((t, _)) => (if plan { chat::plan_filter(&st, t) } else { t }, None),
+        Err(e) => (vec![], Some(e.to_string())),
+    };
+    entries.push(ToolCostEntry {
+        id: "builtin".into(),
+        name: format!("Built-in tools ({label})"),
+        kind: "builtin".into(),
+        state: if berr.is_some() { "error".into() } else { "connected".into() },
+        enabled: true,
+        in_chat: s.builtin_tools,
+        tool_count: builtin.len(),
+        tokens: tool_tokens(&st, client.as_ref(), &builtin).await,
+        error: berr,
+    });
+    // MCP servers: tools of every connected, turned-on server.
+    let all = svc::exposed_tools(&st, &[]).await?;
+    let all = if plan { chat::plan_filter(&st, all) } else { all };
+    for row in st.db.list_mcp_servers().await? {
+        let status = st.mcp.status(&row.id);
+        let mine: Vec<_> = all.iter().filter(|t| t.server_id == row.id).cloned().collect();
+        entries.push(ToolCostEntry {
+            in_chat: (s.tool_servers.is_empty() || s.tool_servers.contains(&row.id)) && !s.disabled_servers.contains(&row.id),
+            tokens: tool_tokens(&st, client.as_ref(), &mine).await,
+            id: row.id,
+            name: row.name,
+            kind: "mcp".into(),
+            state: status.state.clone(),
+            enabled: row.enabled != 0,
+            tool_count: mine.len(),
+            error: status.error.clone(),
+        });
+    }
+    Ok(ToolCosts { exact, mode: mode.into(), entries })
+}
+
+/// Tokens of these tools' definitions as sent to the model.
+async fn tool_tokens(st: &SharedState, client: Option<&inference::LlamaClient>, tools: &[agent_runtime::ExposedTool]) -> u64 {
+    if tools.is_empty() {
+        return 0;
+    }
+    let json = agent_runtime::openai_tools(tools).to_string();
+    let rough = json.len().div_ceil(4) as u64;
+    match client {
+        Some(c) => crate::services::chat::count_tokens(st, c, &json).await.unwrap_or(rough),
+        None => rough,
+    }
 }

@@ -67,7 +67,7 @@ await check("allowed folders: protected, missing and whole-drive folders are ref
   const r = await inv("set_local_roots", { roots: [WORK] });
   assert(r.length === 1 && r[0] === WORK, JSON.stringify(r));
   const local = (await inv("list_environments")).find((e) => e.id === "local");
-  assert(local.config.roots[0] === WORK && local.tools.length === 8, JSON.stringify(local.config));
+  assert(local.config.roots[0] === WORK && local.tools.length === 9 && local.config.outside === "ask", JSON.stringify(local.config));
 });
 
 await check("This PC health check runs PowerShell", async () => {
@@ -76,16 +76,36 @@ await check("This PC health check runs PowerShell", async () => {
   return h.detail;
 });
 
-await check("read tools run without asking; paths outside the folders are refused", async () => {
+await check("read tools run without asking; outside the folders they ask (deny/allow), system folders are refused", async () => {
   const l = await run("local", "fs_list", { path: WORK });
   assert(l.status === "ok" && l.content.includes("readme.txt"), JSON.stringify(l));
   const r = await run("local", "fs_read", { path: "readme.txt", start_line: 2, max_lines: 1 });
   assert(r.status === "ok" && r.content.trim() === "line two", JSON.stringify(r));
   const s = await run("local", "fs_search", { path: WORK, pattern: "TODO" });
   assert(s.content.includes("notes.md:2:"), s.content);
-  for (const p of [path.join(OUTSIDE, "secret.txt"), "..\\outside\\secret.txt", path.join(process.env.SystemRoot, "win.ini")]) {
+  // Outside the allowed folders: every call asks (even though fs_read is "allow"), naming the real path.
+  for (const p of [path.join(OUTSIDE, "secret.txt"), "..\\outside\\secret.txt"]) {
+    const r = run("local", "fs_read", { path: p });
+    const ap = await pendingFor("fs_read");
+    assert(/Outside your allowed folders/.test(ap.reason) && ap.reason.toLowerCase().includes(path.join(OUTSIDE, "secret.txt").toLowerCase()) && ap.grant_choice === "session", JSON.stringify(ap));
+    await inv("answer_tool_approval", { id: ap.id, answer: "deny" });
+    const o = await r;
+    assert(o.status === "denied" && !o.content.includes("do not read"), `${p}: ${JSON.stringify(o)}`);
+  }
+  const ok = await runWithAnswer("local", "fs_read", { path: path.join(OUTSIDE, "secret.txt") }, "allow_once");
+  assert(ok.status === "ok" && ok.content.includes("do not read"), JSON.stringify(ok));
+  // Always-blocked places are refused without asking.
+  for (const p of [path.join(process.env.SystemRoot, "win.ini"), path.join(P.profile, "app.db")]) {
     const o = await run("local", "fs_read", { path: p });
-    assert(o.status === "tool_error" && /outside|protected/.test(o.content) && !o.content.includes("do not read"), `${p}: ${JSON.stringify(o)}`);
+    assert(o.status === "denied" && /protected/.test(o.content), `${p}: ${JSON.stringify(o)}`);
+  }
+  // "Off": outside paths are refused again, without asking.
+  await inv("set_local_outside", { mode: "off" });
+  try {
+    const o = await run("local", "fs_read", { path: path.join(OUTSIDE, "secret.txt") });
+    assert(o.status === "tool_error" && /outside/.test(o.content) && !o.content.includes("do not read"), JSON.stringify(o));
+  } finally {
+    await inv("set_local_outside", { mode: "ask" });
   }
 });
 
@@ -105,8 +125,13 @@ await check("shell asks first, returns output and exit codes, and a timeout stop
   const t0 = Date.now();
   const t = await runWithAnswer("local", "shell_execute", { command: "Start-Sleep 60", timeout_secs: 2 }, "allow_once");
   assert(t.content.includes("stopped after the 2 s timeout") && Date.now() - t0 < 30000, t.content);
-  const c = await runWithAnswer("local", "shell_execute", { command: "Get-Location | Select -Expand Path", cwd: path.join(RUN, "outside") }, "allow_once");
-  assert(c.status === "tool_error" && /outside/.test(c.content), c.content);
+  // A working folder outside the allowed folders asks with a warning; allowed once it runs there.
+  const cr = run("local", "shell_execute", { command: "Get-Location | Select -Expand Path", cwd: OUTSIDE });
+  const cap = await pendingFor("shell_execute");
+  assert(/Outside your allowed folders: runs in/.test(cap.reason) && /can't see which files/.test(cap.reason), cap.reason);
+  await inv("answer_tool_approval", { id: cap.id, answer: "allow_once" });
+  const c = await cr;
+  assert(c.status === "ok" && c.content.toLowerCase().includes(OUTSIDE.toLowerCase()), c.content);
 });
 
 await check("delete on This PC moves to the app trash", async () => {
@@ -215,7 +240,7 @@ const waitDone = (conv, ms = 240000) => waitFor(async () => {
 await check("context meter counts the built-in tools in Agent Mode", async () => {
   ids.conv = await convWith({ agent_mode: true, builtin_tools: true, environment_id: null, tool_servers: [] });
   const ctx = await inv("chat_context", { id: ids.conv, draft: "" });
-  assert(ctx.agent_mode && ctx.tool_count === 8 && ctx.tools > 0, JSON.stringify(ctx));
+  assert(ctx.agent_mode && ctx.tool_count === 9 && ctx.tools > 0, JSON.stringify(ctx));
   return `${ctx.tool_count} tools = ${ctx.tools} tokens`;
 });
 

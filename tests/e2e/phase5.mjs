@@ -270,6 +270,24 @@ await check("a skill visibly changes a task (marker with the skill, none without
   return parse(note.data).text;
 });
 
+await check("a task with no limits (null budgets) starts, completes, and keeps its null limits", async () => {
+  const id = await inv("start_task", {
+    title: "", objective: `List the files in ${WORK} with fs_list and report how many there are.`,
+    settings: SETTINGS, budgets: { max_turns: null, max_tool_calls: null, max_wall_secs: null, max_tokens: null },
+  });
+  const t = await waitTask(id, FINAL, 300000);
+  assert(t.run.state === "completed", summary(t));
+  const b = parse(t.run.budgets);
+  assert(b.max_turns === null && b.max_tool_calls === null && b.max_wall_secs === null && b.max_tokens === null, `budgets ${t.run.budgets}`);
+  const u = parse(t.run.usage);
+  assert(u.turns >= 1 && u.tool_calls >= 1, `usage ${t.run.usage}`);
+  // A budgets object with fields left out also means no limit.
+  const id2 = await inv("start_task", { title: "", objective: "Say hello in one word. Do not use any tools.", settings: SETTINGS, budgets: {} });
+  const t2 = await waitTask(id2, FINAL, 300000);
+  assert(t2.run.state === "completed" && parse(t2.run.budgets).max_turns === null, summary(t2));
+  return `${u.turns} turns, ${u.tool_calls} calls, no limits`;
+});
+
 await check("an agent's skill edit is only a proposal: approve applies it, reject leaves the skill unchanged", async () => {
   const before = (await skillByName("answer-marker")).content;
   const propose = (word) => startTask(
@@ -321,8 +339,14 @@ await check("two subagents run with separate budgets; usage rolls up into the pa
   const childTurns = t.subagents.reduce((n, s) => n + (parse(s.usage).turns ?? 0), 0);
   assert(childTurns > 0 && pu.turns >= childTurns, `parent turns ${pu.turns} vs children ${childTurns}`);
   assert(t.steps.some((s) => s.parent_agent_id === s1.id) && t.steps.some((s) => s.parent_agent_id === s2.id), "children have no steps of their own");
-  const answer = t.run.final_answer || "";
-  assert(t.run.state === "completed" && answer.includes("alpha-content-7731") && answer.includes("bravo-content-4402"), summary(t));
+  // Assert on what each child's tool actually returned, not on the 4B model's
+  // paraphrase (a child once made up the file's content after reading it correctly).
+  const read = (sub, marker) => t.steps.some((s) => s.parent_agent_id === sub.id && s.kind === "tool" && parse(s.data).name === "fs_read" && (parse(s.data).content || "").includes(marker));
+  const aFirst = t.subagents.find((s) => /a\.txt|alpha/.test(s.objective));
+  const bFirst = t.subagents.find((s) => /b\.txt|bravo/.test(s.objective));
+  assert(aFirst && bFirst && aFirst.id !== bFirst.id, "could not tell the children apart by objective");
+  assert(read(aFirst, "alpha-content-7731") && read(bFirst, "bravo-content-4402"), `children's fs_read results: ${summary(t)}`);
+  assert(t.run.state === "completed", summary(t));
   return `children turns ${childTurns}, parent total turns ${pu.turns}; budgets ${t.subagents.map((s) => parse(s.budgets).max_turns).join("/")} of ${pb.max_turns}`;
 });
 
@@ -383,6 +407,55 @@ await check("XML mode: commands run through the text format; a planted command i
   assert(!audit.some((r) => r.tool.endsWith("/fs_delete")), `fs_delete was attempted: ${JSON.stringify(audit.map((r) => [r.tool, r.status]))}`);
   assert(audit.some((r) => r.tool.endsWith("/fs_read")) && audit.some((r) => r.tool.endsWith("/fs_list")), JSON.stringify(audit.map((r) => r.tool)));
   return `${audit.length} audited calls: ${audit.map((r) => r.tool.split("/").pop()).join(", ")}`;
+});
+
+// ---------------- asking the user, and messaging a task ----------------
+await check("ask_user: the task waits for the user, the answer arrives as the tool result, color.txt gets it", async () => {
+  const colorFile = path.join(WORK, "color.txt");
+  fs.rmSync(colorFile, { force: true });
+  const objective = `Before writing anything, call the ask_user tool with the question "Which color should I write?" and options ["red","blue"]. Then write exactly the color the user chose (one word, lowercase) to ${colorFile} with fs_write, and report it.`;
+  const id = await startTask(objective, {}, { max_turns: 12 });
+  const auto = autoApprove(id);
+  try {
+    const waiting = await waitTask(id, [...FINAL, "waiting_for_user"], 300000);
+    assert(waiting.run.state === "waiting_for_user", `expected waiting_for_user: ${summary(waiting)}`);
+    const q = waiting.steps.find((s) => s.kind === "question" && s.state === "waiting");
+    assert(q, "no waiting question step");
+    const qd = parse(q.data);
+    assert(JSON.stringify(qd.options) === JSON.stringify(["red", "blue"]), `options ${JSON.stringify(qd.options)}`);
+    assert((await inv("pending_task_questions")).some((x) => x.id === q.id), "the app-wide list lacks the question");
+    assert(await invErr("resume_task", { id, budgets: null }), "resume must be refused while waiting for an answer");
+    assert(!fs.existsSync(colorFile), "color.txt written before the answer");
+    await inv("answer_task_question", { runId: id, questionId: qd.question_id, answer: "blue" });
+    const t = await waitTask(id, FINAL, 300000);
+    assert(t.run.state === "completed", summary(t));
+    const answered = t.steps.find((s) => s.id === q.id);
+    assert(answered.state === "done" && parse(answered.data).answer === "blue", `question step ${answered.state}`);
+    // What the app controls: the answer reaches the agent as the tool result and the task continues.
+    const result = t.steps.map((s) => parse(s.data)).find((d) => d.name === "ask_user" && d.status === "ok");
+    assert(result && /The user answered[^]*blue/.test(result.content || ""), `ask_user result: ${JSON.stringify(result).slice(0, 200)}`);
+    assert(t.steps.filter((s) => s.kind === "model").length >= 2, "the agent did not continue after the answer");
+    // Whether the (small) model then really writes the file is model behaviour: report it, don't fail on it.
+    const wrote = fs.existsSync(colorFile) && /blue/i.test(fs.readFileSync(colorFile, "utf8"));
+    return `waited, answered "blue", agent continued; color.txt ${wrote ? "= blue" : "not written (model skipped the write)"}`;
+  } finally { auto.stop(); }
+});
+
+await check("send_task_message during a run shows in the transcript as a user message", async () => {
+  const objective = `Do these steps one at a time, one tool call per reply: 1) read ${A} with fs_read, 2) read ${B} with fs_read, 3) list ${WORK} with fs_list. Then report what you found, and mention the secret word if the user gave you one.`;
+  const id = await startTask(objective, {}, { max_turns: 15 });
+  const auto = autoApprove(id);
+  try {
+    await waitFor(async () => (await getTask(id)).steps.length >= 1, 60000, "first step");
+    const outcome = await inv("send_task_message", { runId: id, text: "The secret word is pelican.", resume: false, budgets: null });
+    assert(outcome === "queued", `outcome ${outcome}`);
+    const t = await waitTask(id, FINAL, 300000);
+    assert(t.run.state === "completed", summary(t));
+    const msg = t.steps.find((s) => s.kind === "user" && parse(s.data).text.includes("pelican"));
+    assert(msg, `no user step: ${summary(t)}`);
+    assert(parse(msg.data).delivered === true, "the message was never delivered to the agent");
+    return `delivered; final answer ${/pelican/i.test(t.run.final_answer ?? "") ? "mentions" : "does not mention"} the word`;
+  } finally { auto.stop(); }
 });
 
 // ---------------- UI ----------------
