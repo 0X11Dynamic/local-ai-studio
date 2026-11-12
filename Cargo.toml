@@ -1,0 +1,73 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/app-core",
+    "crates/persistence",
+    "crates/system-monitor",
+    "crates/security",
+    "crates/model-registry",
+    "crates/inference",
+    "crates/downloader",
+    "crates/local-api",
+    "crates/mcp-client",
+    "crates/agent-runtime",
+    "crates/execution",
+    "crates/execution-ssh",
+    "crates/execution-docker",
+    "crates/skills",
+    "src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+app-core = { path = "crates/app-core" }
+persistence = { path = "crates/persistence" }
+system-monitor = { path = "crates/system-monitor" }
+security = { path = "crates/security" }
+model-registry = { path = "crates/model-registry" }
+inference = { path = "crates/inference" }
+downloader = { path = "crates/downloader" }
+local-api = { path = "crates/local-api" }
+mcp-client = { path = "crates/mcp-client" }
+agent-runtime = { path = "crates/agent-runtime" }
+execution = { path = "crates/execution" }
+execution-ssh = { path = "crates/execution-ssh" }
+execution-docker = { path = "crates/execution-docker" }
+skills = { path = "crates/skills" }
+
+# External crates (versions checked on crates.io 2026-11-10)
+anyhow = "1.0.104"
+thiserror = "2.0.21"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util", "net"] }
+tokio-util = "0.7.20"
+futures = "0.3.34"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "stream", "http2", "charset", "system-proxy"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "json"] }
+uuid = { version = "1.29.2", features = ["v4", "serde"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+sha2 = "0.11.1"
+zip = { version = "9.5.0", default-features = false, features = ["deflate"] }
+dirs = "7.0.0"
+regex = "1.13.1"
+walkdir = "2.5.0"
+sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
+nvml-wrapper = "0.13.0"
+keyring = "4.2.0"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Storage_FileSystem"] }
+tempfile = "3.27.0"
+base64 = "0.23.1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
