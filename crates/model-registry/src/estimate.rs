@@ -27,6 +27,90 @@ pub fn is_hybrid_attention(arch: &str) -> bool {
 }
 pub const HYBRID_FULL_ATTENTION_INTERVAL: u64 = 4;
 
+/// llama.cpp pads the sliding-window cache to a multiple of this many cells.
+const SWA_CACHE_PAD: u64 = 256;
+
+/// "Every Nth layer is global" for architectures whose GGUF has a sliding
+/// window but no pattern key: llama.cpp hard-codes these (`set_swa_pattern`).
+fn default_swa_pattern(arch: &str) -> Option<u64> {
+    match arch {
+        "gemma2" | "gpt-oss" => Some(2),
+        "gemma3" => Some(6),
+        "gemma3n" => Some(5),
+        "cohere2" => Some(4),
+        _ => None,
+    }
+}
+
+/// Which layers keep a KV cache, and how big each one's is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvLayout {
+    /// Layers with a full-context KV cache (n_ctx cells).
+    pub global_layers: u64,
+    /// Sliding-window layers: a cache of about `window + n_ubatch` cells.
+    pub swa_layers: u64,
+    /// The sliding window, when there are SWA layers.
+    pub window: Option<u64>,
+    /// Layers that reuse an earlier layer's KV cache (no cache of their own).
+    pub shared_layers: u64,
+    /// MTP / NextN layers: no KV cache in a normal load.
+    pub mtp_layers: u64,
+}
+
+/// KV cache layout from the header, as llama.cpp allocates it:
+/// - MTP / NextN layers (`nextn_predict_layers`, the last ones of
+///   `block_count`) get no cache;
+/// - shared-KV layers (`shared_kv_layers`, the last ones before those) reuse
+///   an earlier layer's cache;
+/// - hybrid models (Qwen3.5 / Qwen3-Next) keep a cache on every
+///   `full_attention_interval`-th layer only (layer il when (il + 1) % interval == 0);
+/// - with a sliding window, a layer is SWA per the per-layer pattern array
+///   (gemma4), or every Nth layer is global (pattern number, or the
+///   architecture's llama.cpp default); without a known pattern every layer
+///   counts as global (the safe overestimate).
+///
+/// A header with none of these keys gives every block a full cache, exactly
+/// the plain dense formula.
+pub fn kv_layout(meta: &ModelMetadata) -> KvLayout {
+    let layers = meta.block_count.unwrap_or(0);
+    let arch = meta.architecture.as_deref().unwrap_or("");
+    let mtp = meta.mtp_layers.unwrap_or(0).min(layers);
+    let main = layers - mtp;
+    let shared = meta.shared_kv_layers.unwrap_or(0).min(main);
+    let own = main - shared;
+    if is_hybrid_attention(arch) {
+        let interval = meta.full_attention_interval.unwrap_or(HYBRID_FULL_ATTENTION_INTERVAL).max(1);
+        // Rows stored before MTP / interval were read keep the earlier rounding.
+        let global = if meta.mtp_layers.is_none() && meta.full_attention_interval.is_none() && shared == 0 {
+            layers.div_ceil(HYBRID_FULL_ATTENTION_INTERVAL)
+        } else {
+            own / interval
+        };
+        return KvLayout { global_layers: global, swa_layers: 0, window: None, shared_layers: shared, mtp_layers: mtp };
+    }
+    let window = meta.sliding_window.filter(|&w| w > 0);
+    let pattern = meta.sliding_window_pattern.or_else(|| default_swa_pattern(arch));
+    let is_swa = |il: u64| -> bool {
+        if window.is_none() {
+            return false;
+        }
+        match (&meta.swa_layers, pattern) {
+            (Some(flags), _) if !flags.is_empty() => flags.get(il as usize).copied().unwrap_or(false),
+            // llama.cpp: pattern 0 = every layer SWA, else layer il is SWA when il % n < n - 1.
+            (_, Some(n)) => n == 0 || il % n < n - 1,
+            _ => false,
+        }
+    };
+    let swa = (0..own).filter(|&il| is_swa(il)).count() as u64;
+    KvLayout { global_layers: own - swa, swa_layers: swa, window: if swa > 0 { window } else { None }, shared_layers: shared, mtp_layers: mtp }
+}
+
+/// Cells llama.cpp gives a sliding-window layer's cache: the window (per
+/// sequence) plus one micro-batch, padded to 256, never more than n_ctx.
+pub fn swa_cache_cells(n_ctx: u64, window: u64, n_ubatch: u64, parallel: u64) -> u64 {
+    (window * parallel.max(1) + n_ubatch.max(1)).div_ceil(SWA_CACHE_PAD).saturating_mul(SWA_CACHE_PAD).min(n_ctx)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EstimateInput {
     pub n_ctx: u64,
@@ -78,20 +162,48 @@ pub fn estimate(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput) ->
     // Hybrid models (Qwen3.5 / Qwen3-Next): only every 4th layer is full
     // attention with a KV cache; the others keep a small fixed recurrent state
     // (llama.cpp's default full_attention_interval is 4). Measured on
-    // Qwen3.5-4B at 16k: KV 512 MiB (a quarter of the dense formula) + RS 50 MiB.
+    // Qwen3.5-4B at 16k: KV 512 MiB (a quarter of the dense formula) + RS 50 MiB;
+    // Qwen3.8-27B (65 blocks incl. 1 MTP layer) at 131072 f16: 16 KV layers, 8192 MiB.
+    // Sliding-window layers keep only the window (see `kv_layout`): Gemma-4-E4B
+    // at 98304 f16 measured 1576 MiB (4 global + 20 SWA layers, 18 shared).
     let hybrid = meta.architecture.as_deref().is_some_and(is_hybrid_attention);
-    let kv_layers = if hybrid { layers.div_ceil(HYBRID_FULL_ATTENTION_INTERVAL) } else { layers };
+    let layout = kv_layout(meta);
+    let kv_layers = layout.global_layers;
     let kv_cache_bytes = if layers > 0 && kv_heads > 0 && k_len > 0 {
         let per_tok_k = (kv_heads * k_len) as f64 * kv_bytes_per_element(&input.cache_type_k);
         let per_tok_v = (kv_heads * v_len) as f64 * kv_bytes_per_element(&input.cache_type_v);
         let recurrent = if hybrid { file_bytes / 50 * input.parallel.max(1) } else { 0 };
-        (kv_layers as f64 * input.n_ctx as f64 * (per_tok_k + per_tok_v)) as u64 + recurrent
+        let full = (kv_layers as f64 * input.n_ctx as f64 * (per_tok_k + per_tok_v)) as u64 + recurrent;
+        match layout.window {
+            Some(w) if layout.swa_layers > 0 => {
+                let k_swa = meta.key_length_swa.unwrap_or(k_len);
+                let v_swa = meta.value_length_swa.unwrap_or(v_len);
+                let per_tok_swa = (kv_heads * k_swa) as f64 * kv_bytes_per_element(&input.cache_type_k)
+                    + (kv_heads * v_swa) as f64 * kv_bytes_per_element(&input.cache_type_v);
+                let cells = swa_cache_cells(input.n_ctx, w, input.n_ubatch, input.parallel);
+                full + (layout.swa_layers as f64 * cells as f64 * per_tok_swa) as u64
+            }
+            _ => full,
+        }
     } else {
         notes.push("KV cache size unknown: header lacks attention dimensions.".into());
         0
     };
-    if meta.architecture.as_deref().is_some_and(|a| a.starts_with("gemma") || a.contains("swa")) {
+    if layout.swa_layers > 0 {
+        notes.push(format!(
+            "Sliding-window attention: {} layers keep the full context, {} only the last {} tokens.",
+            layout.global_layers,
+            layout.swa_layers,
+            layout.window.unwrap_or(0)
+        ));
+    } else if meta.architecture.as_deref().is_some_and(|a| a.starts_with("gemma") || a.contains("swa")) {
         notes.push("This architecture may use sliding-window attention, so the real KV cache can be smaller.".into());
+    }
+    if layout.shared_layers > 0 {
+        notes.push(format!("{} layers reuse another layer's KV cache.", layout.shared_layers));
+    }
+    if layout.mtp_layers > 0 {
+        notes.push(format!("{} multi-token-prediction layer(s) keep no KV cache.", layout.mtp_layers));
     }
     if hybrid {
         notes.push("Hybrid attention: only every 4th layer keeps a KV cache, the rest a small fixed state.".into());
@@ -582,6 +694,132 @@ mod tests {
         let e = env(6 * GIB, 32 * GIB);
         let m = ModelMetadata { context_length: Some(262_144), ..qwen35 };
         assert!(auto_n_ctx(&m, 2_800_000_000, &input(0), &e).n_ctx > auto_n_ctx(&trained(262_144), 2_800_000_000, &input(0), &e).n_ctx);
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    /// Gemma-4-E4B Q4_K_M header (lmstudio-community), as read from the file.
+    fn gemma4_e4b() -> ModelMetadata {
+        let pattern: Vec<bool> = (0..42).map(|il| il % 6 != 5).collect();
+        ModelMetadata {
+            architecture: Some("gemma4".into()),
+            block_count: Some(42),
+            context_length: Some(131_072),
+            embedding_length: Some(2560),
+            head_count: Some(8),
+            head_count_kv: Some(2),
+            key_length: Some(512),
+            value_length: Some(512),
+            vocab_size: Some(262_144),
+            sliding_window: Some(512),
+            swa_layers: Some(pattern),
+            key_length_swa: Some(256),
+            value_length_swa: Some(256),
+            shared_kv_layers: Some(18),
+            ..Default::default()
+        }
+    }
+
+    /// Qwen3.8-27B Q4_K_M header: hybrid, 65 blocks of which 1 is an MTP layer.
+    fn qwen38_27b() -> ModelMetadata {
+        ModelMetadata {
+            architecture: Some("qwen35".into()),
+            block_count: Some(65),
+            context_length: Some(262_144),
+            embedding_length: Some(5120),
+            head_count: Some(24),
+            head_count_kv: Some(4),
+            key_length: Some(256),
+            value_length: Some(256),
+            mtp_layers: Some(1),
+            full_attention_interval: Some(4),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn gemma4_kv_matches_the_measured_1576_mib_at_98304() {
+        let m = gemma4_e4b();
+        let l = kv_layout(&m);
+        assert_eq!((l.global_layers, l.swa_layers, l.shared_layers, l.window), (4, 20, 18, Some(512)));
+        let e = estimate(&m, 5_335_291_936, &input(98_304));
+        // llama-server b12292 on the RTX 5060: KV buffer 1576 MiB (llama.cpp:
+        // 4 x 98304 x 4 KiB + 20 x 1024 x 2 KiB).
+        let measured = 1576 * MIB;
+        assert!(e.kv_cache_bytes.abs_diff(measured) <= measured * 15 / 100, "{} MiB", e.kv_cache_bytes / MIB);
+        assert_eq!(e.kv_cache_bytes, measured);
+        assert!(e.notes.iter().any(|n| n.contains("Sliding-window attention")), "{:?}", e.notes);
+        // Was ~16.9 GB with every block at full size; the SWA cache does not grow with n_ctx.
+        let small = estimate(&m, 5_335_291_936, &input(8192)).kv_cache_bytes;
+        assert_eq!(small, 4 * 8192 * 4096 + 20 * 1024 * 2048);
+        assert_eq!(swa_cache_cells(512, 512, 512, 1), 512, "never more than n_ctx");
+    }
+
+    #[test]
+    fn gemma4_auto_ctx_reaches_the_trained_context_when_sharing() {
+        // 8 GiB card with 7 GiB free, 31.6 GB RAM, Share with CPU: was 98304, now trained.
+        let share = AutoCtxEnv { share_with_cpu: true, ..env(7 * GIB, 28 * GIB) };
+        let a = auto_n_ctx(&gemma4_e4b(), 5_335_291_936, &input(0), &share);
+        assert_eq!((a.n_ctx, a.limited_by.as_str()), (131_072, "trained"), "{a:?}");
+    }
+
+    #[test]
+    fn qwen38_27b_kv_matches_the_measured_8192_mib_at_131072() {
+        let m = qwen38_27b();
+        let l = kv_layout(&m);
+        assert_eq!((l.global_layers, l.mtp_layers), (16, 1));
+        let size = 16_810_714_336;
+        let e = estimate(&m, size, &input(131_072));
+        let recurrent = size / 50;
+        assert_eq!(e.kv_cache_bytes - recurrent, 8192 * MIB, "16 full-attention layers x 131072 x 4 KiB");
+        assert!(e.notes.iter().any(|n| n.contains("multi-token-prediction")), "{:?}", e.notes);
+        // A row stored before MTP was read keeps the old count (17 layers).
+        let old = ModelMetadata { mtp_layers: None, full_attention_interval: None, ..m };
+        assert_eq!(kv_layout(&old).global_layers, 17);
+    }
+
+    /// Read-only check against real model files (headers only):
+    /// `LAS_REAL_MODELS=<dir> cargo test -p model-registry real_kv_estimates -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_kv_estimates() {
+        let Ok(dir) = std::env::var("LAS_REAL_MODELS") else { return };
+        for m in crate::scan::scan(std::path::Path::new(&dir)).models {
+            let l = kv_layout(&m.metadata);
+            let kv = |n| estimate(&m.metadata, m.total_size, &input(n)).kv_cache_bytes / MIB;
+            println!("{} [{:?}] {l:?}: KV f16 98304 = {} MiB, 131072 = {} MiB", m.display_name, m.metadata.architecture, kv(98_304), kv(131_072));
+        }
+    }
+
+    #[test]
+    fn swa_patterns_numbers_defaults_and_unknowns() {
+        let base = ModelMetadata { sliding_window: Some(1024), ..meta() };
+        // No pattern known for llama: every layer stays global (unchanged estimate).
+        assert_eq!(estimate(&base, 1, &input(32_768)).kv_cache_bytes, estimate(&meta(), 1, &input(32_768)).kv_cache_bytes);
+        // Pattern number 6: every 6th layer is global (32 layers -> 5 global, 27 SWA).
+        let p6 = ModelMetadata { sliding_window_pattern: Some(6), ..base.clone() };
+        assert_eq!(kv_layout(&p6), KvLayout { global_layers: 5, swa_layers: 27, window: Some(1024), shared_layers: 0, mtp_layers: 0 });
+        // gemma3 has no key: llama.cpp's default pattern 6.
+        let g3 = ModelMetadata { architecture: Some("gemma3".into()), ..base.clone() };
+        assert_eq!(kv_layout(&g3).swa_layers, 27);
+        let e = estimate(&g3, 1, &input(32_768)).kv_cache_bytes;
+        assert_eq!(e, 5 * 32_768 * 4096 + 27 * 1536 * 4096);
+        // No window: a pattern alone changes nothing.
+        let nowin = ModelMetadata { sliding_window_pattern: Some(6), ..meta() };
+        assert_eq!(kv_layout(&nowin).global_layers, 32);
+        // A dense model with MTP layers: those keep no cache.
+        let glm = ModelMetadata { mtp_layers: Some(1), ..meta() };
+        assert_eq!(kv_layout(&glm).global_layers, 31);
+    }
+
+    #[test]
+    fn dense_models_without_the_new_keys_are_unchanged() {
+        // Every new field None: the plain formula, bit for bit.
+        for ctx in [2048, 8192, 32_768, 131_072] {
+            let e = estimate(&meta(), 4_900_000_000, &input(ctx));
+            assert_eq!(e.kv_cache_bytes, (32.0 * ctx as f64 * (8.0 * 128.0 * 2.0 * 2.0)) as u64);
+            assert!(!e.notes.iter().any(|n| n.contains("Sliding") || n.contains("reuse") || n.contains("multi-token")), "{:?}", e.notes);
+        }
     }
 
     #[test]

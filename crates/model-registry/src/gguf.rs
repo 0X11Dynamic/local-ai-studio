@@ -62,6 +62,8 @@ pub enum Value {
     Bool(bool),
     Str(String),
     NumArray(Vec<i64>),
+    /// Short bool arrays (per-layer flags such as gemma4's sliding-window pattern).
+    BoolArray(Vec<bool>),
     Array { elem_type: u32, len: u64 },
 }
 
@@ -129,6 +131,37 @@ pub struct ModelMetadata {
     /// before detection existed; those are back-filled by `refresh_status`.
     #[serde(default)]
     pub caps: crate::caps::Capabilities,
+    // Attention layout, for the KV cache estimate (`estimate`). All None in
+    // rows stored before they were read (back-filled by `refresh_status`) and
+    // for models without them; None keeps the plain dense formula.
+    /// `<arch>.attention.sliding_window`: tokens a sliding-window (SWA) layer keeps.
+    #[serde(default)]
+    pub sliding_window: Option<u64>,
+    /// `<arch>.attention.sliding_window_pattern` as a number N: every Nth
+    /// layer is global (full attention), the others use the window
+    /// (llama.cpp `set_swa_pattern`).
+    #[serde(default)]
+    pub sliding_window_pattern: Option<u64>,
+    /// The same key as a per-layer array (gemma4): true = sliding-window layer.
+    #[serde(default)]
+    pub swa_layers: Option<Vec<bool>>,
+    /// K / V head size of the sliding-window layers, when it differs.
+    #[serde(default)]
+    pub key_length_swa: Option<u64>,
+    #[serde(default)]
+    pub value_length_swa: Option<u64>,
+    /// `<arch>.attention.shared_kv_layers`: the last N layers reuse an earlier
+    /// layer's KV cache and keep none of their own (gemma3n / gemma4).
+    #[serde(default)]
+    pub shared_kv_layers: Option<u64>,
+    /// `<arch>.nextn_predict_layers`: multi-token-prediction (MTP / NextN)
+    /// layers at the end of `block_count`. They have no KV cache in a normal
+    /// load; llama-server can use them for speculative decoding (`--spec-type draft-mtp`).
+    #[serde(default)]
+    pub mtp_layers: Option<u64>,
+    /// `<arch>.full_attention_interval` of hybrid (linear + full attention) models.
+    #[serde(default)]
+    pub full_attention_interval: Option<u64>,
 }
 
 pub fn read_header(path: &Path) -> Result<GgufHeader, GgufError> {
@@ -199,6 +232,22 @@ pub fn extract(h: &GgufHeader) -> ModelMetadata {
         gguf_version: h.version,
         tensor_count: h.tensor_count,
         caps: crate::caps::from_template(chat_template, "gguf"),
+        sliding_window: ak("attention.sliding_window").and_then(Value::as_u64).filter(|&w| w > 0),
+        sliding_window_pattern: match ak("attention.sliding_window_pattern") {
+            Some(Value::U64(n)) => Some(*n),
+            Some(Value::I64(n)) if *n >= 0 => Some(*n as u64),
+            _ => None,
+        },
+        swa_layers: match ak("attention.sliding_window_pattern") {
+            Some(Value::BoolArray(v)) => Some(v.clone()),
+            Some(Value::NumArray(v)) => Some(v.iter().map(|&x| x != 0).collect()),
+            _ => None,
+        },
+        key_length_swa: ak("attention.key_length_swa").and_then(Value::as_u64),
+        value_length_swa: ak("attention.value_length_swa").and_then(Value::as_u64),
+        shared_kv_layers: ak("attention.shared_kv_layers").and_then(Value::as_u64).filter(|&n| n > 0),
+        mtp_layers: ak("nextn_predict_layers").and_then(Value::as_u64).filter(|&n| n > 0),
+        full_attention_interval: ak("full_attention_interval").and_then(Value::as_u64).filter(|&n| n > 0),
     }
 }
 
@@ -322,8 +371,17 @@ fn read_value<R: Read + Seek>(r: &mut R, ty: u32, file_len: u64) -> Result<Value
                     .checked_mul(sz)
                     .filter(|b| *b <= file_len)
                     .ok_or_else(|| GgufError::Corrupt("array exceeds file size".into()))?;
-                // Keep short integer arrays (per-layer values); skip the rest.
-                if len <= 512 && elem != 6 && elem != 12 && elem != 7 {
+                // Keep short integer and bool arrays (per-layer values); skip the rest.
+                if len <= 512 && elem == 7 {
+                    let mut v = Vec::with_capacity(len as usize);
+                    for _ in 0..len {
+                        if let Value::Bool(x) = read_scalar(r, elem)? {
+                            v.push(x);
+                        }
+                    }
+                    return Ok(Value::BoolArray(v));
+                }
+                if len <= 512 && elem != 6 && elem != 12 {
                     let mut v = Vec::with_capacity(len as usize);
                     for _ in 0..len {
                         match read_scalar(r, elem)? {
@@ -434,6 +492,79 @@ pub(crate) mod tests {
         assert_eq!(m.head_count_kv, Some(4));
         assert_eq!(m.vocab_size, Some(3));
         assert!(m.has_chat_template);
+    }
+
+    /// One GGUF key/value entry: key, type id, raw value bytes.
+    fn entry(k: &str, ty: u32, val: &[u8]) -> Vec<u8> {
+        let mut e = Vec::new();
+        e.extend((k.len() as u64).to_le_bytes());
+        e.extend(k.as_bytes());
+        e.extend(ty.to_le_bytes());
+        e.extend(val);
+        e
+    }
+
+    fn write_kvs(path: &Path, kvs: &[Vec<u8>]) {
+        let mut b: Vec<u8> = b"GGUF".to_vec();
+        b.extend(3u32.to_le_bytes());
+        b.extend(0u64.to_le_bytes());
+        b.extend((kvs.len() as u64).to_le_bytes());
+        for kv in kvs {
+            b.extend(kv);
+        }
+        b.extend([0u8; 64]);
+        std::fs::File::create(path).unwrap().write_all(&b).unwrap();
+    }
+
+    #[test]
+    fn reads_sliding_window_shared_kv_and_mtp_keys() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("g.gguf");
+        let s = |v: &str| [(v.len() as u64).to_le_bytes().to_vec(), v.as_bytes().to_vec()].concat();
+        let u = |v: u32| v.to_le_bytes().to_vec();
+        // gemma4: the pattern is a per-layer bool array (true = sliding window).
+        let mut bools = 7u32.to_le_bytes().to_vec();
+        bools.extend(6u64.to_le_bytes());
+        bools.extend([1u8, 1, 1, 1, 1, 0]);
+        write_kvs(
+            &p,
+            &[
+                entry("general.architecture", 8, &s("gemma4")),
+                entry("gemma4.block_count", 4, &u(6)),
+                entry("gemma4.attention.sliding_window", 4, &u(512)),
+                entry("gemma4.attention.sliding_window_pattern", 9, &bools),
+                entry("gemma4.attention.key_length_swa", 4, &u(256)),
+                entry("gemma4.attention.value_length_swa", 4, &u(256)),
+                entry("gemma4.attention.shared_kv_layers", 4, &u(2)),
+            ],
+        );
+        let m = read_metadata(&p).unwrap();
+        assert_eq!(m.sliding_window, Some(512));
+        assert_eq!(m.swa_layers, Some(vec![true, true, true, true, true, false]));
+        assert_eq!(m.sliding_window_pattern, None);
+        assert_eq!((m.key_length_swa, m.value_length_swa, m.shared_kv_layers), (Some(256), Some(256), Some(2)));
+        assert_eq!(m.mtp_layers, None);
+        // A numeric pattern and MTP layers (qwen35 style keys).
+        write_kvs(
+            &p,
+            &[
+                entry("general.architecture", 8, &s("qwen35")),
+                entry("qwen35.attention.sliding_window", 4, &u(4096)),
+                entry("qwen35.attention.sliding_window_pattern", 4, &u(4)),
+                entry("qwen35.nextn_predict_layers", 4, &u(1)),
+                entry("qwen35.full_attention_interval", 4, &u(4)),
+            ],
+        );
+        let m = read_metadata(&p).unwrap();
+        assert_eq!((m.sliding_window_pattern, m.swa_layers.as_ref()), (Some(4), None));
+        assert_eq!((m.mtp_layers, m.full_attention_interval), (Some(1), Some(4)));
+        // Rows stored before these fields existed still parse (all None).
+        let mut v = serde_json::to_value(ModelMetadata::default()).unwrap();
+        for k in ["sliding_window", "swa_layers", "mtp_layers", "shared_kv_layers"] {
+            v.as_object_mut().unwrap().remove(k);
+        }
+        let old: ModelMetadata = serde_json::from_value(v).unwrap();
+        assert_eq!(old, ModelMetadata::default());
     }
 
     #[test]

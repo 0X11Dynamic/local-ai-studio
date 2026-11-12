@@ -22,7 +22,9 @@ use serde::{Deserialize, Serialize};
 use crate::gguf::{self, GgufHeader, Value};
 
 /// Bump when detection changes so stored rows are re-detected at startup.
-pub const CAPS_VERSION: u32 = 1;
+/// 2: also back-fills the attention layout (sliding window, shared KV, MTP
+/// layers) the memory estimate reads.
+pub const CAPS_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

@@ -80,6 +80,18 @@ pub async fn refresh_status(db: &Db) -> AppResult<()> {
     Ok(())
 }
 
+/// `ModelMetadata` fields read since CAPS_VERSION 2, copied into older rows.
+const ATTENTION_LAYOUT_KEYS: &[&str] = &[
+    "sliding_window",
+    "sliding_window_pattern",
+    "swa_layers",
+    "key_length_swa",
+    "value_length_swa",
+    "shared_kv_layers",
+    "mtp_layers",
+    "full_attention_interval",
+];
+
 /// Detect capabilities for rows stored before detection existed (or by an older
 /// detector). Reads the header and projector read-only; failures leave the row as is.
 async fn backfill_caps(db: &Db, m: &persistence::models::ModelRow) {
@@ -95,14 +107,20 @@ async fn backfill_caps(db: &Db, m: &persistence::models::ModelRow) {
         let tpl = h.kv.get("tokenizer.chat_template").and_then(|v| v.as_str());
         let mut c = caps::from_template(tpl, "gguf");
         caps::apply_projector(&mut c, projector.as_deref().map(caps::read_projector));
-        Some(c)
+        Some((c, gguf::extract(&h)))
     })
     .await
     .ok()
     .flatten();
-    let Some(c) = detected else { return };
-    if let (Some(obj), Ok(v)) = (meta.as_object_mut(), serde_json::to_value(&c)) {
+    let Some((c, fresh)) = detected else { return };
+    if let (Some(obj), Ok(v), Ok(serde_json::Value::Object(f))) = (meta.as_object_mut(), serde_json::to_value(&c), serde_json::to_value(&fresh)) {
         obj.insert("caps".into(), v);
+        // Header fields added after the row was stored (attention layout).
+        for k in ATTENTION_LAYOUT_KEYS {
+            if let Some(x) = f.get(*k) {
+                obj.insert((*k).into(), x.clone());
+            }
+        }
         if let Err(e) = db.update_model_metadata(&m.id, &meta).await {
             tracing::warn!("could not store capabilities for {}: {e}", m.id);
         }
@@ -139,11 +157,15 @@ mod tests {
         let mut old: serde_json::Value = serde_json::from_str(&models[0].metadata).unwrap();
         assert_eq!(old["caps"]["version"], caps::CAPS_VERSION);
         old.as_object_mut().unwrap().remove("caps");
+        // ...and the attention layout fields are re-read from the header.
+        old.as_object_mut().unwrap().remove("sliding_window");
+        old["mtp_layers"] = serde_json::json!(7);
         db.update_model_metadata(&models[0].id, &old).await.unwrap();
         refresh_status(&db).await.unwrap();
         let back: serde_json::Value = serde_json::from_str(&db.get_model(&models[0].id).await.unwrap().metadata).unwrap();
         assert_eq!(back["caps"]["version"], caps::CAPS_VERSION);
         assert_eq!(back["caps"]["vision"], false);
+        assert!(back["mtp_layers"].is_null() && back.get("sliding_window").is_some_and(|v| v.is_null()), "{back}");
 
         std::fs::remove_file(&f).unwrap();
         refresh_status(&db).await.unwrap();
