@@ -3,33 +3,13 @@
 **Run local LLMs offline on Windows: a fast, private LM Studio alternative built on llama.cpp, with GGUF model management, chat, agents, MCP tools and a local OpenAI-compatible API.**
 
 [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](#license)
-[![Release](https://img.shields.io/badge/release-v0.1.0-blue)](../../releases)
+[![Release](https://img.shields.io/badge/release-v0.1.0-blue)](https://github.com/0X11Dynamic/local-ai-studio/releases)
 [![Platform: Windows 10/11 x64](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D4)](#system-requirements)
 [![Built with Rust + Tauri 2](https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri%202-orange)](#architecture)
-
-> Badge targets are placeholders. Point the release badge at the real release once the repository is published.
 
 Local AI Studio is a Windows desktop app for running large language models on your own PC. It downloads GGUF models from Hugging Face, loads them with [llama.cpp](https://github.com/ggml-org/llama.cpp), and gives you a chat UI, an agent mode that can use tools (with your approval), and a local OpenAI-compatible server for other programs. Everything runs on your machine. The installer installs for your user account only and needs no administrator rights. The source is available and free for noncommercial use (see [License](#license)).
 
 It is written in Rust (Tauri 2) with a React/TypeScript front end. All logic lives in Rust crates; the UI only renders.
-
-## Screenshots
-
-> Placeholders. Take these and save them under `docs/images/` before publishing.
-
-| File | What to capture |
-|---|---|
-| `docs/images/chat.png` | A chat with a reasoning model: Markdown reply, collapsed "thinking" block, context bar |
-| `docs/images/discover.png` | Discover page with Hugging Face results showing fit estimates and capability badges |
-| `docs/images/load-panel.png` | My Models load panel with memory estimate, Auto context and Share with CPU |
-| `docs/images/agent-task.png` | An Agent task with subagents and a tool approval card waiting |
-| `docs/images/first-run.png` | First-run setup (This PC, Runtime, First model) |
-| `docs/images/linked-pcs.png` | Linked PCs page with a paired PC and a split model |
-
-<!-- ![Chat](docs/images/chat.png) -->
-<!-- ![Discover](docs/images/discover.png) -->
-<!-- ![Load panel](docs/images/load-panel.png) -->
-<!-- ![Agent task](docs/images/agent-task.png) -->
 
 ## Features
 
@@ -206,7 +186,7 @@ End-to-end suites live in [`tests/e2e`](tests/e2e) (`phase1.mjs` to `phase6.mjs`
 
 ## Contributing
 
-Issues and pull requests are welcome once the repository is public. Please run `cargo test --workspace` and `npm --prefix frontend run build` before opening a pull request, and describe how you tested UI changes. Report security problems privately rather than in a public issue.
+Issues and pull requests are welcome. Please run `cargo test --workspace` and `npm --prefix frontend run build` before opening a pull request, and describe how you tested UI changes. Report security problems privately rather than in a public issue.
 
 ## License
 
