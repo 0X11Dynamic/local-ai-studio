@@ -1,4 +1,4 @@
-// Advanced / adversarial end-to-end run (Will: "run advanced in-depth tests
+// Advanced / adversarial end-to-end run (request: "run advanced in-depth tests
 // to test the stuff like subagents, mcp's, file system, skills, etc. delete
 // any leftover files u may make in the process afterwards").
 //
@@ -164,9 +164,9 @@ await check("setup: This PC folders, model loaded", async () => {
   assert(r[0] === WORK, JSON.stringify(r));
   ids.model = (await inv("import_models", { path: MODEL })).registered[0];
   const d = await inv("get_load_defaults", { id: ids.model });
-  const s = await inv("load_model", { modelId: ids.model, config: { ...d.config, n_ctx: 8192, gpu_layers: { mode: "all" } }, runtimeId: P.cuda });
+  const s = await inv("load_model", { modelId: ids.model, config: { ...d.config, n_ctx: 16384, gpu_layers: { mode: "all" } }, runtimeId: P.cuda });
   assert(s.state === "loaded", s.state);
-  return `${s.gpu_layers_offloaded?.join("/")} layers on GPU, n_ctx 8192`;
+  return `${s.gpu_layers_offloaded?.join("/")} layers on GPU, n_ctx 16384`;
 });
 
 // ---------------- file system (adversarial, through the app) ----------------
@@ -400,7 +400,7 @@ await check("subagents: 6 requested with at most 4 at once; the rest queue and a
   if (t.subagents.length === 0) throw new Error(`the model did not spawn: ${summary(t)}`);
   assert(t.subagents.length === 6, `${t.subagents.length} subagents: ${summary(t)}`);
   assert(maxRunning <= 4, `${maxRunning} ran at once`);
-  assert(t.subagents.every((s) => s.state === "completed"), JSON.stringify(t.subagents.map((s) => [s.label, s.state])));
+  assert(t.subagents.every((s) => s.state === "completed"), `${JSON.stringify(t.subagents.map((s) => [s.label, s.state, s.error || ""]))} | ${summary(t)}`);
   assert(t.run.state === "completed", summary(t));
   // Children never get the spawn tool.
   assert(t.subagents.every((s) => !(parse(s.settings).tools || []).includes("spawn_subagents")), "a child was given spawn_subagents");

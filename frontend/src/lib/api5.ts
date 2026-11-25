@@ -10,6 +10,8 @@ export interface TaskSettings {
   environment_id: string | null; builtin_tools: boolean; mcp_tools: boolean; tool_servers: string[];
   /** MCP server ids turned off for this task ("Task tools" picker); servers added later are on. */
   disabled_servers?: string[];
+  /** Offer web_search ("Task tools" picker); on unless false. */
+  web_search?: boolean;
   skills_mode: "auto" | "off" | "manual"; skills: string[]; subagents: boolean; max_parallel: number;
   tool_mode: "auto" | "native" | "xml"; sampling: SamplingParams;
   /** Read-only planning phase first; the task waits in awaiting_plan_approval. */
@@ -31,6 +33,7 @@ export interface SubagentRow {
 }
 /** A subagent's git worktree, reported when its task or chat is deleted. */
 export interface WorktreeReport { subagent_id: string; label: string; path: string; branch: string; reason: string | null }
+export interface BulkDeleteResult extends DeleteResult { deleted: number; failed: { id: string; error: string }[] }
 export interface DeleteResult { removed_worktrees: WorktreeReport[]; kept_worktrees: WorktreeReport[] }
 /** Stored in a subagent's settings when it ran with isolation "worktree". */
 export interface WorktreeInfo { repo: string; path: string; branch: string; base: string }

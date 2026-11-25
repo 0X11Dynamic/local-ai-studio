@@ -1,7 +1,7 @@
 //! Skills in the app: the folder `%APPDATA%\LocalAIStudio\skills\<name>\`
 //! is the source of truth for content; the database keeps the mode
 //! (auto/always/off), enabled scripts and every revision. Agents can only
-//! *propose* edits; Will approves or rejects them.
+//! *propose* edits; the user approves or rejects them.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -23,7 +23,7 @@ pub struct FileView {
     pub path: String,
     pub sha256: String,
     pub size: u64,
-    /// Enabled by Will, and unchanged since.
+    /// Enabled by the user, and unchanged since.
     pub enabled: bool,
     /// Enabled once, but the file changed since (so it is off again).
     pub changed: bool,
@@ -143,7 +143,7 @@ fn write_atomic(path: &std::path::Path, text: &str) -> AppResult<()> {
 }
 
 /// Sample skills shipped with the app (embedded, so the installer needs no
-/// extra files). Installed once each; a sample Will deletes stays deleted.
+/// extra files). Installed once each; a sample the user deletes stays deleted.
 pub const SAMPLES: [(&str, &str); 3] = [
     ("rust-test-fix", include_str!("../../resources/skills/rust-test-fix/SKILL.md")),
     ("git-commit-style", include_str!("../../resources/skills/git-commit-style/SKILL.md")),
@@ -445,7 +445,15 @@ pub async fn export(st: &SharedState, id: &str, dest: &str) -> AppResult<String>
 /// Which skills apply to `text`. `mode`: "auto" (match), "off", or
 /// "manual" (exactly `manual`, by name).
 pub async fn pick(st: &SharedState, text: &str, mode: &str, manual: &[String]) -> AppResult<Vec<Match>> {
-    sync(st).await?;
+    pick_opts(st, text, mode, manual, true).await
+}
+
+/// `pick`; `sync_first: false` matches against the database as it is,
+/// without re-reading the skills folder (the context meter, per typing pause).
+pub async fn pick_opts(st: &SharedState, text: &str, mode: &str, manual: &[String], sync_first: bool) -> AppResult<Vec<Match>> {
+    if sync_first {
+        sync(st).await?;
+    }
     let rows = st.db.list_skills().await?;
     match mode {
         "off" => Ok(vec![]),
@@ -468,8 +476,17 @@ pub async fn pick(st: &SharedState, text: &str, mode: &str, manual: &[String]) -
     }
 }
 
+/// The picked skills that still exist and are not turned off (a chat's
+/// sticky skills may name one deleted or switched off since).
+pub async fn usable(st: &SharedState, picked: &[Match]) -> AppResult<Vec<Match>> {
+    let rows = st.db.list_skills().await?;
+    Ok(picked.iter().filter(|m| rows.iter().any(|r| r.name == m.name && r.mode != "off")).cloned().collect())
+}
+
 /// The `## Skills` prompt section for picked skills (bodies plus the paths of
-/// scripts Will enabled), capped in size.
+/// scripts the user enabled), capped in size. Why a skill was picked is not
+/// in the text: it changes with each message's wording, and any change near
+/// the top of the prompt makes the model re-read everything after it.
 pub async fn section(st: &SharedState, picked: &[Match]) -> AppResult<Option<String>> {
     if picked.is_empty() {
         return Ok(None);
@@ -479,7 +496,7 @@ pub async fn section(st: &SharedState, picked: &[Match]) -> AppResult<Option<Str
         let Ok(row) = st.db.get_skill(&m.name).await else { continue };
         let folder = PathBuf::from(&row.path);
         let Some((_, Ok(doc))) = read_doc(&folder.join(SKILL_FILE)) else { continue };
-        s.push_str(&format!("\n### Skill: {} (v{}; {})\n{}\n", doc.name, doc.version, m.reason, doc.body.trim()));
+        s.push_str(&format!("\n### Skill: {} (v{})\n{}\n", doc.name, doc.version, doc.body.trim()));
         let on = enabled_scripts(&row);
         let scripts: Vec<String> = extra_files(&folder)?
             .into_iter()

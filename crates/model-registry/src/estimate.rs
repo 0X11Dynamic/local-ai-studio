@@ -4,7 +4,33 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::gguf::ModelMetadata;
+use crate::gguf::{MAX_BLOCK_COUNT, ModelMetadata};
+
+/// `block_count`, clamped to [`MAX_BLOCK_COUNT`] (rows stored before the
+/// header reader clamped it may hold a hostile value).
+fn blocks(meta: &ModelMetadata) -> u64 {
+    meta.block_count.unwrap_or(0).min(MAX_BLOCK_COUNT)
+}
+
+/// Weights llama.cpp keeps in host memory whatever the GPU offload
+/// ([`ModelMetadata::host_weight_bytes`]), at most the file size.
+pub fn host_weight_bytes(meta: &ModelMetadata, file_bytes: u64) -> u64 {
+    meta.host_weight_bytes.unwrap_or(0).min(file_bytes)
+}
+
+/// Weights that can go to the GPU: the file minus [`host_weight_bytes`].
+pub fn offloadable_weight_bytes(meta: &ModelMetadata, file_bytes: u64) -> u64 {
+    file_bytes - host_weight_bytes(meta, file_bytes)
+}
+
+/// The output layer (`output.weight`, vocab x embedding), counted at q8_0
+/// width (8.5 bits; quantized files usually store it as Q6_K, 6.56 bits), so
+/// it errs on the large side. llama.cpp puts it on the last device of a
+/// split, which is this PC's GPU (Qwen3.8-27B: 248320 x 5120, about 1.1 GB).
+pub fn output_layer_bytes(meta: &ModelMetadata) -> u64 {
+    let (vocab, embd) = (meta.vocab_size.unwrap_or(0), meta.embedding_length.unwrap_or(0));
+    vocab.saturating_mul(embd).saturating_mul(17) / 16
+}
 
 /// KV cache element type, matching llama-server `--cache-type-k/-v` values.
 pub fn kv_bytes_per_element(t: &str) -> f64 {
@@ -72,21 +98,24 @@ pub struct KvLayout {
 /// A header with none of these keys gives every block a full cache, exactly
 /// the plain dense formula.
 pub fn kv_layout(meta: &ModelMetadata) -> KvLayout {
-    let layers = meta.block_count.unwrap_or(0);
+    let layers = blocks(meta);
     let arch = meta.architecture.as_deref().unwrap_or("");
-    let mtp = meta.mtp_layers.unwrap_or(0).min(layers);
+    let mtp = meta.mtp_layers_declared.or(meta.mtp_layers).unwrap_or(0).min(layers);
     let main = layers - mtp;
+    // With speculative MTP decoding the MTP layer keeps its own full-context cache.
+    let mtp_kv = if meta.mtp_speculative && meta.mtp_layers.unwrap_or(0) > 0 { mtp } else { 0 };
     let shared = meta.shared_kv_layers.unwrap_or(0).min(main);
     let own = main - shared;
     if is_hybrid_attention(arch) {
         let interval = meta.full_attention_interval.unwrap_or(HYBRID_FULL_ATTENTION_INTERVAL).max(1);
-        // Rows stored before MTP / interval were read keep the earlier rounding.
-        let global = if meta.mtp_layers.is_none() && meta.full_attention_interval.is_none() && shared == 0 {
+        // Rows stored before MTP / interval were read keep the earlier rounding
+        // (no MTP key at all: a declared-but-stripped MTP block is excluded below).
+        let global = if meta.mtp_layers.is_none() && meta.mtp_layers_declared.is_none() && meta.full_attention_interval.is_none() && shared == 0 {
             layers.div_ceil(HYBRID_FULL_ATTENTION_INTERVAL)
         } else {
             own / interval
         };
-        return KvLayout { global_layers: global, swa_layers: 0, window: None, shared_layers: shared, mtp_layers: mtp };
+        return KvLayout { global_layers: global + mtp_kv, swa_layers: 0, window: None, shared_layers: shared, mtp_layers: mtp };
     }
     let window = meta.sliding_window.filter(|&w| w > 0);
     let pattern = meta.sliding_window_pattern.or_else(|| default_swa_pattern(arch));
@@ -101,14 +130,16 @@ pub fn kv_layout(meta: &ModelMetadata) -> KvLayout {
             _ => false,
         }
     };
-    let swa = (0..own).filter(|&il| is_swa(il)).count() as u64;
-    KvLayout { global_layers: own - swa, swa_layers: swa, window: if swa > 0 { window } else { None }, shared_layers: shared, mtp_layers: mtp }
+    // No window or no way to tell SWA layers apart: every layer is global (no per-layer loop).
+    let has_pattern = meta.swa_layers.as_ref().is_some_and(|f| !f.is_empty()) || pattern.is_some();
+    let swa = if window.is_some() && has_pattern { (0..own).filter(|&il| is_swa(il)).count() as u64 } else { 0 };
+    KvLayout { global_layers: own - swa + mtp_kv, swa_layers: swa, window: if swa > 0 { window } else { None }, shared_layers: shared, mtp_layers: mtp }
 }
 
 /// Cells llama.cpp gives a sliding-window layer's cache: the window (per
 /// sequence) plus one micro-batch, padded to 256, never more than n_ctx.
 pub fn swa_cache_cells(n_ctx: u64, window: u64, n_ubatch: u64, parallel: u64) -> u64 {
-    (window * parallel.max(1) + n_ubatch.max(1)).div_ceil(SWA_CACHE_PAD).saturating_mul(SWA_CACHE_PAD).min(n_ctx)
+    window.saturating_mul(parallel.max(1)).saturating_add(n_ubatch.max(1)).div_ceil(SWA_CACHE_PAD).saturating_mul(SWA_CACHE_PAD).min(n_ctx)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +163,10 @@ pub struct EstimateInput {
 #[derive(Debug, Clone, Serialize)]
 pub struct MemoryEstimate {
     pub weights_bytes: u64,
+    /// The part of `weights_bytes` in system RAM: the layers not offloaded
+    /// plus the tensors llama.cpp always keeps on the host
+    /// ([`host_weight_bytes`]). Memory-mapped from the file.
+    pub weights_ram_bytes: u64,
     pub kv_cache_bytes: u64,
     pub compute_buffer_bytes: u64,
     /// Vision projector (mmproj) weights, 0 when it is not loaded.
@@ -146,7 +181,7 @@ pub struct MemoryEstimate {
 
 pub fn estimate(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput) -> MemoryEstimate {
     let mut notes = vec!["Estimate from file size and GGUF metadata; actual use is measured after load.".to_string()];
-    let layers = meta.block_count.unwrap_or(0);
+    let layers = blocks(meta);
     let total_layers = layers + 1; // + output layer, as llama.cpp counts for -ngl
     let offloaded = match input.gpu_layers {
         None => total_layers,
@@ -170,18 +205,19 @@ pub fn estimate(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput) ->
     let layout = kv_layout(meta);
     let kv_layers = layout.global_layers;
     let kv_cache_bytes = if layers > 0 && kv_heads > 0 && k_len > 0 {
-        let per_tok_k = (kv_heads * k_len) as f64 * kv_bytes_per_element(&input.cache_type_k);
-        let per_tok_v = (kv_heads * v_len) as f64 * kv_bytes_per_element(&input.cache_type_v);
-        let recurrent = if hybrid { file_bytes / 50 * input.parallel.max(1) } else { 0 };
-        let full = (kv_layers as f64 * input.n_ctx as f64 * (per_tok_k + per_tok_v)) as u64 + recurrent;
+        let per_tok_k = kv_heads.saturating_mul(k_len) as f64 * kv_bytes_per_element(&input.cache_type_k);
+        let per_tok_v = kv_heads.saturating_mul(v_len) as f64 * kv_bytes_per_element(&input.cache_type_v);
+        let recurrent = if hybrid { (file_bytes / 50).saturating_mul(input.parallel.max(1)) } else { 0 };
+        // Float-to-int `as` saturates, so hostile sizes cannot wrap.
+        let full = ((kv_layers as f64 * input.n_ctx as f64 * (per_tok_k + per_tok_v)) as u64).saturating_add(recurrent);
         match layout.window {
             Some(w) if layout.swa_layers > 0 => {
                 let k_swa = meta.key_length_swa.unwrap_or(k_len);
                 let v_swa = meta.value_length_swa.unwrap_or(v_len);
-                let per_tok_swa = (kv_heads * k_swa) as f64 * kv_bytes_per_element(&input.cache_type_k)
-                    + (kv_heads * v_swa) as f64 * kv_bytes_per_element(&input.cache_type_v);
+                let per_tok_swa = kv_heads.saturating_mul(k_swa) as f64 * kv_bytes_per_element(&input.cache_type_k)
+                    + kv_heads.saturating_mul(v_swa) as f64 * kv_bytes_per_element(&input.cache_type_v);
                 let cells = swa_cache_cells(input.n_ctx, w, input.n_ubatch, input.parallel);
-                full + (layout.swa_layers as f64 * cells as f64 * per_tok_swa) as u64
+                full.saturating_add((layout.swa_layers as f64 * cells as f64 * per_tok_swa) as u64)
             }
             _ => full,
         }
@@ -202,7 +238,9 @@ pub fn estimate(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput) ->
     if layout.shared_layers > 0 {
         notes.push(format!("{} layers reuse another layer's KV cache.", layout.shared_layers));
     }
-    if layout.mtp_layers > 0 {
+    if layout.mtp_layers > 0 && meta.mtp_speculative && meta.mtp_layers.unwrap_or(0) > 0 {
+        notes.push(format!("Speculative MTP decoding: {} multi-token-prediction layer(s) keep a full-context KV cache.", layout.mtp_layers));
+    } else if layout.mtp_layers > 0 {
         notes.push(format!("{} multi-token-prediction layer(s) keep no KV cache.", layout.mtp_layers));
     }
     if hybrid {
@@ -214,12 +252,18 @@ pub fn estimate(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput) ->
 
     let vocab = meta.vocab_size.unwrap_or(32_000);
     let embd = meta.embedding_length.unwrap_or(4096);
-    let compute_buffer_bytes = input.n_ubatch.max(1) * (vocab + 4 * embd) * 4;
+    let compute_buffer_bytes = input.n_ubatch.max(1).saturating_mul(vocab.saturating_add(embd.saturating_mul(4))).saturating_mul(4);
 
-    let weights_gpu = (file_bytes as f64 * gpu_frac) as u64;
-    let weights_cpu = file_bytes - weights_gpu;
+    // Tensors llama.cpp keeps on the host (Gemma's per-layer embeddings) are
+    // never offloaded: only the rest of the file is split by layer.
+    let host = host_weight_bytes(meta, file_bytes);
+    if host > 0 && offloaded > 0 {
+        notes.push(format!("{:.1} GB of per-layer embeddings stay in system RAM (llama.cpp keeps them on the CPU).", host as f64 / 1e9));
+    }
+    let weights_gpu = ((file_bytes - host) as f64 * gpu_frac) as u64;
+    let weights_cpu = file_bytes.saturating_sub(weights_gpu);
     let kv_gpu = if input.kv_offload { (kv_cache_bytes as f64 * gpu_frac) as u64 } else { 0 };
-    let kv_cpu = kv_cache_bytes - kv_gpu;
+    let kv_cpu = kv_cache_bytes.saturating_sub(kv_gpu);
     let uses_gpu = offloaded > 0;
     // The projector goes to the GPU whenever the model uses it, else to RAM.
     let projector_bytes = input.projector_bytes;
@@ -227,11 +271,12 @@ pub fn estimate(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput) ->
         notes.push("Includes the vision projector (mmproj), which llama.cpp keeps on the GPU.".into());
     }
     let (projector_gpu, projector_cpu) = if uses_gpu { (projector_bytes, 0) } else { (0, projector_bytes) };
-    let vram_bytes = if uses_gpu { weights_gpu + kv_gpu + compute_buffer_bytes + projector_gpu } else { 0 };
-    let ram_bytes = weights_cpu + kv_cpu + projector_cpu + if uses_gpu { 256 << 20 } else { compute_buffer_bytes };
+    let vram_bytes = if uses_gpu { weights_gpu.saturating_add(kv_gpu).saturating_add(compute_buffer_bytes).saturating_add(projector_gpu) } else { 0 };
+    let ram_bytes = weights_cpu.saturating_add(kv_cpu).saturating_add(projector_cpu).saturating_add(if uses_gpu { 256 << 20 } else { compute_buffer_bytes });
 
     MemoryEstimate {
         weights_bytes: file_bytes,
+        weights_ram_bytes: weights_cpu,
         kv_cache_bytes,
         compute_buffer_bytes,
         projector_bytes,
@@ -244,19 +289,22 @@ pub fn estimate(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput) ->
 }
 
 /// Largest GPU layer count whose estimated VRAM stays under `budget_bytes`.
+/// VRAM never drops as layers are added (0 layers use none), so this is a
+/// binary search: the same answer as trying 0, 1, 2, ... in order.
 pub fn max_gpu_layers_for_budget(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput, budget_bytes: u64) -> u64 {
-    let total = meta.block_count.unwrap_or(0) + 1;
-    let mut best = 0;
-    for n in 0..=total {
-        let mut i = input.clone();
-        i.gpu_layers = Some(n);
-        if estimate(meta, file_bytes, &i).vram_bytes <= budget_bytes {
-            best = n;
+    let total = blocks(meta) + 1;
+    let fits = |n: u64| estimate(meta, file_bytes, &EstimateInput { gpu_layers: Some(n), ..input.clone() }).vram_bytes <= budget_bytes;
+    // Invariant: `lo` fits (0 always does), everything above `hi` does not.
+    let (mut lo, mut hi) = (0u64, total);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
         } else {
-            break;
+            hi = mid - 1;
         }
     }
-    best
+    lo
 }
 
 /// What "Share with CPU" picks for a load.
@@ -271,6 +319,9 @@ pub struct ShareSplit {
     pub all_fit: bool,
     /// Estimated VRAM of the chosen split.
     pub vram_bytes: u64,
+    /// The weights part of `vram_bytes` (the rest of the weights is in RAM).
+    #[serde(default)]
+    pub weights_vram_bytes: u64,
     /// Plain description for the UI.
     pub summary: String,
 }
@@ -286,19 +337,28 @@ const MOE_EXPERT_SHARE: f64 = 0.85;
 /// runtime supports `--n-cpu-moe`.
 pub fn share_split(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput, free_vram: u64, has_n_cpu_moe: bool) -> ShareSplit {
     let budget = (free_vram as f64 * 0.90) as u64;
-    let total = meta.block_count.unwrap_or(0) + 1;
+    let total = blocks(meta) + 1;
     let mut all = input.clone();
     all.gpu_layers = None;
     let full = estimate(meta, file_bytes, &all);
+    let full_weights_vram = full.weights_bytes.saturating_sub(full.weights_ram_bytes);
     if full.vram_bytes <= budget {
-        return ShareSplit { gpu_layers: total, total_layers: total, n_cpu_moe: None, all_fit: true, vram_bytes: full.vram_bytes, summary: format!("All {total} layers fit on the GPU; nothing needs to run on the CPU.") };
+        return ShareSplit {
+            gpu_layers: total,
+            total_layers: total,
+            n_cpu_moe: None,
+            all_fit: true,
+            vram_bytes: full.vram_bytes,
+            weights_vram_bytes: full_weights_vram,
+            summary: format!("All {total} layers fit on the GPU; nothing needs to run on the CPU."),
+        };
     }
-    let blocks = meta.block_count.unwrap_or(0);
-    if meta.expert_count.unwrap_or(0) > 0 && has_n_cpu_moe && blocks > 0 {
-        let expert_per_layer = (file_bytes as f64 * MOE_EXPERT_SHARE / blocks as f64) as u64;
+    let n_blocks = blocks(meta);
+    if meta.expert_count.unwrap_or(0) > 0 && has_n_cpu_moe && n_blocks > 0 {
+        let expert_per_layer = (file_bytes as f64 * MOE_EXPERT_SHARE / n_blocks as f64) as u64;
         let over = full.vram_bytes - budget;
-        let n = over.div_ceil(expert_per_layer.max(1)).min(blocks);
-        let vram = full.vram_bytes.saturating_sub(n * expert_per_layer);
+        let n = over.div_ceil(expert_per_layer.max(1)).min(n_blocks);
+        let vram = full.vram_bytes.saturating_sub(n.saturating_mul(expert_per_layer));
         if vram <= budget {
             return ShareSplit {
                 gpu_layers: total,
@@ -306,6 +366,7 @@ pub fn share_split(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput,
                 n_cpu_moe: Some(n),
                 all_fit: false,
                 vram_bytes: vram,
+                weights_vram_bytes: full_weights_vram.saturating_sub(n.saturating_mul(expert_per_layer)),
                 summary: format!("All {total} layers on the GPU, with the expert weights of the first {n} on the CPU (mixture-of-experts model too big for free VRAM)."),
             };
         }
@@ -313,9 +374,10 @@ pub fn share_split(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput,
     let n = max_gpu_layers_for_budget(meta, file_bytes, input, budget);
     let mut chosen = input.clone();
     chosen.gpu_layers = Some(n);
-    let vram = estimate(meta, file_bytes, &chosen).vram_bytes;
+    let e = estimate(meta, file_bytes, &chosen);
     let summary = if n == 0 { "Nothing fits in free VRAM, so the model runs on the CPU.".to_string() } else { format!("{n} of {total} layers on the GPU, the rest on the CPU (model too big for free VRAM).") };
-    ShareSplit { gpu_layers: n, total_layers: total, n_cpu_moe: None, all_fit: false, vram_bytes: vram, summary }
+    let weights_vram_bytes = if e.vram_bytes == 0 { 0 } else { e.weights_bytes.saturating_sub(e.weights_ram_bytes) };
+    ShareSplit { gpu_layers: n, total_layers: total, n_cpu_moe: None, all_fit: false, vram_bytes: e.vram_bytes, weights_vram_bytes, summary }
 }
 
 /// Smallest context "Auto" ever picks (unless the model was trained on less).
@@ -336,10 +398,11 @@ pub fn ctx_steps(max: u64) -> Vec<u64> {
     let mut p = AUTO_CTX_MIN;
     while p <= max {
         v.push(p);
-        if p >= 4096 && p + p / 2 <= max {
+        if p >= 4096 && p.saturating_add(p / 2) <= max {
             v.push(p + p / 2);
         }
-        p *= 2;
+        let Some(next) = p.checked_mul(2) else { break };
+        p = next;
     }
     let top = max / 1024 * 1024;
     if top >= AUTO_CTX_MIN && !v.contains(&top) {
@@ -349,9 +412,31 @@ pub fn ctx_steps(max: u64) -> Vec<u64> {
     v
 }
 
+/// A device a linked PC lends for this load (its GPU, or its CPU's RAM).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LinkedDev {
+    /// Bytes this PC may put there: the free memory the helper reports,
+    /// already lowered to what its owner allows this PC.
+    pub bytes: u64,
+    /// The helper's CPU (RAM): layers there run on its CPU.
+    pub cpu: bool,
+}
+
+/// What a linked device adds to the budget at a context whose estimate has
+/// this compute buffer: 90% of what it lends, less the compute buffer every
+/// model device gets for itself. Never negative, so a linked PC never
+/// lowers the context.
+pub fn linked_net(dev: &LinkedDev, compute_buffer_bytes: u64) -> u64 {
+    ((dev.bytes as f64 * AUTO_HEADROOM) as u64).saturating_sub(compute_buffer_bytes)
+}
+
+fn linked_net_total(linked: &[LinkedDev], compute_buffer_bytes: u64) -> u64 {
+    linked.iter().map(|d| linked_net(d, compute_buffer_bytes)).fold(0u64, |a, b| a.saturating_add(b))
+}
+
 /// What the machine has right now, for [`auto_n_ctx`].
 #[derive(Debug, Clone, Copy)]
-pub struct AutoCtxEnv {
+pub struct AutoCtxEnv<'a> {
     /// Free VRAM on the GPU, None without a reading.
     pub free_vram: Option<u64>,
     pub available_ram: u64,
@@ -361,6 +446,8 @@ pub struct AutoCtxEnv {
     /// GPU offload is "Auto": llama.cpp moves layers to the CPU itself when
     /// the whole model cannot be on the GPU.
     pub auto_layers: bool,
+    /// Devices linked PCs lend for this load ("Use linked PCs"); empty = this PC alone.
+    pub linked: &'a [LinkedDev],
 }
 
 /// The context size "Auto (fits your hardware)" chose.
@@ -372,9 +459,26 @@ pub struct AutoCtx {
     /// trained | memory | minimum | no_gpu_info
     pub limited_by: String,
     /// False when even the minimum does not fit (the load warnings say more).
+    /// A mixture-of-experts model whose weights are paged from disk
+    /// (`pages_weights`) still fits: only the active experts are read per token.
     pub fits: bool,
+    /// The memory-mapped weights are bigger than the RAM left for them, so
+    /// Windows pages them from disk; the context was sized by the KV cache
+    /// and compute buffers alone ([`AutoCtxOpts::weights_may_page`]).
+    pub pages_weights: bool,
     /// Plain description for the UI.
     pub summary: String,
+}
+
+/// Options for [`auto_n_ctx_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AutoCtxOpts {
+    /// The weights are memory-mapped (not locked, not read into memory), so
+    /// when they alone are bigger than the RAM left for them they are paged
+    /// from the file instead of blocking every context: then the context is
+    /// sized by what depends on it (KV cache, compute buffers, projector), as
+    /// if the weights took whatever RAM is left.
+    pub weights_may_page: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -384,25 +488,68 @@ enum Budget {
     Shared,
 }
 
-fn fits_budget(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput, env: &AutoCtxEnv, budget: Budget) -> bool {
+/// One budget check: VRAM, and the RAM side split into memory-mapped
+/// weights and everything else.
+struct BudgetCheck {
+    vram_ok: bool,
+    ram_weights: u64,
+    ram_other: u64,
+    ram_budget: u64,
+}
+
+impl BudgetCheck {
+    fn fits(&self) -> bool {
+        self.vram_ok && self.ram_weights.saturating_add(self.ram_other) <= self.ram_budget
+    }
+    /// Fits when the weights may be paged: only the rest has to be in RAM.
+    fn fits_paged(&self) -> bool {
+        self.vram_ok && self.ram_other <= self.ram_budget
+    }
+}
+
+fn check_budget(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput, env: &AutoCtxEnv, budget: Budget) -> BudgetCheck {
     let ram_budget = (env.available_ram as f64 * AUTO_HEADROOM) as u64;
     let free = env.free_vram.unwrap_or(0);
     match budget {
         Budget::Ram | Budget::Gpu => {
             let e = estimate(meta, file_bytes, input);
-            e.vram_bytes <= (free as f64 * AUTO_HEADROOM) as u64 && e.ram_bytes <= ram_budget
+            let ram_weights = e.weights_ram_bytes.min(e.ram_bytes);
+            // Linked PCs: what they lend, less their own compute buffers.
+            let linked = if budget == Budget::Gpu { linked_net_total(env.linked, e.compute_buffer_bytes) } else { 0 };
+            let vram_budget = ((free as f64 * AUTO_HEADROOM) as u64).saturating_add(linked);
+            BudgetCheck { vram_ok: e.vram_bytes <= vram_budget, ram_weights, ram_other: e.ram_bytes - ram_weights, ram_budget }
         }
         Budget::Shared => {
             // Same split "Share with CPU" makes (VRAM filled to 90%); the rest
-            // has to fit in RAM.
+            // has to fit in RAM. Linked PCs hold layers before this PC's CPU
+            // does: their net capacity counts as more free VRAM.
             let mut all = input.clone();
             all.gpu_layers = None;
             let full = estimate(meta, file_bytes, &all);
-            let split = share_split(meta, file_bytes, &all, free, env.has_n_cpu_moe);
-            let in_ram = (full.weights_bytes + full.kv_cache_bytes + full.projector_bytes).saturating_sub(split.vram_bytes);
-            in_ram <= ram_budget
+            let linked = (linked_net_total(env.linked, full.compute_buffer_bytes) as f64 / AUTO_HEADROOM) as u64;
+            let split = share_split(meta, file_bytes, &all, free.saturating_add(linked), env.has_n_cpu_moe);
+            let in_ram = full.weights_bytes.saturating_add(full.kv_cache_bytes).saturating_add(full.projector_bytes).saturating_sub(split.vram_bytes);
+            let ram_weights = full.weights_bytes.saturating_sub(split.weights_vram_bytes).min(in_ram);
+            BudgetCheck { vram_ok: true, ram_weights, ram_other: in_ram - ram_weights, ram_budget }
         }
     }
+}
+
+fn fits_budget(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput, env: &AutoCtxEnv, budget: Budget) -> bool {
+    check_budget(meta, file_bytes, input, env, budget).fits()
+}
+
+/// `n` with thousands separators (131,072).
+pub fn fmt_tokens(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// "Auto" context: the largest step from [`ctx_steps`] that is no larger than
@@ -412,8 +559,18 @@ fn fits_budget(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput, env
 /// with CPU is on (or GPU offload is Auto and the model is too big for the
 /// GPU anyway); in available RAM for CPU-only loads. Never below
 /// [`AUTO_CTX_MIN`]: if even that does not fit, it is used anyway and
-/// `fits` is false. `input.n_ctx` is ignored.
+/// `fits` is false. `input.n_ctx` is ignored. Weights never page
+/// ([`auto_n_ctx_with`] with the default options).
 pub fn auto_n_ctx(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput, env: &AutoCtxEnv) -> AutoCtx {
+    auto_n_ctx_with(meta, file_bytes, input, env, AutoCtxOpts::default())
+}
+
+/// [`auto_n_ctx`] with options. With `weights_may_page`, when no step fits
+/// with the weights in RAM (the weights alone are too big), the largest step
+/// whose VRAM fits and whose RAM side without the weights fits is used:
+/// `pages_weights` is set, and `fits` is true only for mixture-of-experts
+/// models (a dense model reads every weight per token, so paging is very slow).
+pub fn auto_n_ctx_with(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput, env: &AutoCtxEnv, opts: AutoCtxOpts) -> AutoCtx {
     let trained = meta.context_length.filter(|&t| t > 0);
     let cap = trained.unwrap_or(AUTO_CTX_UNKNOWN_TRAINED);
     let floor = AUTO_CTX_MIN.min(cap).max(256);
@@ -423,17 +580,7 @@ pub fn auto_n_ctx(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput, 
     }
     let top = *steps.last().unwrap();
     let at = |n: u64| EstimateInput { n_ctx: n, ..input.clone() };
-    let fmt = |n: u64| {
-        let s = n.to_string();
-        let mut out = String::new();
-        for (i, c) in s.chars().enumerate() {
-            if i > 0 && (s.len() - i) % 3 == 0 {
-                out.push(',');
-            }
-            out.push(c);
-        }
-        out
-    };
+    let fmt = fmt_tokens;
     let trained_note = match trained {
         Some(t) => format!("trained: {}", fmt(t)),
         None => format!("trained context unknown, capped at {}", fmt(cap)),
@@ -446,9 +593,19 @@ pub fn auto_n_ctx(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput, 
             trained,
             limited_by: "no_gpu_info".into(),
             fits: true,
+            pages_weights: false,
             summary: format!("No GPU memory reading, so Auto uses {} tokens ({trained_note}).", fmt(n)),
         };
     }
+    // Linked PCs that lend more than a device's own compute buffer.
+    let linked = !env.linked.is_empty() && linked_net_total(env.linked, estimate(meta, file_bytes, &at(floor)).compute_buffer_bytes) > 0;
+    let where_ = |b: Budget| match b {
+        Budget::Ram => "90% of available RAM",
+        Budget::Gpu if linked => "free VRAM here plus memory lent by linked PCs",
+        Budget::Gpu => "90% of free VRAM",
+        Budget::Shared if linked => "free VRAM here plus memory lent by linked PCs, plus 90% of available RAM",
+        Budget::Shared => "free VRAM plus 90% of available RAM",
+    };
     // Budgets to try, best first: fully on the GPU before spilling to RAM.
     let budgets: Vec<Budget> = if !uses_gpu {
         vec![Budget::Ram]
@@ -459,31 +616,67 @@ pub fn auto_n_ctx(meta: &ModelMetadata, file_bytes: u64, input: &EstimateInput, 
     } else {
         vec![Budget::Gpu]
     };
+    // Paged sizing: only what depends on the context has to fit in RAM.
+    let moe = meta.expert_count.unwrap_or(0) > 0;
+    let paged = || -> Option<AutoCtx> {
+        for &b in &budgets {
+            if let Some(&n) = steps.iter().rev().find(|&&n| check_budget(meta, file_bytes, &at(n), env, b).fits_paged()) {
+                let limited_by = if n == top && trained.is_some() { "trained" } else { "memory" };
+                let summary = format!(
+                    "Largest size whose KV cache and buffers fit in {} ({trained_note}); the model is larger than free RAM, so Windows pages its weights from disk.",
+                    where_(b)
+                );
+                return Some(AutoCtx { n_ctx: n, trained, limited_by: limited_by.into(), fits: moe, pages_weights: true, summary });
+            }
+        }
+        None
+    };
+    // With linked PCs the context comes first (the owner's rule): every
+    // budget is tried and the largest context wins, so more lent memory can
+    // never switch Auto layers to a smaller all-GPU context.
+    let mut best: Option<AutoCtx> = None;
     for (bi, &b) in budgets.iter().enumerate() {
         // Auto layers: only fall back to a CPU split when not even the
         // minimum fits fully on the GPU.
-        if bi > 0 && fits_budget(meta, file_bytes, &at(floor), env, budgets[0]) {
+        if bi > 0 && !linked && fits_budget(meta, file_bytes, &at(floor), env, budgets[0]) {
             break;
         }
         if let Some(&n) = steps.iter().rev().find(|&&n| fits_budget(meta, file_bytes, &at(n), env, b)) {
-            let where_ = match b {
-                Budget::Ram => "90% of available RAM",
-                Budget::Gpu => "90% of free VRAM",
-                Budget::Shared => "free VRAM plus 90% of available RAM",
-            };
-            let (limited_by, summary) = if n == top && trained.is_some() {
-                ("trained", format!("The model's full trained context fits in {where_}."))
+            // A mixture-of-experts model pages its expert weights, so more free
+            // RAM must never give it a smaller context than paging would.
+            let a = if opts.weights_may_page && moe && let Some(p) = paged() && p.n_ctx > n {
+                p
             } else {
-                ("memory", format!("Largest size whose estimate fits in {where_} ({trained_note})."))
+                let w = where_(b);
+                let (limited_by, summary) = if n == top && trained.is_some() {
+                    ("trained", format!("The model's full trained context fits in {w}."))
+                } else {
+                    ("memory", format!("Largest size whose estimate fits in {w} ({trained_note})."))
+                };
+                AutoCtx { n_ctx: n, trained, limited_by: limited_by.into(), fits: true, pages_weights: false, summary }
             };
-            return AutoCtx { n_ctx: n, trained, limited_by: limited_by.into(), fits: true, summary };
+            if !linked {
+                return a;
+            }
+            if best.as_ref().is_none_or(|x| a.n_ctx > x.n_ctx) {
+                best = Some(a);
+            }
         }
+    }
+    if let Some(a) = best {
+        return a;
+    }
+    // The weights alone are too big for RAM: they are paged from the file,
+    // and the context is sized by the rest (never the minimum because of them).
+    if opts.weights_may_page && let Some(p) = paged() {
+        return p;
     }
     AutoCtx {
         n_ctx: floor,
         trained,
         limited_by: "minimum".into(),
         fits: false,
+        pages_weights: false,
         summary: format!("Even {} tokens may not fit in memory, so Auto uses the minimum; see the warnings.", fmt(floor)),
     }
 }
@@ -494,8 +687,8 @@ mod tests {
 
     const GIB: u64 = 1 << 30;
 
-    fn env(free_vram: u64, ram: u64) -> AutoCtxEnv {
-        AutoCtxEnv { free_vram: Some(free_vram), available_ram: ram, share_with_cpu: false, has_n_cpu_moe: true, auto_layers: false }
+    fn env(free_vram: u64, ram: u64) -> AutoCtxEnv<'static> {
+        AutoCtxEnv { free_vram: Some(free_vram), available_ram: ram, share_with_cpu: false, has_n_cpu_moe: true, auto_layers: false, linked: &[] }
     }
 
     fn trained(t: u64) -> ModelMetadata {
@@ -755,6 +948,88 @@ mod tests {
         assert_eq!(swa_cache_cells(512, 512, 512, 1), 512, "never more than n_ctx");
     }
 
+    /// Gemma-4-E4B's per-layer embedding table, read from the file's tensor list
+    /// (`per_layer_token_embd.weight`, [10752, 262144] Q6_K).
+    const GEMMA_PLE: u64 = 2_312_110_080;
+    const GEMMA_SIZE: u64 = 5_335_291_936;
+
+    #[test]
+    fn host_weights_stay_in_ram_and_gemma4_fits_fully_on_the_gpu() {
+        let old = gemma4_e4b();
+        let m = ModelMetadata { host_weight_bytes: Some(GEMMA_PLE), ..gemma4_e4b() };
+        let (a, b) = (estimate(&old, GEMMA_SIZE, &input(131_072)), estimate(&m, GEMMA_SIZE, &input(131_072)));
+        // The table moves from VRAM to RAM; the KV cache is unchanged.
+        assert_eq!(a.vram_bytes - b.vram_bytes, GEMMA_PLE);
+        assert_eq!(b.ram_bytes - a.ram_bytes, GEMMA_PLE);
+        assert_eq!(b.weights_ram_bytes, GEMMA_PLE);
+        assert_eq!(a.kv_cache_bytes, b.kv_cache_bytes);
+        assert!(b.notes.iter().any(|n| n.contains("per-layer embeddings")), "{:?}", b.notes);
+        // Measured: 43 layers on the GPU at -c 98304 used 5264 MiB in total; at 131072 the estimate is about 5.8 GB.
+        assert!(b.vram_bytes < 6_000_000_000, "{} bytes", b.vram_bytes);
+        // RTX 5060 with 7418 MiB free, Share with CPU off: the trained 131072 (was 49152).
+        let e = AutoCtxEnv { free_vram: Some(7418 * MIB), ..env(0, 21_797_000_000) };
+        assert_eq!(auto_n_ctx(&old, GEMMA_SIZE, &input(0), &e).n_ctx, 49_152, "the old estimate");
+        let x = auto_n_ctx(&m, GEMMA_SIZE, &input(0), &e);
+        assert_eq!((x.n_ctx, x.limited_by.as_str(), x.fits), (131_072, "trained", true), "{x:?}");
+        // Half the layers: the offloadable part is split, the table stays in RAM.
+        let half = estimate(&m, GEMMA_SIZE, &EstimateInput { gpu_layers: Some(21), ..input(8192) });
+        assert_eq!(half.weights_ram_bytes, GEMMA_SIZE - ((GEMMA_SIZE - GEMMA_PLE) as f64 * (21.0 / 43.0)) as u64);
+        // CPU only: everything in RAM either way.
+        let cpu = |mm: &ModelMetadata| estimate(mm, GEMMA_SIZE, &EstimateInput { gpu_layers: Some(0), ..input(8192) }).ram_bytes;
+        assert_eq!(cpu(&old), cpu(&m));
+        // A hostile value is capped at the file size.
+        let h = ModelMetadata { host_weight_bytes: Some(u64::MAX), ..gemma4_e4b() };
+        assert_eq!(estimate(&h, GEMMA_SIZE, &input(8192)).weights_ram_bytes, GEMMA_SIZE);
+    }
+
+    /// Cyber-Tiel-Coder-35B-A3B MTP Q5_K_XL header (qwen35moe, 41 blocks incl. 1 MTP layer).
+    fn qwen35moe_35b() -> ModelMetadata {
+        ModelMetadata {
+            architecture: Some("qwen35moe".into()),
+            block_count: Some(41),
+            context_length: Some(262_144),
+            embedding_length: Some(2048),
+            head_count: Some(16),
+            head_count_kv: Some(2),
+            key_length: Some(256),
+            value_length: Some(256),
+            expert_count: Some(256),
+            vocab_size: Some(248_320),
+            mtp_layers: Some(1),
+            mtp_layers_declared: Some(1),
+            full_attention_interval: Some(4),
+            ..Default::default()
+        }
+    }
+    const MOE_SIZE: u64 = 26_981_933_376;
+
+    #[test]
+    fn moe_bigger_than_ram_pages_its_weights_instead_of_the_minimum() {
+        let m = qwen35moe_35b();
+        let share = AutoCtxEnv { free_vram: Some(7418 * MIB), share_with_cpu: true, ..env(0, 21_797_000_000) };
+        // Without paging (auto_n_ctx, the pinned behaviour): the minimum.
+        let old = auto_n_ctx(&m, MOE_SIZE, &input(0), &share);
+        assert_eq!((old.n_ctx, old.limited_by.as_str(), old.fits), (AUTO_CTX_MIN, "minimum", false), "{old:?}");
+        let page = AutoCtxOpts { weights_may_page: true };
+        let a = auto_n_ctx_with(&m, MOE_SIZE, &input(0), &share, page);
+        assert!(a.n_ctx > AUTO_CTX_MIN && a.pages_weights && a.fits, "{a:?}");
+        assert!(a.summary.contains("pages its weights"), "{a:?}");
+        // Share off with GPU offload Auto: the same.
+        let auto_layers = AutoCtxEnv { share_with_cpu: false, auto_layers: true, ..share };
+        assert_eq!(auto_n_ctx_with(&m, MOE_SIZE, &input(0), &auto_layers, page).n_ctx, a.n_ctx);
+        // GPU only (all layers) cannot page VRAM: still the minimum.
+        let gpu = AutoCtxEnv { share_with_cpu: false, auto_layers: false, ..share };
+        assert_eq!(auto_n_ctx_with(&m, MOE_SIZE, &input(0), &gpu, page).limited_by, "minimum");
+        // A dense model that does not fit pages too, but is flagged.
+        let dense = ModelMetadata { expert_count: None, ..m.clone() };
+        let d = auto_n_ctx_with(&dense, MOE_SIZE, &input(0), &share, page);
+        assert!(d.pages_weights && !d.fits && d.n_ctx > AUTO_CTX_MIN, "{d:?}");
+        // Weights that fit: paging changes nothing.
+        let fits = auto_n_ctx(&trained(131_072), 16_000_000_000, &input(0), &AutoCtxEnv { share_with_cpu: true, ..env(8 * GIB, 32 * GIB) });
+        assert_eq!(auto_n_ctx_with(&trained(131_072), 16_000_000_000, &input(0), &AutoCtxEnv { share_with_cpu: true, ..env(8 * GIB, 32 * GIB) }, page), fits);
+        assert!(!fits.pages_weights);
+    }
+
     #[test]
     fn gemma4_auto_ctx_reaches_the_trained_context_when_sharing() {
         // 8 GiB card with 7 GiB free, 31.6 GB RAM, Share with CPU: was 98304, now trained.
@@ -778,6 +1053,19 @@ mod tests {
         assert_eq!(kv_layout(&old).global_layers, 17);
     }
 
+    #[test]
+    fn speculative_mtp_adds_one_full_attention_layer_of_kv() {
+        let m = qwen38_27b();
+        let on = ModelMetadata { mtp_speculative: true, ..m.clone() };
+        assert_eq!(kv_layout(&on).global_layers, 17);
+        let (a, b) = (estimate(&m, 1, &input(131_072)), estimate(&on, 1, &input(131_072)));
+        assert_eq!(b.kv_cache_bytes - a.kv_cache_bytes, 131_072 * 4096 + 0, "one layer x n_ctx x 4 KiB (recurrent part unchanged)");
+        assert!(b.notes.iter().any(|n| n.contains("Speculative MTP")), "{:?}", b.notes);
+        // No MTP tensors (mtp_layers None): the flag adds nothing.
+        let stripped = ModelMetadata { mtp_layers: None, mtp_layers_declared: Some(1), mtp_speculative: true, ..m };
+        assert_eq!(kv_layout(&stripped).global_layers, 16);
+    }
+
     /// Read-only check against real model files (headers only):
     /// `LAS_REAL_MODELS=<dir> cargo test -p model-registry real_kv_estimates -- --ignored --nocapture`
     #[test]
@@ -788,6 +1076,62 @@ mod tests {
             let l = kv_layout(&m.metadata);
             let kv = |n| estimate(&m.metadata, m.total_size, &input(n)).kv_cache_bytes / MIB;
             println!("{} [{:?}] {l:?}: KV f16 98304 = {} MiB, 131072 = {} MiB", m.display_name, m.metadata.architecture, kv(98_304), kv(131_072));
+        }
+    }
+
+    #[test]
+    fn hybrid_with_stripped_mtp_and_no_interval_key_skips_the_mtp_block() {
+        // 65 blocks, MTP declared (tensors stripped), no full_attention_interval key.
+        let m = ModelMetadata { mtp_layers: None, mtp_layers_declared: Some(1), full_attention_interval: None, ..qwen38_27b() };
+        assert_eq!(kv_layout(&m).global_layers, 16, "64 real layers / 4, the MTP block keeps no cache");
+        // A row with no MTP key at all keeps the earlier rounding.
+        let old = ModelMetadata { mtp_layers: None, mtp_layers_declared: None, full_attention_interval: None, ..qwen38_27b() };
+        assert_eq!(kv_layout(&old).global_layers, 17);
+    }
+
+    #[test]
+    fn hostile_header_values_neither_hang_nor_panic() {
+        let t = std::time::Instant::now();
+        // An old row with an absurd block count, a window and a pattern.
+        let m = ModelMetadata {
+            block_count: Some(u64::MAX),
+            sliding_window: Some(u64::MAX),
+            sliding_window_pattern: Some(6),
+            head_count: Some(u64::MAX),
+            head_count_kv: Some(u64::MAX),
+            key_length: Some(u64::MAX),
+            value_length: Some(u64::MAX),
+            embedding_length: Some(u64::MAX),
+            vocab_size: Some(u64::MAX),
+            context_length: Some(u64::MAX),
+            expert_count: Some(8),
+            ..meta()
+        };
+        let i = EstimateInput { n_ctx: u64::MAX, n_ubatch: u64::MAX, parallel: u64::MAX, projector_bytes: u64::MAX, ..input(0) };
+        let e = estimate(&m, u64::MAX, &i);
+        assert_eq!(e.total_layers, crate::gguf::MAX_BLOCK_COUNT + 1);
+        assert_eq!(swa_cache_cells(u64::MAX, u64::MAX, u64::MAX, u64::MAX), u64::MAX);
+        assert_eq!(swa_cache_cells(4096, u64::MAX, 512, 4), 4096, "never more than n_ctx");
+        let _ = share_split(&m, u64::MAX, &i, 8 * GIB, true);
+        let _ = max_gpu_layers_for_budget(&m, u64::MAX, &i, 8 * GIB);
+        let _ = auto_n_ctx(&m, u64::MAX, &i, &AutoCtxEnv { share_with_cpu: true, ..env(8 * GIB, 32 * GIB) });
+        assert!(!ctx_steps(u64::MAX).is_empty());
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn budget_search_matches_trying_every_count() {
+        for (size, ctx, budget) in [(4_900_000_000u64, 4096u64, 2 * GIB), (16_000_000_000, 32_768, 7 * GIB), (16_000_000_000, 8192, 0), (1, 2048, 64 * GIB)] {
+            let i = input(ctx);
+            let mut linear = 0;
+            for n in 0..=33 {
+                if estimate(&meta(), size, &EstimateInput { gpu_layers: Some(n), ..i.clone() }).vram_bytes <= budget {
+                    linear = n;
+                } else {
+                    break;
+                }
+            }
+            assert_eq!(max_gpu_layers_for_budget(&meta(), size, &i, budget), linear, "{size} {ctx} {budget}");
         }
     }
 

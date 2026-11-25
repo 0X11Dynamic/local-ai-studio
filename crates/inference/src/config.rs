@@ -93,6 +93,11 @@ pub struct LoadConfig {
     /// context it chose, so fitting can never trade context for layers
     /// (`-c` is passed explicitly as well).
     pub fit_ctx: Option<u32>,
+    /// Host-RAM prompt cache limit (`--cache-ram`, MiB; 0 = off). llama-server
+    /// keeps up to 8192 MiB of old prompts in RAM by default, outside every
+    /// estimate, so the app sets it from the RAM left after the load. None =
+    /// llama.cpp's default (also when the build lacks the flag).
+    pub cache_ram_mib: Option<u32>,
     /// KV cache type left to the app ("Auto"): for big caches on a model
     /// that is split with the CPU it picks q8_0 at load time
     /// (see `resolve_auto_kv` in the app). An explicit K/V choice turns this
@@ -101,8 +106,24 @@ pub struct LoadConfig {
     /// Speculative decoding type (`--spec-type`, e.g. "draft-mtp", which uses
     /// the model's own multi-token-prediction layers). None = off.
     pub speculative: Option<String>,
+    /// `speculative` was set by the app's default (the file has MTP layers),
+    /// not by the user: the app may turn it off for a load (when it would cost
+    /// context, or the backend fails to start with it). False in configs
+    /// saved before it existed and whenever the user changes the setting.
+    pub speculative_auto: bool,
     /// Most tokens drafted per step (`--spec-draft-n-max`); None = llama.cpp default (3).
     pub spec_draft_n_max: Option<u32>,
+    /// "Use linked PCs": split the layers with the linked PCs whose "Split
+    /// model layers with this PC" switch is on. The app resolves it at load
+    /// time into `rpc` and `tensor_split` (saved with the model's settings;
+    /// the two resolved fields are per load).
+    pub use_linked_pcs: bool,
+    /// `--rpc host:port,...`: the app's local tunnel endpoints (127.0.0.1)
+    /// to linked PCs' rpc-servers. Set by the app for one load.
+    pub rpc: Vec<String>,
+    /// `--tensor-split` proportions in `--list-devices` order, e.g. "7000,14000".
+    /// Set by the app with `rpc`.
+    pub tensor_split: Option<String>,
 }
 
 impl Default for LoadConfig {
@@ -129,9 +150,14 @@ impl Default for LoadConfig {
             n_cpu_moe: None,
             fit_target_mib: None,
             fit_ctx: None,
+            cache_ram_mib: None,
             cache_type_auto: false,
             speculative: None,
+            speculative_auto: false,
             spec_draft_n_max: None,
+            use_linked_pcs: false,
+            rpc: Vec::new(),
+            tensor_split: None,
         }
     }
 }
@@ -178,6 +204,19 @@ impl LoadConfig {
         }
         if self.spec_draft_n_max.is_some_and(|n| n == 0 || n > 64) {
             return Err("draft tokens per step must be between 1 and 64".into());
+        }
+        // Only the app's own loopback tunnel endpoints: rpc-server has no
+        // authentication, so a remote address here would bypass the tunnel.
+        if self.rpc.len() > 16 || !self.rpc.iter().all(|e| e.parse::<std::net::SocketAddr>().is_ok_and(|a| a.ip().is_loopback())) {
+            return Err("linked-PC endpoints must be the app's own 127.0.0.1 tunnel endpoints".into());
+        }
+        if !self.rpc.is_empty() && self.gpu_layers == GpuLayers::CpuOnly {
+            return Err("\"Use linked PCs\" needs GPU layers: layers on CPU only stay on this PC".into());
+        }
+        if let Some(ts) = &self.tensor_split
+            && (ts.is_empty() || ts.len() > 256 || !ts.split(',').all(|v| v.parse::<f64>().is_ok_and(|x| x >= 0.0)))
+        {
+            return Err(format!("bad tensor split {ts:?}"));
         }
         Ok(())
     }
@@ -287,6 +326,12 @@ impl LoadConfig {
         if let Some(n) = self.n_cpu_moe {
             push("--n-cpu-moe", Some(n.to_string()), "MoE experts on CPU", &mut a);
         }
+        if !self.rpc.is_empty() {
+            push("--rpc", Some(self.rpc.join(",")), "linked PCs", &mut a);
+            if let Some(ts) = &self.tensor_split {
+                push("--tensor-split", Some(ts.clone()), "layer split across PCs", &mut a);
+            }
+        }
         push("--parallel", Some(self.parallel.to_string()), "parallel slots", &mut a);
         if caps.has("--fit") {
             a.extend(["--fit".into(), if self.fit { "on" } else { "off" }.into()]);
@@ -298,6 +343,11 @@ impl LoadConfig {
             if let Some(n) = self.fit_ctx {
                 push("--fit-ctx", Some(n.to_string()), "smallest context for fitting", &mut a);
             }
+        }
+        if let Some(m) = self.cache_ram_mib
+            && caps.has("--cache-ram")
+        {
+            push("--cache-ram", Some(m.to_string()), "prompt cache RAM limit", &mut a);
         }
         if let Some(t) = &self.speculative {
             let all_known = t.split(',').all(|x| caps.has_spec_type(x));
@@ -443,6 +493,21 @@ mod tests {
     }
 
     #[test]
+    fn cache_ram_is_passed_only_when_set_and_supported() {
+        let with = LoadConfig { cache_ram_mib: Some(1536), ..Default::default() };
+        let help = format!("{NEW_HELP}-cram, --cache-ram N                   x\n");
+        let b = with.to_args(Path::new("m.gguf"), None, 1, &caps(&help));
+        assert_eq!(flag_value(&b.args, "--cache-ram"), Some("1536"));
+        let off = LoadConfig { cache_ram_mib: Some(0), ..Default::default() };
+        assert_eq!(flag_value(&off.to_args(Path::new("m.gguf"), None, 1, &caps(&help)).args, "--cache-ram"), Some("0"));
+        // A build without the flag: skipped, not reported as a failure.
+        let old = with.to_args(Path::new("m.gguf"), None, 1, &caps(NEW_HELP));
+        assert!(!old.args.iter().any(|a| a == "--cache-ram") && old.unsupported.is_empty());
+        // Unset: llama.cpp's default.
+        assert!(!LoadConfig::default().to_args(Path::new("m.gguf"), None, 1, &caps(&help)).args.iter().any(|a| a == "--cache-ram"));
+    }
+
+    #[test]
     fn speculative_decoding_flags_and_validation() {
         let cfg = LoadConfig { speculative: Some("draft-mtp".into()), spec_draft_n_max: Some(4), ..Default::default() };
         assert!(cfg.validate().is_ok());
@@ -460,7 +525,28 @@ mod tests {
         assert!(LoadConfig { fit_target_mib: Some(1 << 20), ..Default::default() }.validate().is_err());
         // Saved configs from before these fields: all off.
         let saved: LoadConfig = serde_json::from_str(r#"{"n_ctx": 4096}"#).unwrap();
-        assert!(saved.speculative.is_none() && saved.fit_target_mib.is_none() && !saved.cache_type_auto);
+        assert!(saved.speculative.is_none() && saved.fit_target_mib.is_none() && !saved.cache_type_auto && !saved.speculative_auto);
+    }
+
+    #[test]
+    fn linked_pcs_pass_rpc_and_tensor_split() {
+        let help = format!("{NEW_HELP}--rpc SERVERS                    x
+-ts,   --tensor-split N0,N1,N2,...  x
+");
+        let cfg = LoadConfig { use_linked_pcs: true, rpc: vec!["127.0.0.1:53110".into(), "127.0.0.1:53111".into()], tensor_split: Some("7000,14000,5750".into()), ..Default::default() };
+        assert!(cfg.validate().is_ok());
+        let b = cfg.to_args(Path::new("m.gguf"), None, 1, &caps(&help));
+        assert_eq!(flag_value(&b.args, "--rpc"), Some("127.0.0.1:53110,127.0.0.1:53111"));
+        assert_eq!(flag_value(&b.args, "--tensor-split"), Some("7000,14000,5750"));
+        // Not resolved (no endpoints): nothing passed.
+        let d = LoadConfig { use_linked_pcs: true, ..Default::default() }.to_args(Path::new("m.gguf"), None, 1, &caps(&help)).args;
+        assert!(!d.iter().any(|a| a == "--rpc" || a == "--tensor-split"));
+        // Never a remote rpc-server directly (no auth there), never CPU only.
+        assert!(LoadConfig { rpc: vec!["192.168.1.20:50052".into()], ..Default::default() }.validate().is_err());
+        assert!(LoadConfig { rpc: vec!["127.0.0.1:1".into()], gpu_layers: GpuLayers::CpuOnly, ..Default::default() }.validate().is_err());
+        assert!(LoadConfig { tensor_split: Some("1,x".into()), ..Default::default() }.validate().is_err());
+        let saved: LoadConfig = serde_json::from_str(r#"{"n_ctx": 4096}"#).unwrap();
+        assert!(!saved.use_linked_pcs && saved.rpc.is_empty() && saved.tensor_split.is_none());
     }
 
     #[test]

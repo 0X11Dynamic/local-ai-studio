@@ -42,6 +42,8 @@ export interface ChatSettings {
   agent_mode: boolean; tool_servers: string[]; limits: Limits; builtin_tools: boolean; environment_id: string | null; skills: boolean; tool_mode: string;
   /** "chat" | "plan" | "agent"; empty in older chats (then agent_mode decides). Plan = agent_mode + mode "plan". */
   mode?: string;
+  /** Offer web_search (Tools menu "Web search"); on unless false. */
+  web_search?: boolean;
   /** MCP server ids turned off for this chat only (Tools menu); servers added later stay on. */
   disabled_servers?: string[];
   /** Agent mode only: offer spawn_subagents (default off). */
@@ -52,6 +54,12 @@ export interface ChatSettings {
   thinking?: boolean | null;
   /** Reasoning effort level (only levels the loaded model lists are sent); null = default. */
   reasoning_effort?: string | null;
+  /** Tools menu "Load tool details on demand" (many tools: big servers listed by name, loaded when needed); on unless false. */
+  defer_tools?: boolean;
+  /** Tool ids the model loaded in this chat (grow-only; kept by the backend). */
+  loaded_tools?: string[];
+  /** Auto skills picked in this chat so far (sticky; kept by the backend). */
+  skill_picks?: string[];
 }
 export interface ConversationSummary { id: string; title: string; model_id: string | null; updated_at: string; message_count: number }
 export interface MessageStats {
@@ -149,6 +157,8 @@ export const api2 = {
   duplicateConversation: (id: string) => invoke<ConversationView>("duplicate_conversation", { id }),
   /** Also deletes the chat's hidden subagent run; lists git worktrees it had to keep. */
   deleteConversation: (id: string) => invoke<import("./api5").DeleteResult>("delete_conversation", { id }),
+  /** Up to 1000 chats; bad or missing ids come back in `failed`, the rest are still deleted. */
+  deleteConversations: (ids: string[]) => invoke<import("./api5").BulkDeleteResult>("delete_conversations", { ids }),
   updateChatSettings: (id: string, settings: ChatSettings) => invoke<void>("update_chat_settings", { id, settings }),
   /** Pending attachments go with it: `attachments` picks some by id, omitted = all. */
   chatSend: (id: string, content: string, attachments?: string[]) => invoke<SendStarted>("chat_send", { id, content, attachments }),

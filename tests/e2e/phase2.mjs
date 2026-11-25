@@ -305,6 +305,34 @@ await check("rename, duplicate, search, export and delete conversations", async 
   assert(!(await inv("list_conversations", {})).some((x) => x.id === dup.id), "not deleted");
 });
 
+await check("bulk delete chats (IPC), then select mode + confirm in the UI", async () => {
+  const mk = async (title) => { const c = await inv("create_conversation"); await inv("rename_conversation", { id: c.id, title }); return c.id; };
+  const [a, b, c] = [await mk("BulkDel A"), await mk("BulkDel B"), await mk("BulkDel C")];
+  const r = await inv("delete_conversations", { ids: [a, b, "not-a-real-id"] });
+  assert(r.deleted === 2 && r.failed.length === 1 && r.failed[0].id === "not-a-real-id", JSON.stringify(r));
+  assert(Array.isArray(r.removed_worktrees) && Array.isArray(r.kept_worktrees), "worktree lists missing");
+  const left = (await inv("list_conversations", {})).map((x) => x.id);
+  assert(!left.includes(a) && !left.includes(b) && left.includes(c), "wrong chats remain");
+  // UI: select mode, tick one chat, delete with the in-app confirm.
+  const d = await mk("BulkDel D");
+  await cdp.nav("Overview");
+  await cdp.nav("Chat");
+  await cdp.waitFor(`[...document.querySelectorAll('.chat-item')].some(b => b.innerText.includes('BulkDel D'))`, 10000);
+  await cdp.eval(`document.querySelector("button[aria-label='Select chats']").click()`);
+  await cdp.waitFor(`!!document.querySelector("input[aria-label='Select BulkDel D']")`, 5000, "select mode checkboxes");
+  await cdp.eval(`document.querySelector("input[aria-label='Select BulkDel D']").click()`);
+  await cdp.waitFor(`document.querySelector("button[aria-label='Delete selected chats']") && !document.querySelector("button[aria-label='Delete selected chats']").disabled`, 5000, "delete enabled");
+  await cdp.eval(`document.querySelector("button[aria-label='Delete selected chats']").click()`);
+  await cdp.waitFor(`!!document.querySelector("button[aria-label='Confirm delete chat']")`, 5000, "confirm dialog");
+  await cdp.eval(`document.querySelector("button[aria-label='Confirm delete chat']").click()`);
+  await cdp.waitFor(`!document.querySelector("button[aria-label='Confirm delete chat']")`, 10000, "confirm closed");
+  const after = (await inv("list_conversations", {})).map((x) => x.id);
+  assert(!after.includes(d), "UI delete did not remove the chat");
+  assert(after.includes(c), "unselected chat was removed");
+  await inv("delete_conversation", { id: c });
+  return "IPC: 2 deleted, 1 bad id reported; UI select + confirm deleted the chat";
+});
+
 await check("Markdown renders, raw HTML in a reply is not executed", async () => {
   const c = await inv("create_conversation");
   await inv("chat_send", { id: c.id, content: "Repeat exactly this text and nothing else: <img src=x onerror=alert(1)> **bold** and `code` /no_think" });

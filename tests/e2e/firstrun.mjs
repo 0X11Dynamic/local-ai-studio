@@ -2,7 +2,9 @@
 // runtimes folder (the other suites keep it closed). The recommended GPU
 // runtime starts installing by itself and is cancelled; the CPU runtime is
 // installed into the temp profile only; the starter download is started and
-// cancelled (into a temp models folder). Real data is never touched.
+// cancelled (into a temp models folder). The Storage step is used to point the
+// runtimes folder at a temp folder; the runtime must install there. Real data
+// is never touched.
 //   LAS_E2E_EXE=target/release/local-ai-studio.exe node tests/e2e/firstrun.mjs
 // Screenshots: %TEMP%\las-firstrun-shots (kept; the profile is deleted).
 import fs from "node:fs";
@@ -19,6 +21,7 @@ const realBefore = fs.existsSync(realRuntimes) ? fs.readdirSync(realRuntimes).so
 const run = path.join(process.env.TEMP, `las-firstrun-${Date.now()}`);
 const data = path.join(run, "profile");
 const models = path.join(run, "models");
+const runtimesChosen = path.join(run, "chosen-runtimes");
 fs.mkdirSync(path.join(data, "runtimes"), { recursive: true });
 fs.mkdirSync(models, { recursive: true });
 fs.mkdirSync(shots, { recursive: true });
@@ -38,15 +41,45 @@ try {
   await check("setup opens by itself on an empty profile", async () => {
     await cdp.waitFor("!!document.querySelector('[role=dialog].firstrun')", 15000, "setup dialog");
   });
-  // Keep downloads out of the real models folder.
-  await cdp.invoke("set_setting", { key: "library.models_dir", value: models });
-
   await check("hardware and GPU listed", async () => {
     await cdp.waitFor("document.querySelector('.firstrun')?.innerText.includes('1. This PC') && !!document.querySelector('.firstrun .kv')", 60000, "plan");
     const t = await cdp.text(".firstrun");
     assert(/RTX|GPU|No GPU/.test(t), t.slice(0, 300));
     const plan = await cdp.invoke("setup_plan");
     return `gpus=${plan.gpus.map((g) => g.name).join("|")} driver=${plan.driver?.status}:${plan.driver?.driver_version} rec=${plan.available.find((r) => r.recommended)?.id} starter_gpu=${plan.starter_gpu?.file} starter_cpu=${plan.starter_cpu.file}`;
+  });
+
+  await check("Storage step: defaults shown, nothing installs before it is confirmed", async () => {
+    await cdp.waitFor("!!document.querySelector('.firstrun [data-storage-step]')", 10000, "storage step");
+    const t = await cdp.text(".firstrun");
+    assert(t.includes("2. Storage") && t.includes("3. Runtime") && t.includes("4. A first model"), t.slice(0, 400));
+    await cdp.waitFor("!!document.querySelector('#setup-models')?.value && !!document.querySelector('#setup-runtimes')?.value", 10000, "default folders filled in");
+    const rt = await cdp.eval("document.querySelector('#setup-runtimes').value");
+    assert(rt.toLowerCase() === path.join(data, "runtimes").toLowerCase(), `isolated profile default: ${rt}`);
+    await cdp.waitFor("!!document.querySelector('.firstrun [data-storage-free]')", 10000, "free space shown");
+    const free = await cdp.text(".firstrun [data-storage-free]");
+    assert(/free on this drive/.test(free), free);
+    await sleep(1500);
+    assert(!(await cdp.eval("!!document.querySelector('.firstrun [data-installing]')")), "installed before confirming");
+    assert((await cdp.invoke("list_runtimes")).length === 0, "a runtime appeared");
+    return free.trim();
+  });
+
+  await check("invalid folders are rejected, valid ones saved", async () => {
+    await cdp.setValue("#setup-runtimes", "relative\\folder");
+    await cdp.waitFor("!!document.querySelector('.firstrun [data-storage-error]')", 10000, "error shown");
+    assert(await cdp.eval("[...document.querySelectorAll('.firstrun button')].find(b => b.innerText.startsWith('Use these folders')).disabled"), "button enabled for a bad path");
+    await cdp.setValue("#setup-models", models);
+    await cdp.setValue("#setup-runtimes", runtimesChosen);
+    await cdp.waitFor("!document.querySelector('.firstrun [data-storage-error]') && ![...document.querySelectorAll('.firstrun button')].find(b => b.innerText.startsWith('Use these folders')).disabled", 10000, "valid");
+    await cdp.clickButton("Use these folders", "document.querySelector('.firstrun')");
+    await cdp.waitFor("document.querySelector('.firstrun [data-storage-step]').dataset.storageConfirmed === '1'", 10000, "confirmed");
+    const st = await cdp.invoke("get_storage");
+    assert(st.runtimes.path.toLowerCase() === runtimesChosen.toLowerCase(), JSON.stringify(st.runtimes));
+    assert(st.models.path.toLowerCase() === models.toLowerCase(), JSON.stringify(st.models));
+    const saved = JSON.parse(fs.readFileSync(path.join(data, "storage.json"), "utf8"));
+    assert(saved.origin === "user" && saved.runtimes_dir.toLowerCase() === runtimesChosen.toLowerCase(), JSON.stringify(saved));
+    await cdp.screenshot(path.join(shots, "firstrun-0-storage.png"));
   });
 
   await check("recommended runtime starts installing by itself with progress", async () => {
@@ -67,6 +100,11 @@ try {
     await cdp.waitFor("document.querySelector('.firstrun').innerText.includes('Installed:')", 600000, "cpu runtime installed");
     const rs = await cdp.invoke("list_runtimes");
     assert(rs.length === 1 && rs[0].variant === "cpu", JSON.stringify(rs.map((r) => r.id)));
+    // It went to the folder chosen in the Storage step, not the default one.
+    assert(rs[0].server_path.toLowerCase().startsWith(runtimesChosen.toLowerCase()), rs[0].server_path);
+    assert(fs.existsSync(path.join(runtimesChosen, rs[0].id, "runtime.json")), "no manifest in the chosen folder");
+    const stray = fs.readdirSync(path.join(data, "runtimes")).filter((n) => !n.startsWith("."));
+    assert(stray.length === 0, `default runtimes folder not empty: ${stray}`);
     return rs[0].id;
   });
 

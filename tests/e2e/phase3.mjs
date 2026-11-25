@@ -272,7 +272,7 @@ await check("mcpServers import/export: secrets to the vault, placeholders on exp
   assert(/JSON/.test(badJson.message), badJson.message);
 });
 
-await check("Will's LM Studio mcp.json imports turned on (tools still ask) without changing the file", async () => {
+await check("An LM Studio mcp.json imports turned on (tools still ask) without changing the file", async () => {
   const lm = path.join(process.env.USERPROFILE, ".lmstudio", "mcp.json");
   if (!fs.existsSync(lm)) return "no LM Studio mcp.json on this PC (skipped)";
   const before = fs.readFileSync(lm, "utf8");
@@ -479,8 +479,17 @@ await check("Agent Mode preview lists exactly the exposed tools; built-in prompt
   const exposed = (await inv("preview_chat_tools", { toolServers: [] })).tools.map((t) => t.model_name).sort();
   const p = await inv("preview_instructions", { mode: "agent", sections: { mode: "raw", raw: "", identity: "", task: "", tool_use: "", formatting: "" }, base: null });
   // MCP tools plus the built-in shell and file tools (on by default since phase 4).
-  const listed = [...p.text.matchAll(/^- (\S+) \((?:server|built-in)/gm)].map((m) => m[1]).sort();
-  assert(JSON.stringify(listed) === JSON.stringify(exposed), `listed ${listed.length} vs exposed ${exposed.length}`);
+  // Native tool mode no longer repeats each tool's description in the prompt (the
+  // JSON tool definitions carry them); it states the count and which tools run
+  // without asking or need approval, with "server__*" patterns for whole servers.
+  const count = Number((p.text.match(/Your (\d+) tools/) || [])[1]);
+  assert(count === exposed.length, `prompt says ${count} tools vs exposed ${exposed.length}`);
+  assert(![...p.text.matchAll(/^- (\S+) \((?:server|built-in)/gm)].length, "per-tool list still in the native prompt");
+  const names = [...p.text.matchAll(/^(?:Run without asking|Ask the user for approval each time): (.+)$/gm)]
+    .flatMap((m) => m[1].replace(/\.$/, "").split(/,\s*/));
+  const covered = (t) => names.some((n) => (n.endsWith("*") ? t.startsWith(n.slice(0, -1)) : n === t));
+  const missing = exposed.filter((t) => !covered(t));
+  assert(!missing.length, `not in the permission lines: ${missing.join(", ")}`);
   assert(!p.text.includes("directory_tree"), "deny tool listed");
   const chat = await inv("preview_instructions", { mode: "chat", sections: { mode: "raw", raw: "", identity: "", task: "", tool_use: "", formatting: "" }, base: null });
   assert(!chat.text.includes("Available tools"), "chat mode lists tools");
@@ -488,7 +497,7 @@ await check("Agent Mode preview lists exactly the exposed tools; built-in prompt
   assert(settings.base.startsWith("You are the assistant inside Local AI Studio"), settings.base.slice(0, 60));
   const agent = (await inv("list_instruction_profiles")).find((x) => x.title.startsWith("Autonomous Agent"));
   assert(agent.sections.raw.startsWith("You are working in Agent Mode") && !agent.sections.raw.includes("shell.execute"), "agent template not updated");
-  return `${listed.length} tools listed, ${p.tokens} tokens`;
+  return `${count} tools covered by the permission lines, ${p.tokens} tokens`;
 });
 
 await check("UI: MCP Connections page shows servers, status and tools", async () => {

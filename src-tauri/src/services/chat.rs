@@ -45,6 +45,8 @@ pub struct ChatSettings {
     pub limits: Limits,
     /// Built-in shell and file tools in Agent Mode.
     pub builtin_tools: bool,
+    /// Offer web_search (the Tools menu's "Web search"); on by default.
+    pub web_search: bool,
     /// Where they run: an execution environment id (None = This PC).
     pub environment_id: Option<String>,
     /// Add matching skills to the instruction in Agent Mode.
@@ -63,6 +65,71 @@ pub struct ChatSettings {
     pub thinking: Option<bool>,
     /// Reasoning effort level for models that offer levels (None = default).
     pub reasoning_effort: Option<String>,
+    /// Tools menu "Load tool details on demand": with many tools (a server
+    /// over 30, or over 60 in all), big servers' tools are listed by name and
+    /// the model loads the definitions it needs (`load_tools`). On by default.
+    pub defer_tools: bool,
+    /// Tool ids the model loaded in this chat (deferred loading), in load
+    /// order. Only grows, so the prompt stays the same from message to message.
+    pub loaded_tools: Vec<String>,
+    /// Auto skills picked so far in this chat, in pick order. Sticky: a
+    /// skill stays once picked, so the instruction does not change between
+    /// messages (which would make the model re-read the whole prompt).
+    pub skill_picks: Vec<String>,
+}
+
+/// Most auto skills one chat collects (the section is capped in size too).
+pub const MAX_STICKY_SKILLS: usize = 5;
+
+/// `base` plus the items of `add` it does not have yet (order kept).
+fn union(base: &mut Vec<String>, add: &[String]) {
+    for a in add {
+        if !base.contains(a) {
+            base.push(a.clone());
+        }
+    }
+}
+
+/// Serializes chat-settings writes, so a background save of loaded tools and
+/// a settings change from the UI never overwrite each other.
+static SETTINGS_WRITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Save a chat's settings. The grow-only lists (`loaded_tools`,
+/// `skill_picks`) are merged with what is stored, never shortened: the UI
+/// may hold an older copy.
+pub async fn save_settings(st: &SharedState, id: &str, model_id: Option<&str>, settings: &ChatSettings) -> AppResult<()> {
+    let _g = SETTINGS_WRITE.lock().await;
+    let mut s = settings.clone();
+    if let Ok(cur) = st.db.get_conversation(id).await {
+        let cur = settings_of(&cur);
+        let mut loaded = cur.loaded_tools;
+        union(&mut loaded, &s.loaded_tools);
+        let mut picks = cur.skill_picks;
+        union(&mut picks, &s.skill_picks);
+        s.loaded_tools = loaded;
+        s.skill_picks = picks;
+    }
+    // Names of skills that were deleted or turned off do not stay in the list
+    // (they would use up the cap of `MAX_STICKY_SKILLS`).
+    if let Ok(rows) = st.db.list_skills().await {
+        prune_picks(&mut s.skill_picks, |n| rows.iter().any(|r| r.name == n && r.mode != "off"));
+    }
+    st.db.update_conversation_settings(id, model_id, &serde_json::to_value(&s)?).await
+}
+
+/// Keep the picks that `alive` accepts, at most `MAX_STICKY_SKILLS` (order kept).
+fn prune_picks(picks: &mut Vec<String>, alive: impl Fn(&str) -> bool) {
+    picks.retain(|n| alive(n));
+    picks.truncate(MAX_STICKY_SKILLS);
+}
+
+/// Add tool ids / skill names to a chat's grow-only lists.
+pub async fn add_settings_lists(st: &SharedState, id: &str, tools: &[String], skills: &[String]) -> AppResult<()> {
+    let _g = SETTINGS_WRITE.lock().await;
+    let mut s = settings_of(&st.db.get_conversation(id).await?);
+    union(&mut s.loaded_tools, tools);
+    union(&mut s.skill_picks, skills);
+    st.db.update_conversation_settings(id, None, &serde_json::to_value(&s)?).await
 }
 
 impl ChatSettings {
@@ -84,18 +151,24 @@ impl ChatSettings {
 /// Never the app's agent tools (spawn_subagents, skill_propose_edit).
 /// "Reads + web + asked commands": the built-in fs_list, fs_read and
 /// fs_search (normal rules: outside the allowed folders they ask), web_fetch,
+/// web_search,
 /// and shell_execute (which `plan_filter` turns into ask-every-time); MCP
 /// tools only when set to "runs without asking" AND marked read-only by the
 /// server (the hint only narrows, never widens). Never the writes, moves,
 /// deletes or the app's agent tools (spawn_subagents, skill_propose_edit).
 pub fn is_plan_tool(t: &ExposedTool, mcp_read_only: bool) -> bool {
     if t.server_id.starts_with(agent_runtime::BUILTIN_PREFIX) {
-        return matches!(t.tool_name.as_str(), "fs_list" | "fs_read" | "fs_search" | "web_fetch" | "shell_execute");
+        return matches!(t.tool_name.as_str(), "fs_list" | "fs_read" | "fs_search" | "web_fetch" | "web_search" | "shell_execute");
     }
     if t.server_id.starts_with(mcp::AGENT_PREFIX) {
         return false;
     }
     t.policy == security::policy::Policy::Allow && mcp_read_only
+}
+
+/// The built-in web_search tool (any environment).
+pub fn is_web_search(t: &ExposedTool) -> bool {
+    t.server_id.starts_with(agent_runtime::BUILTIN_PREFIX) && t.tool_name == "web_search"
 }
 
 /// Keep only the tools Plan mode allows (see `is_plan_tool`). The shell is
@@ -136,6 +209,7 @@ impl Default for ChatSettings {
             disabled_servers: vec![],
             limits: Limits::default(),
             builtin_tools: true,
+            web_search: true,
             environment_id: None,
             skills: true,
             tool_mode: "auto".into(),
@@ -144,6 +218,9 @@ impl Default for ChatSettings {
             max_subagents: 2,
             thinking: None,
             reasoning_effort: None,
+            defer_tools: true,
+            loaded_tools: vec![],
+            skill_picks: vec![],
         }
     }
 }
@@ -317,36 +394,70 @@ pub struct Prepared {
     pub skills_text: Option<String>,
     /// Subagents allowed: the instruction base the children share (no tools section).
     pub subagent_prompt: Option<String>,
+    /// The chat's sticky skill set after this message (save it in the settings).
+    pub skill_picks: Vec<String>,
+    /// Deferred tool loading for this chat (None = every tool sent in full).
+    pub offer: Option<std::sync::Arc<agent_runtime::ToolOffer>>,
 }
 
 fn template_supports_tools(st: &SharedState) -> bool {
     st.engine.status().props.as_ref().map(|p| p.raw["chat_template_caps"]["supports_tool_calls"].as_bool().unwrap_or(false)).unwrap_or(false)
 }
 
+fn xml_mode(st: &SharedState, s: &ChatSettings) -> bool {
+    s.agent_mode && (s.tool_mode == "xml" || (s.tool_mode != "native" && !template_supports_tools(st)))
+}
+
 /// `latest`: the message about to be sent (or the draft), for skill matching.
 pub async fn prepare(st: &SharedState, conv: &ConversationRow, model_id: Option<&str>, latest: Option<&str>) -> AppResult<Prepared> {
+    prepare_with(st, conv, model_id, latest, false).await
+}
+
+/// `meter`: for the context meter (called on every typing pause): skills are
+/// matched against what is in the database, without re-reading the skills
+/// folder (a send does that).
+async fn prepare_with(st: &SharedState, conv: &ConversationRow, model_id: Option<&str>, latest: Option<&str>, meter: bool) -> AppResult<Prepared> {
     let s = settings_of(conv);
-    let xml = s.agent_mode && (s.tool_mode == "xml" || (s.tool_mode != "native" && !template_supports_tools(st)));
+    let xml = xml_mode(st, &s);
     let base = st.db.get_setting::<String>("instructions.base").await?.unwrap_or_default();
     let resolved = instructions::resolve_profile_mode(&st.db, s.profile_id.as_deref(), model_id, s.effective_mode()).await?;
     let sections = resolved.as_ref().map(|(_, p)| instructions::sections_of(p)).unwrap_or_default();
-    let (tools, mut section) = if s.agent_mode {
-        let (t, sec) = agent_tools(st, &s).await?;
-        (t, Some(sec))
+    let (tools, mut section, offer) = if s.agent_mode {
+        let (t, sec, offer) = agent_tools_with(st, &s, xml).await?;
+        let offer = if meter {
+            // The meter runs on every typing pause: it reads the registered
+            // offer and never registers, replaces or removes one.
+            offer.map(|o| crate::services::tool_offer::peek(&crate::services::tool_offer::chat_key(&conv.id), o))
+        } else {
+            // Registered for the chat: the reply's loop and load_tools use it.
+            let offer = offer.map(|o| crate::services::tool_offer::install_for_chat(st, &conv.id, o));
+            if offer.is_none() {
+                crate::services::tool_offer::remove(&crate::services::tool_offer::chat_key(&conv.id));
+            }
+            offer
+        };
+        (t, Some(sec), offer)
     } else {
-        (vec![], None)
+        (vec![], None, None)
     };
     let mut skills_text = None;
+    let mut skill_picks = s.skill_picks.clone();
     if s.agent_mode && s.skills {
-        // Match on the newest user message (or the one being sent).
+        // Match on the newest user message (or the one being sent), and keep
+        // every skill picked earlier in this chat (sticky: the instruction
+        // only grows, so the model's prompt cache stays valid).
         let text = match latest.filter(|l| !l.trim().is_empty()) {
             Some(l) => l.to_string(),
             None => st.db.list_messages(&conv.id).await?.iter().rev().find(|m| m.role == "user").map(|m| m.content.clone()).unwrap_or_default(),
         };
-        if !text.is_empty() {
-            let picked = crate::services::skills::pick(st, &text, "auto", &[]).await?;
-            skills_text = crate::services::skills::section(st, &picked).await?;
-        }
+        let picked = if text.is_empty() { vec![] } else { crate::services::skills::pick_opts(st, &text, "auto", &[], !meter).await? };
+        let picked = sticky_skills(&mut skill_picks, &picked);
+        // Only skills that still exist and are on count against the cap; the
+        // saved set drops the others.
+        let mut live = crate::services::skills::usable(st, &picked).await?;
+        live.truncate(MAX_STICKY_SKILLS);
+        skill_picks = live.iter().map(|m| m.name.clone()).collect();
+        skills_text = crate::services::skills::section(st, &live).await?;
     }
     if let Some(sec) = section.as_mut() {
         if let Some(sk) = &skills_text {
@@ -360,16 +471,46 @@ pub async fn prepare(st: &SharedState, conv: &ConversationRow, model_id: Option<
     }
     let (system, _) = instructions::compose(&base, &sections, if s.agent_mode { "agent" } else { "chat" }, section.as_deref());
     let subagent_prompt = if tools.iter().any(is_spawn_tool) { Some(subagent_prompt(st, &s, &base, &sections, skills_text.as_deref(), xml).await?) } else { None };
+    // What the loop sends (`agent_loop::turn` builds the same list per step).
+    let tool_defs = match (&offer, xml) {
+        (_, true) => serde_json::Value::Null,
+        (Some(o), false) => agent_runtime::openai_tools(&o.sent(&tools)),
+        (None, false) => agent_runtime::openai_tools(&tools),
+    };
     Ok(Prepared {
         system,
         profile: resolved.map(|(r, _)| r),
-        tool_defs: if xml { serde_json::Value::Null } else { agent_runtime::openai_tools(&tools) },
+        tool_defs,
         tools,
         agent: s.agent_mode,
         xml,
         skills_text,
         subagent_prompt,
+        skill_picks,
+        offer,
     })
+}
+
+/// Add the newly matched skills to the chat's sticky set (never removing
+/// one, at most `MAX_STICKY_SKILLS` names), and return the set in pick order.
+/// Matches that did not fit follow the set: names in `picks` may be skills
+/// that were deleted or turned off, so the caller drops those (see
+/// `skills::usable`) and applies the cap to the skills that are left. The
+/// match reason is not used: it stays out of the prompt (it changes with
+/// every message's wording).
+fn sticky_skills(picks: &mut Vec<String>, matched: &[skills::Match]) -> Vec<skills::Match> {
+    let mut over: Vec<String> = vec![];
+    for m in matched {
+        if picks.contains(&m.name) || over.contains(&m.name) {
+            continue;
+        }
+        if picks.len() < MAX_STICKY_SKILLS {
+            picks.push(m.name.clone());
+        } else {
+            over.push(m.name.clone());
+        }
+    }
+    picks.iter().chain(over.iter()).map(|n| skills::Match { name: n.clone(), score: 0, reason: String::new() }).collect()
 }
 
 // ---------- subagents in chat ----------
@@ -414,16 +555,28 @@ async fn subagent_prompt(st: &SharedState, s: &ChatSettings, base: &str, section
 /// Everything Agent Mode offers this chat: built-in tools for its execution
 /// environment, then MCP tools, and the generated prompt section.
 pub async fn agent_tools(st: &SharedState, s: &ChatSettings) -> AppResult<(Vec<ExposedTool>, String)> {
+    let (t, sec, _) = agent_tools_with(st, s, xml_mode(st, s)).await?;
+    Ok((t, sec))
+}
+
+/// `agent_tools` for a tool format, with the deferred-loading offer (not
+/// registered yet) when the chat's tools are deferred.
+pub async fn agent_tools_with(st: &SharedState, s: &ChatSettings, xml: bool) -> AppResult<(Vec<ExposedTool>, String, Option<agent_runtime::ToolOffer>)> {
     let mut tools = vec![];
     let mut env_section = None;
-    if s.builtin_tools {
+    // Web search runs in the app, not in the environment: it follows its own
+    // switch (Tools menu "Web search"), whether or not the built-in shell and
+    // file tools are on.
+    if s.builtin_tools || s.web_search {
         let env_id = s.environment_id.clone().unwrap_or_else(|| exec::LOCAL_ID.to_string());
         let (t, sec) = exec::exposed(st, &env_id).await.map_err(|e| match e {
             AppError::NotFound(_) => AppError::NotFound("this chat's execution environment was removed; pick another in Chat settings".into()),
             e => e,
         })?;
-        tools.extend(t);
-        env_section = Some(sec);
+        tools.extend(t.into_iter().filter(|t| if is_web_search(t) { s.web_search } else { s.builtin_tools }));
+        if s.builtin_tools {
+            env_section = Some(sec);
+        }
     }
     // Servers turned off for this chat (Tools menu) are left out.
     tools.extend(mcp::exposed_tools(st, &s.tool_servers).await?.into_iter().filter(|t| !s.disabled_servers.contains(&t.server_id)));
@@ -432,7 +585,9 @@ pub async fn agent_tools(st: &SharedState, s: &ChatSettings) -> AppResult<(Vec<E
         tools = plan_filter(st, tools);
     }
     let subagents = !plan && offer_subagent_tool(&mut tools, s);
-    let mut section = agent_runtime::tools_section(&tools, &s.limits);
+    let offer = crate::services::tool_offer::plan(&mut tools, s.defer_tools, &s.loaded_tools, xml, "chat");
+    let mode = if xml { agent_runtime::ToolMode::Xml } else { agent_runtime::ToolMode::Native };
+    let mut section = agent_runtime::tools_prompt(&tools, &s.limits, mode, offer.as_ref());
     if plan {
         section = format!("{section}\n\n{}", instructions::PLAN_RULES);
     }
@@ -444,7 +599,7 @@ pub async fn agent_tools(st: &SharedState, s: &ChatSettings) -> AppResult<(Vec<E
 
 {e}");
     }
-    Ok((tools, section))
+    Ok((tools, section, offer))
 }
 
 /// History as OpenAI messages. In Agent Mode assistant tool calls and their
@@ -555,49 +710,178 @@ async fn attachment_tokens(st: &SharedState, client: &LlamaClient, att: &AttachC
     Ok(n)
 }
 
+/// The part of a context report that does not depend on the draft: the
+/// prompt (system + tools + history) counted once, then reused while the
+/// user types. Keyed by a hash of everything that goes into it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MeterBase {
+    key: u64,
+    /// Template-rendered tokens of system + tools + history (no draft).
+    total: u64,
+    system: u64,
+    history: u64,
+    tools: u64,
+    skills: u64,
+    /// History attachments (and the untrusted-data rule when there are any).
+    attachments: u64,
+    has_attachments: bool,
+    messages: usize,
+}
+
+/// Per conversation: the last base counted.
+static METER: std::sync::LazyLock<Mutex<std::collections::HashMap<String, MeterBase>>> = std::sync::LazyLock::new(Default::default);
+/// Per backend port + model: template tokens a user turn adds around its text.
+static TURN_OVERHEAD: std::sync::LazyLock<Mutex<std::collections::HashMap<(u16, String), u64>>> = std::sync::LazyLock::new(Default::default);
+
+fn port_of(client: &LlamaClient) -> u16 {
+    client.base_url().rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(0)
+}
+
+/// Hash of everything the draft-free prompt is built from.
+fn meter_key(port: u16, model_id: &str, p: &Prepared, defs: &str, msgs: &[MessageRow], media: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    (port, model_id, &p.system, defs, p.agent, p.xml, media, p.skills_text.as_deref()).hash(&mut h);
+    for m in msgs {
+        (&m.id, &m.role, &m.content, &m.tool_calls, &m.tool_call_id, &m.stats, &m.attachments).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Tokens of the tool definitions, counted per source (built-in tools, web
+/// search, each MCP server, the app's agent tools) like the Tools menu's
+/// `chat_tool_costs`, so both share the token cache.
+async fn tool_def_tokens(st: &SharedState, client: &LlamaClient, sent: &[ExposedTool]) -> AppResult<u64> {
+    let mut groups: Vec<(String, Vec<ExposedTool>)> = vec![];
+    for t in sent {
+        let g = if is_web_search(t) {
+            "web_search".to_string()
+        } else if t.server_id.starts_with(agent_runtime::BUILTIN_PREFIX) {
+            "builtin".to_string()
+        } else {
+            t.server_id.clone()
+        };
+        match groups.iter_mut().find(|(k, _)| *k == g) {
+            Some((_, v)) => v.push(t.clone()),
+            None => groups.push((g, vec![t.clone()])),
+        }
+    }
+    let mut n = 0;
+    for (_, g) in groups {
+        n += count(st, client, &agent_runtime::openai_tools(&g).to_string()).await?;
+    }
+    Ok(n)
+}
+
+/// Template tokens around one more user message (role markers), measured
+/// once per model; 8 when the template can't render the probe.
+async fn user_turn_overhead(st: &SharedState, client: &LlamaClient, model_id: &str) -> u64 {
+    let k = (port_of(client), model_id.to_string());
+    if let Some(n) = TURN_OVERHEAD.lock().unwrap().get(&k) {
+        return *n;
+    }
+    let two = [serde_json::json!({ "role": "user", "content": "x" }), serde_json::json!({ "role": "assistant", "content": "y" })];
+    let three = [two[0].clone(), two[1].clone(), serde_json::json!({ "role": "user", "content": "x" })];
+    let n = match (prompt_tokens(client, &two, None).await, prompt_tokens(client, &three, None).await, count(st, client, "x").await) {
+        (Ok(a), Ok(b), Ok(x)) if b > a => (b - a).saturating_sub(x),
+        _ => 8,
+    };
+    TURN_OVERHEAD.lock().unwrap().insert(k, n);
+    n
+}
+
+/// Draft-free part of the report, from the cache when nothing changed.
+async fn meter_base(st: &SharedState, client: &LlamaClient, conversation_id: &str, key: u64, p: &Prepared, msgs: &[MessageRow], ms: Option<&attachments::MediaSupport>) -> AppResult<MeterBase> {
+    if let Some(b) = METER.lock().unwrap().get(conversation_id).filter(|b| b.key == key) {
+        return Ok(*b);
+    }
+    // Counting only: image/audio bytes aren't read (they are estimated).
+    // History attachments are read only here, on a miss.
+    let att = AttachCtx { by_msg: attachments::load_history(st, msgs, ms, false).await, draft: vec![] };
+    let api = to_api_att(&p.system, msgs, None, p.agent, p.xml, &att);
+    let with_tools = !p.tools.is_empty() && !p.xml;
+    let total = prompt_tokens(client, &api, with_tools.then_some(&p.tool_defs)).await?;
+    let tools = if with_tools {
+        match &p.offer {
+            Some(o) => tool_def_tokens(st, client, &o.sent(&p.tools)).await?,
+            None => tool_def_tokens(st, client, &p.tools).await?,
+        }
+    } else {
+        0
+    };
+    let mut history = 0;
+    for m in msgs.iter().filter(|m| matches!(m.role.as_str(), "user" | "assistant") || (p.agent && m.role == "tool")) {
+        history += count(st, client, &m.content).await?;
+    }
+    let b = MeterBase {
+        key,
+        total,
+        system: count(st, client, &p.system).await?,
+        history,
+        tools,
+        skills: match &p.skills_text {
+            Some(t) => count(st, client, t).await?,
+            None => 0,
+        },
+        attachments: attachment_tokens(st, client, &att).await?,
+        has_attachments: att.any(),
+        messages: api.len(),
+    };
+    let mut m = METER.lock().unwrap();
+    if m.len() > 64 {
+        m.clear();
+    }
+    m.insert(conversation_id.to_string(), b);
+    Ok(b)
+}
+
+/// Context use for the composer's meter (called after each typing pause).
+/// The system + tools + history part is counted once and cached by a hash
+/// of its inputs; each pause only counts the draft and its attachments.
 pub async fn context_report(st: &SharedState, conversation_id: &str, draft: &str) -> AppResult<ContextReport> {
     let (client, model_id, n_ctx, supports_tools) = loaded(st)?;
     let conv = st.db.get_conversation(conversation_id).await?;
     let msgs = st.db.list_messages(conversation_id).await?;
-    let p = prepare(st, &conv, Some(&model_id), Some(draft)).await?;
+    let p = prepare_with(st, &conv, Some(&model_id), Some(draft), true).await?;
     let ms = attachments::media_support(st).await;
+    let media = ms.as_ref().map(|m| serde_json::to_string(m).unwrap_or_default()).unwrap_or_default();
+    let defs = if p.xml { String::new() } else { p.tool_defs.to_string() };
+    let key = meter_key(port_of(&client), &model_id, &p, &defs, &msgs, &media);
+    let base = meter_base(st, &client, conversation_id, key, &p, &msgs, ms.as_ref()).await?;
+    // The draft and the attachments waiting on the composer.
     let pending = attachments::pending(st, conversation_id);
-    // Counting only: image/audio bytes aren't read (they are estimated).
-    let att = AttachCtx { by_msg: attachments::load_history(st, &msgs, ms.as_ref(), false).await, draft: attachments::load(st, conversation_id, &pending, ms.as_ref(), false).await };
-    let api = to_api_att(&p.system, &msgs, Some(draft), p.agent, p.xml, &att);
-    let with_tools = !p.tools.is_empty() && !p.xml;
-    let total = prompt_tokens(&client, &api, with_tools.then_some(&p.tool_defs)).await?;
-    let tools_t = if with_tools { total.saturating_sub(prompt_tokens(&client, &api, None).await?) } else { 0 };
-    let sys_t = count(st, &client, &p.system).await?;
-    let mut hist = 0;
-    for m in msgs.iter().filter(|m| matches!(m.role.as_str(), "user" | "assistant") || (p.agent && m.role == "tool")) {
-        hist += count(st, &client, &m.content).await?;
+    let draft_att = AttachCtx { by_msg: Default::default(), draft: attachments::load(st, conversation_id, &pending, ms.as_ref(), false).await };
+    let mut att_t = base.attachments;
+    if !draft_att.draft.is_empty() {
+        // attachment_tokens adds the rule; it is already counted when the history has attachments.
+        att_t += attachment_tokens(st, &client, &draft_att).await?;
+        if base.has_attachments {
+            att_t = att_t.saturating_sub(count(st, &client, attachments::RULE).await?);
+        }
     }
     let draft_t = count(st, &client, draft).await?;
-    let att_t = attachment_tokens(st, &client, &att).await?;
+    let new_turn = !draft.is_empty() || !draft_att.draft.is_empty();
+    let turn_t = if new_turn { user_turn_overhead(st, &client, &model_id).await } else { 0 };
+    let total = base.total + draft_t + (att_t - base.attachments) + turn_t;
     let s = settings_of(&conv);
     let reserved = s.sampling.max_tokens.unwrap_or(s.reserve_tokens) as u64;
     let remaining = n_ctx as i64 - total as i64 - reserved as i64;
     Ok(ContextReport {
         n_ctx,
         total,
-        system: sys_t,
-        history: hist,
+        system: base.system,
+        history: base.history,
         draft: draft_t,
-        template: total.saturating_sub(sys_t + hist + draft_t + tools_t + att_t),
-        tools: tools_t,
-        skills: match &p.skills_text {
-            Some(t) => count(st, &client, t).await?,
-            None => 0,
-        },
+        template: total.saturating_sub(base.system + base.history + draft_t + base.tools + att_t),
+        tools: base.tools,
+        skills: base.skills,
         reserved,
         remaining,
         fits: remaining >= 0,
         profile: p.profile,
-        messages_counted: api.len(),
+        messages_counted: base.messages + usize::from(new_turn),
         agent_mode: p.agent,
         tool_count: p.tools.len(),
-        tools_warning: n_ctx > 0 && tools_t * 4 > n_ctx,
+        tools_warning: n_ctx > 0 && base.tools * 4 > n_ctx,
         supports_tools,
         attachments: att_t,
         pending_attachments: pending.len(),
@@ -716,7 +1000,13 @@ pub async fn send_with(app: AppHandle, st: SharedState, conversation_id: String,
         }
         st.db.rename_conversation(&conversation_id, &t).await?;
     }
-    st.db.update_conversation_settings(&conversation_id, Some(&model_id), &serde_json::to_value(&s)?).await?;
+    // Sticky skills and loaded tools are saved with the message, so the next
+    // message builds the same instruction and tool list.
+    s.skill_picks = prep.skill_picks.clone();
+    if let Some(o) = &prep.offer {
+        union(&mut s.loaded_tools, &o.loaded_ids());
+    }
+    save_settings(&st, &conversation_id, Some(&model_id), &s).await?;
     // Subagents allowed: the reply gets a run context like a task.
     let chat_run = match (&prep.subagent_prompt, prep.agent) {
         (Some(shared), true) => {
@@ -1288,7 +1578,7 @@ mod tests {
             policy,
             timeout_secs: 60,
         };
-        for n in ["fs_list", "fs_read", "fs_search", "web_fetch", "shell_execute"] {
+        for n in ["fs_list", "fs_read", "fs_search", "web_fetch", "web_search", "shell_execute"] {
             assert!(is_plan_tool(&tool("builtin:local", n, Allow), false), "{n}");
         }
         for n in ["fs_write", "fs_patch", "fs_move", "fs_delete"] {
@@ -1357,6 +1647,94 @@ mod tests {
         let schema = tasks::spawn_tool("r").input_schema;
         assert!(agent_runtime::validate_args(&schema, &serde_json::json!({ "subagents": [{ "label": "a", "objective": "b", "isolation": "worktree" }] })).is_ok());
         assert!(agent_runtime::validate_args(&schema, &serde_json::json!({ "subagents": [{ "label": "a", "objective": "b", "isolation": "docker" }] })).is_err());
+    }
+
+    fn m(name: &str, reason: &str) -> skills::Match {
+        skills::Match { name: name.into(), score: 9, reason: reason.into() }
+    }
+
+    #[test]
+    fn picked_skills_are_sticky_and_never_removed() {
+        let mut picks = vec![];
+        let first = sticky_skills(&mut picks, &[m("rust", "matched: cargo")]);
+        assert_eq!(first.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), vec!["rust"]);
+        assert!(first[0].reason.is_empty(), "no reason text goes to the prompt");
+        // A later message matches other words, or nothing: the set only grows.
+        let second = sticky_skills(&mut picks, &[m("git", "matched: commit"), m("rust", "matched: test")]);
+        assert_eq!(second.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), vec!["rust", "git"]);
+        let third = sticky_skills(&mut picks, &[]);
+        assert_eq!(third, second, "same set, same order, when nothing matches");
+        for i in 0..10 {
+            sticky_skills(&mut picks, &[m(&format!("s{i}"), "x")]);
+        }
+        assert_eq!(picks.len(), MAX_STICKY_SKILLS);
+        // Old chats load with empty lists; new settings default to deferred loading on.
+        let old: ChatSettings = serde_json::from_str(r#"{"agent_mode":true}"#).unwrap();
+        assert!(old.defer_tools && old.loaded_tools.is_empty() && old.skill_picks.is_empty());
+        let mut a = vec!["x".to_string()];
+        union(&mut a, &["y".into(), "x".into()]);
+        assert_eq!(a, vec!["x", "y"]);
+    }
+
+    /// Red-team regression: the sticky cap counts skills that were deleted or
+    /// turned off since they were picked (`prepare_with` runs `sticky_skills`
+    /// before `skills::usable`, and `save_settings` unions with the stored
+    /// list, so dead names can never leave `skill_picks`). Once five picks
+    /// exist, a chat never picks a new skill again, even when four are gone.
+    #[test]
+    fn sticky_cap_is_not_used_up_by_deleted_skills() {
+        let mut picks: Vec<String> = ["gone1", "gone2", "gone3", "gone4", "live"].iter().map(|s| s.to_string()).collect();
+        let exists = |n: &str| n == "live" || n == "fresh";
+        // Same order as prepare_with: sticky set first, then drop the dead ones.
+        let picked = sticky_skills(&mut picks, &[m("fresh", "matched")]);
+        let usable: Vec<&str> = picked.iter().map(|x| x.name.as_str()).filter(|n| exists(n)).collect();
+        assert!(usable.contains(&"fresh"), "a newly matching skill is never used: {usable:?}");
+    }
+
+    #[test]
+    fn dead_skills_are_pruned_and_the_cap_counts_live_ones_only() {
+        let mut picks: Vec<String> = ["gone1", "live1", "gone2", "live2", "live3"].iter().map(|s| s.to_string()).collect();
+        prune_picks(&mut picks, |n| n.starts_with("live"));
+        assert_eq!(picks, vec!["live1", "live2", "live3"]);
+        // More live names than the cap: the first ones stay (pick order).
+        let mut many: Vec<String> = (0..9).map(|i| format!("s{i}")).collect();
+        prune_picks(&mut many, |_| true);
+        assert_eq!(many.len(), MAX_STICKY_SKILLS);
+        assert_eq!(many[0], "s0");
+        // Overflow matches come after the sticky set and are never added twice.
+        let mut full: Vec<String> = (0..MAX_STICKY_SKILLS).map(|i| format!("p{i}")).collect();
+        let out = sticky_skills(&mut full, &[m("new", "x"), m("new", "y"), m("p0", "z")]);
+        assert_eq!(full.len(), MAX_STICKY_SKILLS, "the name list itself stays capped");
+        assert_eq!(out.last().map(|x| x.name.as_str()), Some("new"));
+        assert_eq!(out.iter().filter(|x| x.name == "new").count(), 1);
+    }
+
+    fn prepared(system: &str) -> Prepared {
+        Prepared { system: system.into(), profile: None, tools: vec![], tool_defs: serde_json::Value::Null, agent: true, xml: false, skills_text: None, subagent_prompt: None, skill_picks: vec![], offer: None }
+    }
+
+    #[test]
+    fn meter_key_ignores_the_draft_but_not_history_system_or_tools() {
+        let h = vec![msg("user", "hi", None, None), msg("assistant", "hello", None, None)];
+        let p = prepared("sys");
+        let k = meter_key(8080, "m", &p, "[]", &h, "");
+        // Typing changes nothing the key is made of: a cache hit.
+        assert_eq!(k, meter_key(8080, "m", &prepared("sys"), "[]", &h, ""));
+        let base = MeterBase { key: k, total: 100, system: 10, history: 5, tools: 0, skills: 0, attachments: 0, has_attachments: false, messages: 3 };
+        METER.lock().unwrap().insert("conv-meter-test".into(), base);
+        assert_eq!(METER.lock().unwrap().get("conv-meter-test").filter(|b| b.key == k).copied(), Some(base));
+        // A new message, an edited one, another system prompt, tools or model: a miss.
+        let mut more = h.clone();
+        more.push(msg("user", "again", None, None));
+        assert_ne!(k, meter_key(8080, "m", &p, "[]", &more, ""));
+        let mut edited = h.clone();
+        edited[1].content = "hello!".into();
+        assert_ne!(k, meter_key(8080, "m", &p, "[]", &edited, ""));
+        assert_ne!(k, meter_key(8080, "m", &prepared("sys2"), "[]", &h, ""));
+        assert_ne!(k, meter_key(8080, "m", &p, "[{}]", &h, ""));
+        assert_ne!(k, meter_key(8080, "other", &p, "[]", &h, ""));
+        assert!(METER.lock().unwrap().get("conv-meter-test").filter(|b| b.key == meter_key(8080, "m", &p, "[]", &more, "")).is_none());
+        METER.lock().unwrap().remove("conv-meter-test");
     }
 
     #[test]

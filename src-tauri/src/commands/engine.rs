@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use app_core::AppError;
-use inference::{EngineStatus, LoadConfig, LoadRequest};
+use inference::{EngineStatus, GpuLayers, LoadConfig, LoadRequest};
 use tauri::State;
 
 use super::Cmd;
@@ -38,8 +38,12 @@ pub async fn load_model(
 }
 
 /// The one load path shared by the UI and the local API.
-pub async fn do_load(st: &SharedState, model_id: String, config: LoadConfig, runtime_id: Option<String>) -> Cmd<EngineStatus> {
+pub async fn do_load(st: &SharedState, model_id: String, mut config: LoadConfig, runtime_id: Option<String>) -> Cmd<EngineStatus> {
     let st = st.clone();
+    // Linked-PC endpoints are resolved per load (a reload may pass the old
+    // effective config); only the user's "Use linked PCs" choice is kept.
+    config.rpc.clear();
+    config.tensor_split = None;
     // Validate before anything is recorded: a rejected config must never
     // become the model's "last used" settings.
     config.validate().map_err(AppError::InvalidInput)?;
@@ -53,103 +57,242 @@ pub async fn do_load(st: &SharedState, model_id: String, config: LoadConfig, run
     let runtime = resolve_runtime(&st, runtime_id).await?;
     let meta: model_registry::ModelMetadata = serde_json::from_str(&m.metadata).unwrap_or_default();
     if config.speculative.as_deref().is_some_and(|s| s.split(',').any(|t| t == "draft-mtp")) && meta.mtp_layers.unwrap_or(0) == 0 {
-        return Err(AppError::InvalidInput(format!("{} has no multi-token-prediction (MTP) layers, so it can't use speculative decoding with draft-mtp", m.display_name)));
+        let why = if meta.mtp_unknown {
+            "declares MTP layers, but its tensor list could not be read to confirm they are there"
+        } else if meta.mtp_layers_declared.unwrap_or(0) > 0 {
+            "declares MTP but its MTP layers were removed"
+        } else {
+            "has no multi-token-prediction (MTP) layers"
+        };
+        return Err(AppError::InvalidInput(format!("{} {why}, so it can't use speculative decoding with draft-mtp", m.display_name)));
     }
     let projector = super::models::projector_bytes(&config, m.projector_path.as_deref());
-    // "Share with CPU" and an Auto context are measured from free memory
-    // right now. A model that is already loaded would make VRAM look full,
-    // so unload it first (a load replaces it anyway).
-    if (config.n_ctx == 0 || config.share_with_cpu || config.cache_type_auto)
-        && runtime.uses_gpu()
+    // "Share with CPU", an Auto context and Auto KV are measured from free
+    // memory right now. A model that is already loaded would make VRAM and
+    // RAM look full, so unload it first (a load replaces it anyway).
+    if (config.n_ctx == 0 || config.share_with_cpu || config.cache_type_auto || config.use_linked_pcs)
         && let Some(pid) = st.engine.backend_pid()
     {
         do_unload(&st).await?;
-        wait_for_vram_release(&st, pid).await;
+        if runtime.uses_gpu() {
+            wait_for_vram_release(&st, pid).await;
+        }
     }
-    let free = super::models::free_vram(&st);
-    let available_ram = st.monitor.hardware_info().available_ram_bytes;
+    // "Use linked PCs": tunnel endpoints for --rpc and a split by free memory
+    // (checks the linked PCs' llama.cpp build first).
+    let (run, link_note, linked) = crate::services::linking::resolve_linked(&st, &runtime, config.clone()).await?;
+    let linked = linked.as_ref();
+    let r = match launch(&st, &m, &meta, &runtime, &run, &config, projector, link_note.into_iter().collect(), linked).await {
+        Ok(s) => Ok(s),
+        // A linked PC that refused memory over its owner's limit is not an MTP
+        // problem: retrying without MTP would fail the same way and save MTP off.
+        Err((e, launched))
+            if super::models::retry_without_spec(&config, &launched, &runtime.capabilities, &e)
+                && (linked.is_none() || st.linking.refusal_notes().await.is_empty()) =>
+        {
+            // Speculative MTP was the app's default, not the user's choice:
+            // try once more without it.
+            tracing::warn!("load failed with speculative decoding ({e}); retrying without it");
+            let note = format!("Speculative decoding (draft-mtp) was turned off: the model did not start with it ({e}). You can turn it on again in the load settings.");
+            let retry = super::models::retry_config(&run, &launched);
+            let saved = super::models::without_spec(&config);
+            let r = launch(&st, &m, &meta, &runtime, &retry, &saved, projector, vec![note], linked).await.map_err(|(e, _)| e);
+            if r.is_err() {
+                // MTP wasn't the cause: keep the user's settings as they were.
+                if let Ok(v) = serde_json::to_value(&config) {
+                    let _ = st.db.set_model_configs(&m.id, None, Some(&v)).await;
+                }
+            }
+            r
+        }
+        Err((e, _)) => Err(e),
+    };
+    // A linked PC refused memory over the limit its owner set: say so.
+    match r {
+        Err(e) if linked.is_some() => {
+            let notes = st.linking.refusal_notes().await;
+            if notes.is_empty() {
+                return Err(e);
+            }
+            let more = notes.join(" ");
+            Err(match e {
+                AppError::Runtime(m) => AppError::Runtime(format!("{m}. {more}")),
+                AppError::OutOfMemory(m) => AppError::OutOfMemory(format!("{m}. {more}")),
+                other => other,
+            })
+        }
+        r => r,
+    }
+}
+
+/// Measure a split load with [`crate::services::linking::preflight`] and,
+/// while a device would go over its free memory (a linked PC's: its
+/// owner's limit), move layers by the measured cost ([`linking::split::refit`]),
+/// at most 3 rounds. Returns a note when it changed the split.
+async fn refit_split(runtime: &inference::InstalledRuntime, model: &str, cfg: &mut LoadConfig, total_layers: u64) -> Option<String> {
+    use linking::split;
+    let before = (cfg.gpu_layers, cfg.tensor_split.clone());
+    let max_layers = total_layers as u32;
+    for _ in 0..3 {
+        let rows = crate::services::linking::preflight(runtime, std::path::Path::new(model), cfg).await?;
+        // Linked PCs' devices come first, one per --tensor-split entry.
+        let weights: Vec<u64> = cfg.tensor_split.as_deref()?.split(',').map(|x| x.trim().parse().unwrap_or(0)).collect();
+        if rows.len() != weights.len() {
+            tracing::warn!("split check: {} devices measured, {} in --tensor-split; keeping the split", rows.len(), weights.len());
+            return None;
+        }
+        let linked: Vec<bool> = rows.iter().map(|d| d.name.starts_with("RPC")).collect();
+        // Speculative MTP runs a draft context on this PC's GPU that
+        // llama-fit-params doesn't count: about one more compute buffer and
+        // one layer's KV cache (real 2-PC test: 0.5-0.7 GB spilled to shared
+        // memory without it).
+        let ngl_now = match cfg.gpu_layers {
+            GpuLayers::Count(n) => n,
+            _ => max_layers,
+        };
+        let mtp_mib = if cfg.speculative.as_deref().is_some_and(|s| s.split(',').any(|t| t == "draft-mtp")) {
+            let sum: u64 = weights.iter().sum::<u64>().max(1);
+            rows.iter().zip(&linked).zip(&weights).filter(|((_, l), _)| !**l).map(|((d, _), w)| {
+                let layers = (ngl_now as u64 * w / sum).max(1);
+                d.compute_mib + d.context_mib / layers
+            }).sum()
+        } else {
+            0
+        };
+        if split::breakdown_fits(&rows, &linked, mtp_mib) {
+            break;
+        }
+        let ngl = match cfg.gpu_layers {
+            GpuLayers::Count(n) => n,
+            _ => max_layers,
+        };
+        let (n, layers) = split::refit(&rows, &linked, &weights, ngl, max_layers, mtp_mib)?;
+        tracing::info!("split check: {rows:?} does not fit; -ngl {ngl} -> {n}, --tensor-split {}", layers.iter().map(u64::to_string).collect::<Vec<_>>().join(","));
+        cfg.gpu_layers = if n >= max_layers { GpuLayers::All } else { GpuLayers::Count(n) };
+        cfg.tensor_split = Some(layers.iter().map(u64::to_string).collect::<Vec<_>>().join(","));
+    }
+    if (cfg.gpu_layers, cfg.tensor_split.clone()) == before {
+        return None;
+    }
+    let layers = match cfg.gpu_layers {
+        GpuLayers::Count(n) => n.to_string(),
+        _ => "all".into(),
+    };
+    Some(format!(
+        "Split adjusted to llama.cpp's measured memory use: {layers} GPU layers, --tensor-split {}.",
+        cfg.tensor_split.as_deref().unwrap_or("?")
+    ))
+}
+
+/// Plan the load of `config` ([`super::models::plan_load`]), record it, start
+/// the backend and add the plan's notes to the status. `save` is stored as
+/// the model's "last used" settings (the user's choices, not the resolved
+/// values, so the next load re-measures). On failure, also returns the
+/// config the backend was started with.
+#[allow(clippy::too_many_arguments)]
+async fn launch(
+    st: &SharedState,
+    m: &persistence::ModelRow,
+    meta: &model_registry::ModelMetadata,
+    runtime: &inference::InstalledRuntime,
+    config: &LoadConfig,
+    save: &LoadConfig,
+    projector: u64,
+    mut notes: Vec<String>,
+    linked: Option<&crate::services::linking::LinkedLoad>,
+) -> Result<EngineStatus, (AppError, LoadConfig)> {
+    let free = super::models::free_vram(st);
+    let hw = st.monitor.hardware_info();
     let caps = &runtime.capabilities;
-    // "Auto" KV cache type: q8_0 for a big cache on a model that shares the
-    // GPU with the CPU. Decided first, so the Auto context can use the room.
-    let (config_kv, auto_kv) = super::models::resolve_auto_kv(
-        &config,
-        &meta,
-        m.size as u64,
-        projector,
-        free,
-        runtime.uses_gpu(),
-        super::models::KvSupport::of(caps),
-    );
-    // Auto context (n_ctx 0): llama-server would allocate the full trained
-    // context, which can run out of memory, so the app picks the size.
-    let (config_ctx, auto) = super::models::resolve_auto_ctx(
-        &config_kv,
-        &meta,
-        m.size as u64,
-        projector,
-        free,
-        available_ram,
-        caps.has("--n-cpu-moe"),
-        runtime.uses_gpu(),
-    );
-    if let Some(a) = &auto {
+    let topo = system_monitor::core_topology();
+    let linked_devs = linked.map(|l| l.linked_devs()).unwrap_or_default();
+    let mut plan = {
+        let observed = st.observed_offload.lock().unwrap().clone();
+        let lookup = |c: &LoadConfig| observed.get(&(m.id.clone(), super::models::offload_key(c))).copied();
+        let env = super::models::PlanEnv {
+            free_vram: free,
+            available_ram: hw.available_ram_bytes,
+            total_ram: hw.total_ram_bytes,
+            caps,
+            uses_gpu: runtime.uses_gpu(),
+            topo,
+            observed: &lookup,
+            linked: &linked_devs,
+        };
+        super::models::plan_load(config, meta, m.size as u64, projector, &env)
+    };
+    // Linked PCs: --tensor-split by net capacity at the final context.
+    if let Some(l) = linked
+        && !plan.config.rpc.is_empty()
+    {
+        let total = meta.block_count.unwrap_or(0) + 1;
+        let cb = model_registry::estimate::estimate(meta, m.size as u64, &super::models::estimate_input(&plan.config, meta, total, projector)).compute_buffer_bytes;
+        // This PC's GPU also holds the output layer, which the layer split doesn't count.
+        let local_extra = projector.saturating_add(model_registry::estimate::output_layer_bytes(meta));
+        let (split, note) = crate::services::linking::net_split(l, cb, local_extra);
+        if let Some((rpc, ts)) = split {
+            plan.config.rpc = rpc;
+            plan.config.tensor_split = ts;
+        }
+        notes.extend(note);
+        // Check the split against llama.cpp's own breakdown before any weight
+        // is sent: the compute buffers are larger than the estimate on some
+        // models (Qwen3.8-27B: about 1 GB per device, estimated at 0.5), and
+        // a linked PC refuses memory over its owner's limit.
+        if let Some(n) = refit_split(runtime, &m.path, &mut plan.config, total).await {
+            // The earlier split by estimate no longer holds.
+            notes.retain(|x| !x.starts_with("Layers split by"));
+            notes.push(n);
+        }
+    }
+    if let Some(a) = &plan.auto_ctx {
         tracing::info!("Auto context: {} tokens ({})", a.n_ctx, a.summary);
     }
-    if let Some(mut a) = auto_kv {
-        super::models::finish_auto_kv(&mut a, &config_ctx, &meta, m.size as u64, projector);
+    if let Some(a) = &plan.auto_kv {
         tracing::info!("{}", a.summary);
     }
-    // "Share with CPU": llama.cpp fits the layers to free VRAM (--fit), or
-    // on older builds the app's estimate picks the split.
-    let mut split = None;
-    let effective = if config.share_with_cpu && runtime.uses_gpu() {
-        let (c, s) = super::models::resolve_share(
-            &config_ctx,
-            &meta,
-            m.size as u64,
-            projector,
-            free,
-            caps.has("--n-cpu-moe"),
-            super::models::runtime_can_fit(caps),
-        );
-        if let Some(s) = &s {
-            tracing::info!("Share with CPU (estimate): {}", s.summary);
-        }
-        split = s;
-        c
-    } else {
-        config_ctx
-    };
-    // Hybrid CPUs: threads on the P-cores when the CPU runs layers.
-    let total_layers = meta.block_count.unwrap_or(0) + 1;
-    let full_gpu_fits = free.map(|f| {
-        let mut i = super::models::estimate_input(&effective, &meta, total_layers, projector);
-        i.gpu_layers = None;
-        model_registry::estimate::estimate(&meta, m.size as u64, &i).vram_bytes <= (f as f64 * 0.90) as u64
-    });
-    let on_cpu = super::models::cpu_runs_layers(&effective, total_layers, runtime.uses_gpu(), split.as_ref(), full_gpu_fits);
-    let effective = super::models::apply_thread_policy(&effective, system_monitor::core_topology(), on_cpu, caps);
-    effective.validate().map_err(AppError::InvalidInput)?;
-    // The model's "last used" keeps the user's choice (share_with_cpu, Auto
-    // context), not the resolved values, so the next load re-measures.
-    let cfg_json = serde_json::to_value(&config)?;
-    let instance_id = st.db.insert_instance(&model_id, &runtime.id, &serde_json::to_value(&effective)?).await?;
-    st.db.set_model_configs(&model_id, None, Some(&cfg_json)).await?;
+    if let Some(s) = &plan.split {
+        tracing::info!("Share with CPU (estimate): {}", s.summary);
+    }
+    for n in &plan.notes {
+        tracing::info!("{n}");
+    }
+    let effective = plan.config.clone();
+    let fail = |e: AppError| (e, effective.clone());
+    effective.validate().map_err(|e| fail(AppError::InvalidInput(e)))?;
+    let cfg_json = serde_json::to_value(save).map_err(|e| fail(e.into()))?;
+    let eff_json = serde_json::to_value(&effective).map_err(|e| fail(e.into()))?;
+    let instance_id = st.db.insert_instance(&m.id, &runtime.id, &eff_json).await.map_err(fail)?;
+    st.db.set_model_configs(&m.id, None, Some(&cfg_json)).await.map_err(fail)?;
     let req = LoadRequest {
-        model_id,
+        model_id: m.id.clone(),
         instance_id: instance_id.clone(),
         model_path: PathBuf::from(&m.path),
-        projector_path: m.projector_path.map(PathBuf::from),
-        runtime,
-        config: effective,
+        projector_path: m.projector_path.clone().map(PathBuf::from),
+        runtime: runtime.clone(),
+        config: effective.clone(),
         alias: Some(m.display_name.clone()),
+        model_bytes: (m.size as u64).saturating_add(projector),
+        // Linked PCs receiving weights (none unless "Use linked PCs" resolved some).
+        probes: if effective.rpc.is_empty() { Vec::new() } else { st.linking.load_probes().into_iter().filter(|p| effective.rpc.contains(&p.endpoint)).collect() },
     };
     match st.engine.load(req).await {
-        Ok(s) => Ok(s),
+        Ok(s) => {
+            // Remember what llama.cpp chose when it fitted the layers itself.
+            if effective.gpu_layers == inference::GpuLayers::Auto
+                && let Some(o) = s.gpu_layers_offloaded
+            {
+                st.observed_offload.lock().unwrap().insert((m.id.clone(), super::models::offload_key(&effective)), o);
+            }
+            notes.extend(plan.notes);
+            notes.extend(super::models::after_load_note(&effective, plan.cpu_layers, s.gpu_layers_offloaded, topo, caps));
+            st.engine.add_warnings(&notes);
+            Ok(st.engine.status())
+        }
         Err(e) => {
             let state = if matches!(e, AppError::Cancelled) { "unloaded" } else { "failed" };
             let _ = st.db.set_instance_state(&instance_id, state, Some(&e.to_string())).await;
-            Err(e)
+            Err((e, effective))
         }
     }
 }
@@ -205,12 +348,8 @@ pub async fn reload_with_projector(state: State<'_, SharedState>) -> Cmd<EngineS
     if m.projector_path.is_none() {
         return Err(AppError::InvalidInput(format!("{} has no vision projector (mmproj) file next to it", m.display_name)));
     }
-    let mut config: LoadConfig = m
-        .last_config
-        .as_deref()
-        .and_then(|c| serde_json::from_str(c).ok())
-        .or(status.config.clone())
-        .unwrap_or_default();
+    // "Last used", upgraded like the load panel's defaults.
+    let mut config: LoadConfig = super::models::last_used_config(st, &m, status.runtime_id.as_deref()).await.or(status.config.clone()).unwrap_or_default();
     config.load_projector = true;
     do_load(st, model_id, config, status.runtime_id.clone()).await
 }

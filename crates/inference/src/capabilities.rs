@@ -92,6 +92,7 @@ impl RuntimeCapabilities {
 
     /// Run `<exe> --help` and parse it.
     pub async fn probe(server_exe: &Path) -> std::io::Result<Self> {
+        crate::vcrt::ensure_next_to(server_exe);
         let mut cmd = tokio::process::Command::new(server_exe);
         cmd.arg("--help").stdin(std::process::Stdio::null()).kill_on_drop(true);
         if let Some(dir) = server_exe.parent() {

@@ -75,6 +75,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             runtime: gpu_rt.clone(),
             config: cfg,
             alias: None,
+            model_bytes: 0,
+            probes: vec![],
         })
         .await;
     let st = match st {
@@ -151,6 +153,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             runtime: cpu_rt,
             config: cfg,
             alias: None,
+            model_bytes: 0,
+            probes: vec![],
         })
         .await?;
     println!(
@@ -180,6 +184,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             runtime: gpu_rt,
             config: LoadConfig::default(),
             alias: None,
+            model_bytes: 0,
+            probes: vec![],
         })
         .await;
     println!("invalid GGUF -> {:?} / hint {:?}", r.as_ref().err().map(|e| e.to_string()), engine.status().error_hint);

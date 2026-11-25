@@ -80,8 +80,11 @@ pub async fn refresh_status(db: &Db) -> AppResult<()> {
     Ok(())
 }
 
-/// `ModelMetadata` fields read since CAPS_VERSION 2, copied into older rows.
+/// `ModelMetadata` fields read since CAPS_VERSION 2 (mtp_layers re-read at 3,
+/// and at 4 from every shard of a split model; host_weight_bytes since 5),
+/// copied into older rows.
 const ATTENTION_LAYOUT_KEYS: &[&str] = &[
+    "host_weight_bytes",
     "sliding_window",
     "sliding_window_pattern",
     "swa_layers",
@@ -89,6 +92,8 @@ const ATTENTION_LAYOUT_KEYS: &[&str] = &[
     "value_length_swa",
     "shared_kv_layers",
     "mtp_layers",
+    "mtp_layers_declared",
+    "mtp_unknown",
     "full_attention_interval",
 ];
 
@@ -101,9 +106,11 @@ async fn backfill_caps(db: &Db, m: &persistence::models::ModelRow) {
         return;
     }
     let path = std::path::PathBuf::from(&m.path);
+    let shards: Vec<std::path::PathBuf> = serde_json::from_str::<Vec<String>>(&m.shard_paths).unwrap_or_default().into_iter().map(std::path::PathBuf::from).collect();
     let projector = m.projector_path.clone().map(std::path::PathBuf::from);
     let detected = tokio::task::spawn_blocking(move || {
-        let h = gguf::read_header(&path).ok()?;
+        let mut h = gguf::read_header(&path).ok()?;
+        gguf::add_shard_tensors(&mut h, &path, &shards);
         let tpl = h.kv.get("tokenizer.chat_template").and_then(|v| v.as_str());
         let mut c = caps::from_template(tpl, "gguf");
         caps::apply_projector(&mut c, projector.as_deref().map(caps::read_projector));

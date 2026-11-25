@@ -243,6 +243,22 @@ pub async fn run_task(
     pause: &CancellationToken,
     observer: &dyn TaskObserver,
 ) -> TaskEnd {
+    let end = run_task_inner(ctx, transcript, budgets, usage, pause, observer).await;
+    // However it ended, the agent no longer holds a generation slot.
+    if let Some(seat) = ctx.gate {
+        seat.release();
+    }
+    end
+}
+
+async fn run_task_inner(
+    ctx: &TurnCtx<'_>,
+    transcript: &mut Vec<serde_json::Value>,
+    budgets: &Budgets,
+    usage: &mut Usage,
+    pause: &CancellationToken,
+    observer: &dyn TaskObserver,
+) -> TaskEnd {
     let mut segment = usage.turns as usize;
     // Turns this start: the backstop counts per start, so Resume can go on.
     let mut this_start = 0u32;

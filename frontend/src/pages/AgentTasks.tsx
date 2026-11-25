@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { errorMessage } from "../lib/api";
 import { api3, type ApprovalAnswer, type ApprovalRequest, type ServerView, type ToolEventPayload } from "../lib/api3";
 import { api4, type EnvView } from "../lib/api4";
+import { api7 } from "../lib/api7";
 import {
   api5, DEFAULT_BUDGETS, OPEN_TASK_KEY, STATE_LABEL, SUGGESTED_LIMITS, keptNote, onOpen, parseJson,
   type Budgets, type QuestionData, type RunSummary, type TaskDetail, type TaskEvent, type TaskSettings, type Usage,
@@ -14,7 +15,7 @@ import { QuestionCard, ReplyBox, Timeline } from "../components/TaskView";
 
 // Every connected MCP server is on (disabled_servers lists the ones turned off).
 const BLANK_SETTINGS: TaskSettings = {
-  environment_id: null, builtin_tools: true, mcp_tools: true, tool_servers: [], disabled_servers: [], skills_mode: "auto", skills: [],
+  environment_id: null, builtin_tools: true, web_search: true, mcp_tools: true, tool_servers: [], disabled_servers: [], skills_mode: "auto", skills: [],
   subagents: true, max_parallel: 2, tool_mode: "auto", plan_first: false, thinking: null, reasoning_effort: null,
   sampling: { temperature: null, top_p: null, top_k: null, min_p: null, repeat_penalty: null, max_tokens: null, seed: null, stop: [] },
 };
@@ -51,6 +52,8 @@ function TaskTools({ settings, envName, servers, onChange }: {
   settings: TaskSettings; envName: string; servers: ServerView[] | null; onChange: (s: TaskSettings) => void;
 }) {
   const off = settings.disabled_servers ?? [];
+  const [searchTokens, setSearchTokens] = useState<number | null>(null);
+  useEffect(() => { api7.getSearchSettings().then((v) => setSearchTokens(v.tool_tokens)).catch(() => setSearchTokens(null)); }, []);
   const usable = (servers ?? []).filter((sv) => sv.enabled);
   const count = (sv: ServerView) => sv.tools.filter((t) => t.enabled && t.policy !== "deny").length;
   return (
@@ -60,6 +63,11 @@ function TaskTools({ settings, envName, servers, onChange }: {
         <input type="checkbox" aria-label={`Built-in tools on ${envName}`} checked={settings.builtin_tools}
           onChange={(e) => onChange({ ...settings, builtin_tools: e.target.checked })} />
         <span>{envName}</span><span className="faint">shell and files</span>
+      </label>
+      <label className="task-tool" title="Search the web with the provider chosen in Settings > Search">
+        <input type="checkbox" aria-label="Web search" checked={settings.web_search !== false}
+          onChange={(e) => onChange({ ...settings, web_search: e.target.checked })} />
+        <span>Web search</span><span className="faint">{searchTokens == null ? "searches, then reads pages" : `about ${searchTokens} tok`}</span>
       </label>
       {servers == null ? (
         <span className="faint task-tool-note">Loading MCP servers</span>

@@ -66,14 +66,14 @@ How to plan:
 
 End your reply with the numbered plan and stop. The user reviews it and decides whether to run it.
 
-If web_fetch is listed you may use it to read public web pages (docs, release notes), and if shell_execute is listed use it only for read-only or auditing commands (listing, reading, git status or log, --version), never to change anything: the user approves each command.";
+If web_search is listed you may use it to find current information, then read the best 1-3 results with web_fetch and cite their URLs. If web_fetch is listed you may use it to read public web pages (docs, release notes), and if shell_execute is listed use it only for read-only or auditing commands (listing, reading, git status or log, --version), never to change anything: the user approves each command.";
 
 /// App-generated rules added in Plan mode (not editable, always present).
 pub const PLAN_RULES: &str = "## Plan mode
-Only read-only tools are available now: use them to look at the relevant files first. Do not try to change anything, and do not refuse because of that: the approved plan is carried out later in Agent mode. Finish with a numbered step-by-step plan and stop. web_fetch reads public web pages; shell_execute (if offered) is for read-only or auditing commands only, and each command asks the user.";
+Only read-only tools are available now: use them to look at the relevant files first. Do not try to change anything, and do not refuse because of that: the approved plan is carried out later in Agent mode. Finish with a numbered step-by-step plan and stop. web_search finds pages and web_fetch reads public web pages; shell_execute (if offered) is for read-only or auditing commands only, and each command asks the user.";
 
 /// Bump when any built-in template text changes, so existing installs update.
-const BUILTIN_VERSION: u64 = 7;
+const BUILTIN_VERSION: u64 = 8;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]

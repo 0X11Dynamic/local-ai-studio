@@ -4,6 +4,10 @@
 
 /// `CREATE_NO_WINDOW` process creation flag (no console window flash).
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// `NORMAL_PRIORITY_CLASS` process creation flag. Without it a child gets
+/// this app's priority class, which is "below normal" when the app was
+/// started by Task Scheduler (its default task priority 7).
+pub const NORMAL_PRIORITY_CLASS: u32 = 0x0000_0020;
 
 #[cfg(windows)]
 mod imp {
@@ -71,6 +75,45 @@ mod imp {
 #[cfg(windows)]
 pub use imp::JobObject;
 
+/// Give a child normal memory and I/O priority. Children inherit this app's,
+/// which are "low" when Task Scheduler started the app (its default task
+/// priority 7 also means below-normal CPU, which the caller avoids with
+/// [`NORMAL_PRIORITY_CLASS`]): the file pages such a process reads are
+/// dropped first and its disk reads wait behind everyone else's. On the VM
+/// test (2026-11-23) the helper's rpc-server, started from a Task
+/// Scheduler-launched app, re-read its weight cache from disk in 4 KB page
+/// faults at ~16 MB/s, so a cached reload took 80-130 s; at normal priority
+/// the same reload took 8.5 s. An app started the usual way (Start menu,
+/// Explorer) already has normal priorities; this changes nothing there.
+#[cfg(windows)]
+pub fn normal_child_priority(child: &tokio::process::Child) -> std::io::Result<()> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::{MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_NORMAL, ProcessMemoryPriority, SetProcessInformation};
+    windows::core::link!("ntdll.dll" "system" fn NtSetInformationProcess(process: HANDLE, class: i32, info: *const core::ffi::c_void, len: u32) -> i32);
+    /// `PROCESSINFOCLASS::ProcessIoPriority` and `IO_PRIORITY_HINT::IoPriorityNormal`.
+    const PROCESS_IO_PRIORITY: i32 = 33;
+    const IO_PRIORITY_NORMAL: u32 = 2;
+    let h = HANDLE(child.raw_handle().ok_or_else(|| std::io::Error::other("process already exited"))?);
+    let info = MEMORY_PRIORITY_INFORMATION { MemoryPriority: MEMORY_PRIORITY_NORMAL };
+    // SAFETY: `h` is the live process handle tokio owns; `info` and `io`
+    // outlive the calls and their sizes are passed.
+    unsafe {
+        SetProcessInformation(
+            h,
+            ProcessMemoryPriority,
+            &info as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32,
+        )
+    }
+    .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let io = IO_PRIORITY_NORMAL;
+    let status = unsafe { NtSetInformationProcess(h, PROCESS_IO_PRIORITY, &io as *const u32 as *const _, 4) };
+    if status < 0 {
+        return Err(std::io::Error::other(format!("NtSetInformationProcess(ProcessIoPriority) failed: 0x{status:08x}")));
+    }
+    Ok(())
+}
+
 /// Place a tokio child process into a new kill-on-close job.
 #[cfg(windows)]
 pub fn contain(child: &tokio::process::Child) -> std::io::Result<JobObject> {
@@ -85,6 +128,26 @@ pub fn contain(child: &tokio::process::Child) -> std::io::Result<JobObject> {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_child_can_be_given_normal_cpu_memory_and_io_priority() {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Threading::{GetPriorityClass, GetProcessInformation, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_NORMAL, ProcessMemoryPriority};
+        let mut cmd = tokio::process::Command::new("powershell.exe");
+        cmd.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]).creation_flags(CREATE_NO_WINDOW | NORMAL_PRIORITY_CLASS);
+        let mut child = cmd.spawn().unwrap();
+        normal_child_priority(&child).unwrap();
+        let h = HANDLE(child.raw_handle().unwrap());
+        let mut info = MEMORY_PRIORITY_INFORMATION::default();
+        unsafe { GetProcessInformation(h, ProcessMemoryPriority, &mut info as *mut _ as *mut std::ffi::c_void, std::mem::size_of::<MEMORY_PRIORITY_INFORMATION>() as u32) }.unwrap();
+        assert_eq!(info.MemoryPriority, MEMORY_PRIORITY_NORMAL);
+        windows::core::link!("ntdll.dll" "system" fn NtQueryInformationProcess(process: HANDLE, class: i32, info: *mut core::ffi::c_void, len: u32, ret: *mut u32) -> i32);
+        let mut io = 0u32;
+        let st = unsafe { NtQueryInformationProcess(h, 33, &mut io as *mut u32 as *mut _, 4, std::ptr::null_mut()) };
+        assert!(st >= 0 && io == 2, "I/O priority {io} (status {st:#x})");
+        assert_eq!(unsafe { GetPriorityClass(h) }, NORMAL_PRIORITY_CLASS);
+        child.kill().await.unwrap();
+    }
 
     #[tokio::test]
     async fn dropping_the_job_kills_the_process() {

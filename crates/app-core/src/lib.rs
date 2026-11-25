@@ -3,6 +3,7 @@
 
 pub mod error;
 pub mod paths;
+pub mod storage;
 
 pub use error::{AppError, AppResult};
 pub use paths::AppPaths;

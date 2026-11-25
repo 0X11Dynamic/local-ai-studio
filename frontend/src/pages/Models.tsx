@@ -6,6 +6,7 @@ import { bytes, tokens } from "../lib/format";
 import { useEngine } from "../lib/engine";
 import { capBadges, capDetails, capsOf } from "../lib/api6";
 import { LoadPanel } from "../components/LoadPanel";
+import { LoadProgressMini } from "../components/LoadProgressView";
 import { LogView } from "../components/LogView";
 import type { PageId } from "../App";
 
@@ -156,6 +157,7 @@ export function Models({ go }: { go: (p: PageId) => void }) {
                       <div>
                         {m.display_name}{" "}
                         {m.active && <span className="tag accent">{status?.state === "loading" ? "loading" : "loaded"}</span>}
+                        {m.active && status?.state === "loading" && <LoadProgressMini />}
                         {m.status !== "ok" && <span className="tag danger">{m.status}</span>}
                         {capBadges(capsOf(m.meta), !!m.projector_path).map((b) => (
                           <span key={b.label} className={`tag cap ${b.tone}`} title={b.title}>{b.label}</span>

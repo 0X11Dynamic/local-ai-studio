@@ -1,7 +1,7 @@
 import { useEffect, useState, type ComponentType } from "react";
 import {
   ChatCircle, Compass, Cube, ListChecks, TerminalWindow, TreeStructure, BookOpen, Plugs,
-  Code, Cpu, Gear, TextAlignLeft, Gauge, SidebarSimple, type IconProps,
+  Code, Cpu, Gear, TextAlignLeft, Gauge, SidebarSimple, Network, type IconProps,
 } from "@phosphor-icons/react";
 import { EngineProvider, useEngine } from "./lib/engine";
 import { api } from "./lib/api";
@@ -21,16 +21,18 @@ import { Environments } from "./pages/Environments";
 import { AgentTasks } from "./pages/AgentTasks";
 import { Subagents } from "./pages/Subagents";
 import { Skills } from "./pages/Skills";
+import { LinkedPCs } from "./pages/LinkedPCs";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { LoadProgressMini } from "./components/LoadProgressView";
 import { FirstRun } from "./components/FirstRun";
 
 export type PageId =
   | "overview" | "chat" | "discover" | "models" | "runtimes" | "agents" | "subagents"
-  | "environments" | "skills" | "mcp" | "instructions" | "developer" | "settings";
+  | "environments" | "skills" | "mcp" | "instructions" | "developer" | "settings" | "linked";
 
 interface NavItem { id: PageId; label: string; icon: ComponentType<IconProps>; phase?: number }
 
-// 13 destinations grouped into 4 sections so no group exceeds 4 items.
+// 14 destinations grouped into 4 sections so no group exceeds 4 items.
 const NAV: { title: string; items: NavItem[] }[] = [
   {
     title: "Work",
@@ -61,6 +63,7 @@ const NAV: { title: string; items: NavItem[] }[] = [
     title: "System",
     items: [
       { id: "overview", label: "Overview", icon: Gauge },
+      { id: "linked", label: "Linked PCs", icon: Network },
       { id: "developer", label: "Developer / API", icon: Code },
       { id: "settings", label: "Settings", icon: Gear },
     ],
@@ -83,6 +86,7 @@ function EngineIndicator({ go }: { go: (p: PageId) => void }) {
   return (
     <button className="btn ghost engine-pill" onClick={() => go("models")} title="Open My Models">
       <span className={status.state === "failed" ? "danger-text" : status.state === "loaded" ? "" : "faint"}>{label}</span>
+      {status.state === "loading" && <LoadProgressMini />}
       {status.state === "loaded" && (
         <>
           <strong className="mono">{status.props?.model_path?.split(/[\\/]/).pop()}</strong>
@@ -170,6 +174,7 @@ function Shell() {
             {page === "runtimes" && <Runtimes />}
             {page === "models" && <Models go={setPage} />}
             {page === "settings" && <Settings />}
+            {page === "linked" && <LinkedPCs />}
             {current.phase && <NotBuilt label={current.label} phase={current.phase} />}
           </ErrorBoundary>
         </main>

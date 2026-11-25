@@ -66,20 +66,115 @@ pub async fn duplicate_conversation(state: State<'_, SharedState>, id: String) -
 /// worktrees are removed when clean and merged (or empty), else kept and
 /// listed in `kept_worktrees`.
 pub async fn delete_conversation(state: State<'_, SharedState>, id: String) -> Cmd<crate::services::tasks::DeleteResult> {
+    delete_one(state.inner(), &id).await
+}
+
+/// One chat's deletion, shared by the single and bulk commands.
+async fn delete_one(state: &SharedState, id: &str) -> Cmd<crate::services::tasks::DeleteResult> {
     // Only a real chat: the id names a folder that is moved to the trash.
-    if !attachments::is_id(&id) {
+    if !attachments::is_id(id) {
         return Err(AppError::InvalidInput("not a valid chat id".into()));
     }
-    state.db.get_conversation(&id).await.map_err(|e| match e {
+    state.db.get_conversation(id).await.map_err(|e| match e {
         AppError::NotFound(_) => AppError::NotFound("chat not found".into()),
         e => e,
     })?;
-    chat::stop(state.inner(), &id);
-    let r = crate::services::tasks::delete_chat_run(state.inner(), &id).await?;
-    state.db.delete_conversation(&id).await?;
-    // Its attachment files go to the app trash (trash\attachments-<id>-<time>).
-    attachments::trash_conversation(state.inner(), &id);
+    chat::stop(state, id);
+    let r = crate::services::tasks::delete_chat_run(state, id).await?;
+    state.db.delete_conversation(id).await?;
+    // Its attachment files go to the app trash (trashttachments-<id>-<time>).
+    attachments::trash_conversation(state, id);
     Ok(r)
+}
+
+pub const MAX_BULK_DELETE: usize = 1000;
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct DeleteFailure {
+    pub id: String,
+    pub error: String,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct BulkDeleteResult {
+    pub deleted: usize,
+    pub failed: Vec<DeleteFailure>,
+    pub removed_worktrees: Vec<crate::services::tasks::WorktreeReport>,
+    pub kept_worktrees: Vec<crate::services::tasks::WorktreeReport>,
+}
+
+/// Drop repeated ids (first occurrence wins) so a chat is not deleted twice.
+fn dedupe_ids(ids: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    ids.into_iter().filter(|i| seen.insert(i.clone())).collect()
+}
+
+/// Fold per-chat outcomes into one result; failures do not stop the rest.
+fn aggregate(outcomes: Vec<(String, Cmd<crate::services::tasks::DeleteResult>)>) -> BulkDeleteResult {
+    let mut out = BulkDeleteResult::default();
+    for (id, r) in outcomes {
+        match r {
+            Ok(d) => {
+                out.deleted += 1;
+                out.removed_worktrees.extend(d.removed_worktrees);
+                out.kept_worktrees.extend(d.kept_worktrees);
+            }
+            Err(e) => out.failed.push(DeleteFailure { id, error: e.to_string() }),
+        }
+    }
+    out
+}
+
+/// Delete several chats (max 1000). Invalid or missing ids are listed in
+/// `failed`; the others are still deleted.
+#[tauri::command]
+pub async fn delete_conversations(state: State<'_, SharedState>, ids: Vec<String>) -> Cmd<BulkDeleteResult> {
+    if ids.len() > MAX_BULK_DELETE {
+        return Err(AppError::InvalidInput(format!("delete at most {MAX_BULK_DELETE} chats at once")));
+    }
+    let mut outcomes = Vec::new();
+    for id in dedupe_ids(ids) {
+        let r = delete_one(state.inner(), &id).await;
+        outcomes.push((id, r));
+    }
+    Ok(aggregate(outcomes))
+}
+
+#[cfg(test)]
+mod bulk_delete_tests {
+    use super::*;
+    use crate::services::tasks::{DeleteResult, WorktreeReport};
+
+    fn wt(n: &str) -> WorktreeReport {
+        WorktreeReport { subagent_id: n.into(), label: n.into(), path: n.into(), branch: n.into(), reason: None }
+    }
+
+    #[test]
+    fn dedupes_keeping_order() {
+        let v = dedupe_ids(vec!["a".into(), "b".into(), "a".into(), "c".into(), "b".into()]);
+        assert_eq!(v, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn aggregates_successes_and_failures() {
+        let r = aggregate(vec![
+            ("a".into(), Ok(DeleteResult { removed_worktrees: vec![wt("w1")], kept_worktrees: vec![] })),
+            ("bad".into(), Err(AppError::InvalidInput("not a valid chat id".into()))),
+            ("c".into(), Ok(DeleteResult { removed_worktrees: vec![], kept_worktrees: vec![wt("w2")] })),
+        ]);
+        assert_eq!(r.deleted, 2);
+        assert_eq!(r.failed.len(), 1);
+        assert_eq!(r.failed[0].id, "bad");
+        assert!(r.failed[0].error.contains("not a valid chat id"));
+        assert_eq!(r.removed_worktrees.len(), 1);
+        assert_eq!(r.kept_worktrees.len(), 1);
+    }
+
+    #[test]
+    fn empty_is_zero() {
+        let r = aggregate(vec![]);
+        assert_eq!((r.deleted, r.failed.len()), (0, 0));
+    }
 }
 
 #[tauri::command]
@@ -107,7 +202,9 @@ pub async fn update_chat_settings(state: State<'_, SharedState>, id: String, set
     if let Some(p) = &settings.profile_id {
         state.db.get_preset(p).await?;
     }
-    state.db.update_conversation_settings(&id, None, &serde_json::to_value(&settings)?).await
+    // Loaded tools and sticky skills are only ever added (an older copy from
+    // the UI must not drop what the model loaded meanwhile).
+    chat::save_settings(state.inner(), &id, None, &settings).await
 }
 
 /// Send a message. Pending attachments go with it: `attachments` (ids) picks

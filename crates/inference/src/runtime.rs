@@ -7,7 +7,7 @@
 //! register an existing `llama-server.exe` (a "custom" runtime) in place.
 
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, RwLock};
 
 use app_core::{AppError, AppResult};
 use regex::Regex;
@@ -161,7 +161,8 @@ struct GhAsset {
 }
 
 pub struct RuntimeManager {
-    dir: PathBuf,
+    /// The runtimes folder; changed by `move_to` / `set_dir` (Settings -> Storage).
+    dir: RwLock<PathBuf>,
     http: reqwest::Client,
 }
 
@@ -172,16 +173,112 @@ fn parse_ver(s: &str) -> Option<(u32, u32)> {
 
 impl RuntimeManager {
     pub fn new(dir: PathBuf, http: reqwest::Client) -> Self {
-        Self { dir, http }
+        Self { dir: RwLock::new(dir), http }
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
+    pub fn dir(&self) -> PathBuf {
+        self.dir.read().unwrap().clone()
+    }
+
+    /// Point at another runtimes folder without touching any files.
+    pub fn set_dir(&self, dir: PathBuf) {
+        *self.dir.write().unwrap() = dir;
+    }
+
+    /// Move every installed runtime into `new_dir` and switch to it. Each
+    /// runtime is copied, its manifest is rewritten to the new location and
+    /// re-read to prove `server_path` exists there; only then are the old
+    /// copies deleted. Any failure removes the partial copies and leaves the
+    /// old folder as it was. Custom runtimes (the user's own llama-server)
+    /// only move their manifest. Blocking; the caller refuses while a model
+    /// runs. Returns the moved runtime ids.
+    pub fn move_to(&self, new_dir: &Path) -> AppResult<Vec<String>> {
+        let old = self.dir();
+        let lower = |p: &Path| p.to_string_lossy().replace('/', "\\").trim_end_matches('\\').to_lowercase();
+        let (o, n) = (lower(&old), lower(new_dir));
+        if o == n {
+            return Ok(Vec::new());
+        }
+        if n.starts_with(&format!("{o}\\")) || o.starts_with(&format!("{n}\\")) {
+            return Err(AppError::InvalidInput("the new runtimes folder cannot be inside the old one (or the other way round)".into()));
+        }
+        std::fs::create_dir_all(new_dir)?;
+        let mut done: Vec<(PathBuf, PathBuf)> = Vec::new();
+        let rollback = |done: &[(PathBuf, PathBuf)], tmp: Option<&Path>| {
+            for (_, dst) in done {
+                let _ = std::fs::remove_dir_all(dst);
+            }
+            if let Some(t) = tmp {
+                let _ = std::fs::remove_dir_all(t);
+            }
+        };
+        let mut ids = Vec::new();
+        let entries: Vec<_> = std::fs::read_dir(&old).map(|rd| rd.flatten().collect()).unwrap_or_default();
+        for e in entries {
+            let src = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || !src.join(MANIFEST).is_file() {
+                continue;
+            }
+            let Ok(mut r) = std::fs::read_to_string(src.join(MANIFEST))
+                .map_err(|e| e.to_string())
+                .and_then(|t| serde_json::from_str::<InstalledRuntime>(&t).map_err(|e| e.to_string()))
+            else {
+                continue;
+            };
+            let dst = new_dir.join(&name);
+            let tmp = new_dir.join(format!(".moving-{name}"));
+            let _ = std::fs::remove_dir_all(&tmp);
+            if dst.exists() {
+                rollback(&done, Some(&tmp));
+                return Err(AppError::Conflict(format!("{} already exists in the new folder", dst.display())));
+            }
+            let step = (|| -> AppResult<()> {
+                copy_dir(&src, &tmp)?;
+                if r.source != "custom"
+                    && let Ok(rel) = r.server_path.strip_prefix(&src)
+                {
+                    r.server_path = dst.join(rel);
+                }
+                std::fs::write(tmp.join(MANIFEST), serde_json::to_vec_pretty(&r)?)?;
+                std::fs::rename(&tmp, &dst)?;
+                done.push((src.clone(), dst.clone()));
+                let back: InstalledRuntime = serde_json::from_slice(&std::fs::read(dst.join(MANIFEST))?)?;
+                if !back.server_path.is_file() {
+                    return Err(AppError::Runtime(format!("{} is missing after the copy", back.server_path.display())));
+                }
+                if r.source != "custom" && !back.server_path.starts_with(&dst) {
+                    return Err(AppError::Runtime(format!("{} does not point into the new folder", back.id)));
+                }
+                Ok(())
+            })();
+            if let Err(err) = step {
+                rollback(&done, Some(&tmp));
+                return Err(err);
+            }
+            ids.push(r.id.clone());
+        }
+        // Every copy is verified: now the old ones can go.
+        for (src, _) in &done {
+            if let Err(e) = std::fs::remove_dir_all(src) {
+                tracing::warn!("could not delete the old runtime copy {}: {e}", src.display());
+            }
+        }
+        for id in &ids {
+            if let Ok(text) = std::fs::read_to_string(new_dir.join(id).join(MANIFEST))
+                && let Ok(r) = serde_json::from_str::<InstalledRuntime>(&text)
+                && r.source != "custom"
+            {
+                crate::vcrt::ensure_next_to(&r.server_path);
+            }
+        }
+        self.set_dir(new_dir.to_path_buf());
+        Ok(ids)
     }
 
     pub fn list_installed(&self) -> Vec<InstalledRuntime> {
         let mut out = Vec::new();
-        let Ok(rd) = std::fs::read_dir(&self.dir) else { return out };
+        let Ok(rd) = std::fs::read_dir(self.dir()) else { return out };
         for e in rd.flatten() {
             let m = e.path().join(MANIFEST);
             let Ok(text) = std::fs::read_to_string(&m) else { continue };
@@ -200,6 +297,12 @@ impl RuntimeManager {
     /// Probe `--help` again for runtimes whose manifest was written by an
     /// older capability parser (see `RUNTIME_CAPS_VERSION`), and save the
     /// result. Runs `llama-server --help` only; never loads a model.
+    /// Copy the Visual C++ runtime DLLs next to every installed runtime that
+    /// lacks them (cheap existence check). Returns how many runtimes were repaired.
+    pub fn repair_vcrt(&self) -> usize {
+        self.list_installed().iter().filter(|r| !crate::vcrt::ensure_next_to(&r.server_path).is_empty()).count()
+    }
+
     pub async fn reprobe_outdated(&self) {
         for mut r in self.list_installed() {
             if r.capabilities.version >= crate::capabilities::RUNTIME_CAPS_VERSION {
@@ -208,7 +311,7 @@ impl RuntimeManager {
             match RuntimeCapabilities::probe(&r.server_path).await {
                 Ok(caps) => {
                     r.capabilities = caps;
-                    let path = self.dir.join(&r.id).join(MANIFEST);
+                    let path = self.dir().join(&r.id).join(MANIFEST);
                     match serde_json::to_vec_pretty(&r) {
                         Ok(bytes) if path.is_file() => {
                             if let Err(e) = std::fs::write(&path, bytes) {
@@ -396,11 +499,12 @@ impl RuntimeManager {
         if !rt.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
             return Err(AppError::InvalidInput("bad runtime id".into()));
         }
-        let final_dir = self.dir.join(&rt.id);
+        let root = self.dir();
+        let final_dir = root.join(&rt.id);
         if final_dir.join(MANIFEST).is_file() {
             return self.get(&rt.id);
         }
-        let dl_dir = self.dir.join(".downloads");
+        let dl_dir = root.join(".downloads");
         let mut zips = Vec::new();
         for a in &rt.assets {
             if !a.url.starts_with("https://github.com/ggml-org/llama.cpp/releases/download/") {
@@ -437,7 +541,7 @@ impl RuntimeManager {
             total: None,
             bytes_per_sec: 0.0,
         });
-        let staging = self.dir.join(format!(".staging-{}", rt.id));
+        let staging = root.join(format!(".staging-{}", rt.id));
         let _ = std::fs::remove_dir_all(&staging);
         let st = staging.clone();
         let zs = zips.clone();
@@ -500,7 +604,7 @@ impl RuntimeManager {
             .map_err(|e| AppError::Runtime(format!("{} is not a working llama-server: {e}", server.display())))?;
         let n = self.list_installed().iter().filter(|r| r.source == "custom").count() + 1;
         let id = format!("custom-{n}");
-        let dir = self.dir.join(&id);
+        let dir = self.dir().join(&id);
         std::fs::create_dir_all(&dir)?;
         let r = InstalledRuntime {
             id,
@@ -519,8 +623,9 @@ impl RuntimeManager {
     /// own llama-server.exe is never deleted.
     pub fn remove(&self, id: &str) -> AppResult<()> {
         let r = self.get(id)?;
-        let dir = self.dir.join(&r.id);
-        if !dir.starts_with(&self.dir) || r.id.contains("..") {
+        let root = self.dir();
+        let dir = root.join(&r.id);
+        if !dir.starts_with(&root) || r.id.contains("..") {
             return Err(AppError::InvalidInput("bad runtime id".into()));
         }
         std::fs::remove_dir_all(dir)?;
@@ -539,6 +644,20 @@ fn variant_rank(v: &str) -> u8 {
     } else {
         2
     }
+}
+
+fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for e in std::fs::read_dir(src)? {
+        let e = e?;
+        let to = dst.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            copy_dir(&e.path(), &to)?;
+        } else {
+            std::fs::copy(e.path(), &to)?;
+        }
+    }
+    Ok(())
 }
 
 fn extract_zip(zip_path: &Path, dest: &Path) -> std::io::Result<()> {
@@ -713,5 +832,72 @@ mod tests {
         extract_zip(&zp, &out).unwrap();
         assert!(!d.path().join("escape.txt").exists());
         assert!(find_file(&out, "llama-server.exe").is_some());
+    }
+    fn write_runtime(root: &Path, id: &str, source: &str, server: &Path) {
+        let dir = root.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = InstalledRuntime {
+            id: id.into(),
+            tag: "b1".into(),
+            variant: "cpu".into(),
+            server_path: server.to_path_buf(),
+            installed_at: String::new(),
+            source: source.into(),
+            capabilities: Default::default(),
+        };
+        std::fs::write(dir.join(MANIFEST), serde_json::to_vec_pretty(&r).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn move_copies_repoints_and_deletes_the_old_copy() {
+        let t = tempfile::tempdir().unwrap();
+        let (old, new) = (t.path().join("old"), t.path().join("new"));
+        let bin = old.join("b1-cpu").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("llama-server.exe"), b"exe").unwrap();
+        std::fs::write(bin.join("ggml.dll"), b"dll").unwrap();
+        write_runtime(&old, "b1-cpu", "official", &bin.join("llama-server.exe"));
+        // A custom runtime points at the user's own exe, which must not move.
+        let mine = t.path().join("mine").join("llama-server.exe");
+        std::fs::create_dir_all(mine.parent().unwrap()).unwrap();
+        std::fs::write(&mine, b"x").unwrap();
+        write_runtime(&old, "custom-1", "custom", &mine);
+        std::fs::create_dir_all(old.join(".downloads")).unwrap();
+
+        let rm = RuntimeManager::new(old.clone(), reqwest::Client::new());
+        assert_eq!(rm.list_installed().len(), 2);
+        let mut moved = rm.move_to(&new).unwrap();
+        moved.sort();
+        assert_eq!(moved, ["b1-cpu", "custom-1"]);
+        assert_eq!(rm.dir(), new);
+        let list = rm.list_installed();
+        assert_eq!(list.len(), 2);
+        let off = list.iter().find(|r| r.id == "b1-cpu").unwrap();
+        assert_eq!(off.server_path, new.join("b1-cpu").join("bin").join("llama-server.exe"));
+        assert!(new.join("b1-cpu").join("bin").join("ggml.dll").is_file());
+        assert_eq!(list.iter().find(|r| r.id == "custom-1").unwrap().server_path, mine);
+        assert!(!old.join("b1-cpu").exists(), "old copy deleted");
+        assert!(mine.is_file(), "the user's own exe is untouched");
+    }
+
+    #[test]
+    fn move_refuses_nesting_and_conflicts_and_keeps_the_old_folder() {
+        let t = tempfile::tempdir().unwrap();
+        let old = t.path().join("old");
+        let bin = old.join("b1-cpu");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("llama-server.exe"), b"exe").unwrap();
+        write_runtime(&old, "b1-cpu", "official", &bin.join("llama-server.exe"));
+        let rm = RuntimeManager::new(old.clone(), reqwest::Client::new());
+        assert!(rm.move_to(&old.join("inside")).is_err());
+        assert!(rm.move_to(t.path()).is_err());
+        assert_eq!(rm.move_to(&old).unwrap().len(), 0, "same folder is a no-op");
+        // The destination already has that runtime id.
+        let new = t.path().join("new");
+        std::fs::create_dir_all(new.join("b1-cpu")).unwrap();
+        assert!(rm.move_to(&new).is_err());
+        assert_eq!(rm.dir(), old);
+        assert_eq!(rm.list_installed().len(), 1, "nothing lost");
+        assert!(old.join("b1-cpu").join("llama-server.exe").is_file());
     }
 }

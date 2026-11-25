@@ -10,4 +10,3 @@ app-core.workspace = true
 keyring.workspace = true
 serde.workspace = true
 regex.workspace = true
-tracing.workspace = true

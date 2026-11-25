@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { api, errorMessage, type EstimateView, type GpuLayers, type InstalledRuntime, type LoadConfig, type LoadDefaults, type ModelView } from "../lib/api";
 import { bytes } from "../lib/format";
 import { useEngine } from "../lib/engine";
+import { LinkedPcsOption, LinkedPcsResult } from "./LinkedPcsLoad";
+import { LoadProgressView } from "./LoadProgressView";
 
 type GpuMode = GpuLayers["mode"];
 
@@ -55,10 +57,10 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
     if (!cfg) return;
     const effective: LoadConfig = cpuRuntime ? { ...cfg, gpu_layers: { mode: "cpu_only" } } : cfg;
     const t = setTimeout(() => {
-      api.estimateMemory(model.id, effective).then(setEst).catch(() => setEst(null));
+      api.estimateMemory(model.id, effective, runtimeId || null).then(setEst).catch(() => setEst(null));
     }, 200);
     return () => clearTimeout(t);
-  }, [cfg, model.id, cpuRuntime]);
+  }, [cfg, model.id, cpuRuntime, runtimeId]);
 
   const has = (flag: string) => !runtime || runtime.capabilities.flags.includes(flag);
   const cacheTypes = runtime?.capabilities.cache_types.length ? runtime.capabilities.cache_types : ["f16", "q8_0", "q4_0"];
@@ -144,14 +146,16 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
       : `${offloaded[0]}/${offloaded[1]} (all on GPU)`
     : "not reported";
   const moeOnCpu = isThis ? status?.config?.n_cpu_moe : null;
-  const fitMargin = cfg.fit_target_mib ?? 1024;
+  const fitMargin = est?.fit_target_mib ?? cfg.fit_target_mib ?? 1024;
   // With --fit, llama.cpp picks the layer count at load; the split shown is the app's estimate.
   const split = est?.share_split;
   const shareHelp = !split
     ? "Picked from free VRAM when the model loads."
     : est?.share_fit && !split.all_fit && split.n_cpu_moe == null && split.gpu_layers > 0
       ? `Estimate: about ${split.gpu_layers} of ${split.total_layers} layers on the GPU. llama.cpp fits the exact number when the model loads, keeping ${fitMargin} MiB free.`
-      : `Estimate: ${split.summary}`;
+      : est?.share_fit && split.all_fit
+        ? `Estimate: all ${split.total_layers} layers fit, with little VRAM to spare, so llama.cpp fits the exact number when the model loads, keeping ${fitMargin} MiB free.`
+        : `Estimate: ${split.summary}`;
   const kvAuto = !!cfg.cache_type_auto;
   const setKv = (which: "k" | "v", t: string) => {
     if (t === "auto") return set({ cache_type_auto: true, cache_type_k: "f16", cache_type_v: "f16" });
@@ -165,6 +169,7 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
   // Speculative decoding with the model's own MTP layers: offered only when
   // the model has them and the runtime lists draft-mtp.
   const mtpAvailable = (model.meta.mtp_layers ?? 0) > 0 && !!runtime?.capabilities.spec_types?.includes("draft-mtp");
+  const mtpStripped = !mtpAvailable && (model.meta.mtp_layers ?? 0) === 0 && (model.meta.mtp_layers_declared ?? 0) > 0 && !model.meta.mtp_unknown;
   const running = isThis ? status?.config : null;
 
   return (
@@ -202,7 +207,7 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
             <span className="err" id="ctx-help">{ctxError}</span>
           ) : autoCtx ? (
             <span className="help" id="ctx-help" aria-live="polite">
-              {est ? <><span className={est.auto_ctx.fits ? "ctx-auto-value" : "ctx-auto-value warn"}>Auto: {est.auto_ctx.n_ctx.toLocaleString()} tokens.</span> {est.auto_ctx.summary} Measured again when the model loads.</> : "Auto: picked from free memory when the model loads."}
+              {est ? <><span className={est.auto_ctx.fits && !est.auto_ctx.pages_weights ? "ctx-auto-value" : "ctx-auto-value warn"}>Auto: {est.auto_ctx.n_ctx.toLocaleString()} tokens{est.auto_ctx_alone != null ? ` (${est.auto_ctx_alone.toLocaleString()} on this PC alone)` : ""}.</span> {linkedLine(est.linked_contrib)}{est.auto_ctx.summary} Measured again when the model loads.</> : "Auto: picked from free memory when the model loads."}
             </span>
           ) : (
             <span className="help" id="ctx-help">Trained: {defaults?.trained_context?.toLocaleString() ?? "?"}.{est ? ` Auto would pick ${est.auto_ctx.n_ctx.toLocaleString()}.` : ""}</span>
@@ -266,6 +271,8 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
             This model won't fit in free VRAM ({est?.share_split?.summary}). Turn on Share with CPU to split it between GPU and CPU.
           </div>
         )}
+        <LinkedPcsOption modelId={model.id} checked={!!cfg.use_linked_pcs} disabled={disabled}
+          cpuOnly={cpuRuntime || cfg.gpu_layers.mode === "cpu_only"} onChange={(on) => set({ use_linked_pcs: on })} />
         <label className="check wide">
           <input type="checkbox" checked={cfg.kv_offload && !cpuRuntime} disabled={disabled || cpuRuntime || !has("--no-kv-offload")} onChange={(e) => set({ kv_offload: e.target.checked })} />
           Keep the KV cache on the GPU
@@ -273,9 +280,12 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
         {mtpAvailable && (
           <label className="check wide">
             <input type="checkbox" checked={cfg.speculative === "draft-mtp"} disabled={disabled}
-              onChange={(e) => set({ speculative: e.target.checked ? "draft-mtp" : null })} />
-            Speculative decoding (MTP): draft tokens with the model's own prediction layers (same output, may be faster)
+              onChange={(e) => set({ speculative: e.target.checked ? "draft-mtp" : null, speculative_auto: false })} />
+            Speculative decoding (MTP): draft tokens with the model's own prediction layers. Faster generation (measured +80% on Qwen3.8-27B); output can differ slightly at near-ties.
           </label>
+        )}
+        {mtpStripped && (
+          <div className="faint wide">Speculative decoding (MTP) is unavailable: this file declares MTP but its MTP layers were removed.</div>
         )}
         {defaults?.has_projector && (
           <label className="check wide">
@@ -377,6 +387,7 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
       ) : null}
       {err && <div className="notice error">{err}{isThis && status?.error_hint ? ` ${status.error_hint}` : ""}</div>}
       {anotherLoaded && <div className="notice">Another model is loaded. Loading this one unloads it first.</div>}
+      {isThis && <LoadProgressView />}
 
       <div className="row">
         {loaded ? (
@@ -416,6 +427,11 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
             <dt>Load time</dt><dd>{status.load_seconds?.toFixed(1)} s</dd>
             <dt>Process</dt><dd>pid {status.pid}, port {status.port}</dd>
           </dl>
+          {running?.rpc?.length ? (
+            <div style={{ display: "grid", gap: 6, marginTop: 8 }}>
+              <LinkedPcsResult modelId={model.id} tensorSplit={running.tensor_split} refreshKey={status.instance_id} />
+            </div>
+          ) : null}
         </div>
       )}
       {isThis && status?.state === "failed" && !err && (
@@ -423,4 +439,12 @@ export function LoadPanel({ model, runtimes }: { model: ModelView; runtimes: Ins
       )}
     </div>
   );
+}
+
+/** "+6.0 GB GPU memory from Desk PC (its owner allows up to 8.0 GB)." per linked device. */
+function linkedLine(c: { peer: string; device: string; bytes: number; cpu: boolean; cap_bytes: number | null }[]): string {
+  return c
+    .filter((d) => d.bytes > 0)
+    .map((d) => `+${(d.bytes / 1e9).toFixed(1)} GB ${d.cpu ? "RAM" : "GPU memory"} from ${d.peer}${d.cap_bytes != null ? ` (its owner allows up to ${(d.cap_bytes / 1e9).toFixed(1)} GB)` : ""}. `)
+    .join("");
 }

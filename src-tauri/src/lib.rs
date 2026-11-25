@@ -57,6 +57,27 @@ pub fn run() {
             let st_mcp = state.clone();
             tauri::async_runtime::spawn(async move { services::mcp::autoconnect(st_mcp) });
 
+            // App-local Visual C++ runtime DLLs (a fresh Windows has none):
+            // point at the bundled copies and repair runtimes that lack them.
+            {
+                use tauri::Manager as _;
+                if let Ok(res) = app.path().resource_dir() {
+                    inference::vcrt::set_source_dir(res.join("vcrt"));
+                }
+                #[cfg(debug_assertions)]
+                inference::vcrt::set_source_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources").join("vcrt"));
+                let st_vc = state.clone();
+                tauri::async_runtime::spawn(async move {
+                    let n = tokio::task::spawn_blocking(move || st_vc.runtimes.repair_vcrt()).await.unwrap_or(0);
+                    if n > 0 {
+                        tracing::info!("repaired the Visual C++ runtime DLLs of {n} runtime(s)");
+                    }
+                });
+            }
+
+            // Linked PCs: record each reply's generation speed (alone vs split).
+            state.linking.watch_engine(state.engine.subscribe());
+
             // Re-read the flags of runtimes probed by an older app version
             // (e.g. the --spec-type list); runs `llama-server --help` only.
             let st_rt = state.clone();
@@ -118,6 +139,7 @@ pub fn run() {
                         st.api.stop().await;
                         st.mcp.disconnect_all().await;
                         services::exec::shutdown(&st).await;
+                        st.linking.shutdown().await;
                         st.engine.unload().await;
                         if let (Some(i), true) = (inst, was_running) {
                             let _ = st.db.set_instance_state(&i, "unloaded", None).await;
@@ -132,6 +154,10 @@ pub fn run() {
             commands::system::user_guide,
             commands::system::get_hardware,
             commands::system::get_resources,
+            commands::storage::get_storage,
+            commands::storage::check_storage_folder,
+            commands::storage::set_storage_dirs,
+            commands::storage::open_data_folder,
             commands::system::get_settings,
             commands::system::set_setting,
             commands::runtimes::list_runtimes,
@@ -173,6 +199,7 @@ pub fn run() {
             commands::chat::rename_conversation,
             commands::chat::duplicate_conversation,
             commands::chat::delete_conversation,
+            commands::chat::delete_conversations,
             commands::chat::update_chat_settings,
             commands::chat::chat_send,
             commands::chat::chat_stop,
@@ -225,6 +252,10 @@ pub fn run() {
             commands::mcp::preview_chat_tools,
             commands::mcp::run_tool_manually,
             commands::mcp::chat_tool_costs,
+            commands::search::get_search_settings,
+            commands::search::set_search_settings,
+            commands::search::set_search_key,
+            commands::search::test_web_search,
             commands::exec::list_environments,
             commands::exec::set_local_roots,
             commands::exec::set_local_outside,
@@ -268,13 +299,31 @@ pub fn run() {
             commands::tasks::import_skill,
             commands::tasks::export_skill,
             commands::tasks::match_skills,
+            commands::linking::linking_status,
+            commands::linking::linking_set_name,
+            commands::linking::linking_set_helper,
+            commands::linking::linking_start_code,
+            commands::linking::linking_cancel_code,
+            commands::linking::linking_pair,
+            commands::linking::linking_connect,
+            commands::linking::linking_set_split,
+            commands::linking::linking_set_send_jobs,
+            commands::linking::linking_unlink,
+            commands::linking::linking_clear_cache,
+            commands::linking::linking_check_reach,
+            commands::linking::linking_split_preview,
+            commands::linking::linking_set_peer_share,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Local AI Studio");
 }
 
-async fn build_state(paths: app_core::AppPaths) -> app_core::AppResult<AppState> {
+async fn build_state(mut paths: app_core::AppPaths) -> app_core::AppResult<AppState> {
     let db = persistence::Db::open(&paths.db_path).await?;
+    // An older install's models-folder setting becomes the recorded choice.
+    if let Some(m) = commands::storage::migrate_models_setting(&db, &paths).await {
+        paths.default_models_dir = m;
+    }
     let stale = db.close_stale_instances().await?;
     if stale > 0 {
         tracing::info!("marked {stale} model instance(s) from a previous run as unloaded");
@@ -312,6 +361,10 @@ async fn build_state(paths: app_core::AppPaths) -> app_core::AppResult<AppState>
         None => security::CredentialStore::new(),
     };
     let downloads = model_registry::downloads::DownloadManager::new(db.clone(), http.clone(), concurrency);
+    // Linked PCs: identity key from Credential Manager (this profile's
+    // namespace), pinned keys from the DB. "Let this PC help" starts off.
+    let linking = Arc::new(services::linking::LinkService::new(db.clone(), &credentials).await?);
+    linking.init_cache(&paths.data_dir);
     downloads.set_hf_token(credentials.get(state::CRED_HF_TOKEN).ok().flatten());
     let state = AppState {
         runtimes: inference::RuntimeManager::new(paths.runtimes_dir.clone(), http.clone()),
@@ -321,11 +374,13 @@ async fn build_state(paths: app_core::AppPaths) -> app_core::AppResult<AppState>
         api: local_api::ApiServer::default(),
         mcp: mcp_client::McpManager::new(),
         envs: Default::default(),
-        gen_gate: Mutex::new((None, Arc::new(tokio::sync::Semaphore::new(1)))),
+        gen_gate: Mutex::new((None, agent_runtime::Gate::new(1))),
         tasks: Mutex::new(Default::default()),
         tasks_starting: Mutex::new(Default::default()),
         subagent_stops: Mutex::new(Default::default()),
         pending_attachments: Mutex::new(Default::default()),
+        observed_offload: Mutex::new(Default::default()),
+        linking,
         approvals: Mutex::new(Default::default()),
         installs: Mutex::new(Default::default()),
         generations: Mutex::new(Default::default()),

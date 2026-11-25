@@ -244,7 +244,8 @@ pub fn scan(root: &Path) -> ScanResult {
     }
 
     let mut push = |path: PathBuf, shards: Vec<PathBuf>, mut problems: Vec<String>, result: &mut ScanResult| {
-        let meta = match gguf::read_metadata(&path) {
+        // Split models: MTP tensors can be in any shard.
+        let meta = match gguf::read_metadata_shards(&path, &shards) {
             Ok(m) => m,
             Err(e) => {
                 result.skipped.push(SkippedFile { path, reason: e.to_string() });

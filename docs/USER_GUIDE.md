@@ -51,8 +51,9 @@ Open Windows **Settings > Apps > Installed apps**, find **Local AI Studio**, and
 
 **System**
 - **Overview**: CPU, RAM, GPU and VRAM use, and what is loaded.
+- **Linked PCs**: link another PC so a model can be split across both (see "Linking PCs").
 - **Developer / API**: the local OpenAI-compatible server (see "Local API").
-- **Settings**: theme, model download folder, parallel downloads, your Hugging Face token, folders the app uses, and this guide.
+- **Settings**: theme, storage folders (models and runtimes; setup asks for them too), parallel downloads, your Hugging Face token, folders the app uses, and this guide.
 
 ## Agent Mode (in a chat)
 
@@ -62,6 +63,8 @@ In Agent Mode the model gets:
 - the built-in shell and file tools for the environment you pick ("Run them on"), if **Built-in shell and file tools** is ticked
 - the tools of the MCP servers you tick (none ticked means every connected server)
 - matching skills, if **Use skills** is ticked.
+
+**Web search.** The `web_search` tool (on by default in Agent and Plan chats and in tasks) lets the model look things up, then read the best pages with `web_fetch` and cite them. It runs without asking. Choose the provider in **Settings > Search**: DuckDuckGo (default, no key), LangSearch or Brave Search API (free keys, stored in Windows Credential Manager) or your own SearXNG. **Test** runs one query. The model may search 20 times per reply or task (a setting). Untick **Web search** in the chat's Tools menu or the task's tool list to turn it off there.
 
 **Tool calls** sets how the model calls tools:
 - **Automatic**: native tool calls when the model's chat template supports them, otherwise the text format.
@@ -154,6 +157,23 @@ A skill is a folder in `%APPDATA%\LocalAIStudio\skills` with a `SKILL.md`. That 
 - Requests from web pages are refused unless their origin is on your allow list.
 - Every request is logged on the page.
 
+## Linking PCs
+
+Two PCs with Local AI Studio can act as one bigger computer: a model too big for one PC is split, layer by layer, across both. Nothing else to install; the link is direct and encrypted by the app.
+
+**Link them once**
+1. On the PC that will help: **Linked PCs** > **Link this PC** > **Show linking code**. It shows this PC's address, the port it is really listening on (default 47070) and a 6-digit code that works once, for 10 minutes.
+2. On the other PC: **Linked PCs** > **Link to another PC**: type that address and the code, then **Link**. Leave the port empty unless the helper shows another one: the app tries 47070, then 50070 (the default of older versions). Five wrong codes lock it; make a new one.
+3. Both PCs now trust each other and reconnect without a code. Windows may ask whether Local AI Studio can use the network: allow it on private networks.
+
+**Lend a PC**: on the helper turn on **Let this PC help**. Choose which devices to share, CPU threads, and the most memory to lend. It is off after every restart, and other PCs can only use this PC while it is on. The helper needs the same llama.cpp runtime build as the main PC (Runtimes page).
+
+**Split a model**: in the linked PC's row, **Split model layers with this PC** is on for PCs on the same network and off for other networks (you can turn it on anyway). In **My Models**, tick **Use linked PCs** and load. The app splits the layers by each device's free memory. Every generated token waits for one network round trip (measured: about 1 ms per token for each ms of round trip), so the page shows the round trip and an estimate next to this PC's own speed. After loading, the load panel shows the measured speed; if it's slower than this PC alone, it suggests turning splitting off (it never does that by itself). Splitting helps most for models that don't fit on one PC.
+
+**Other networks**: on the helper click **Check access from other networks**. The app asks your router to open the port (UPnP) and shows your public address. If the router refuses, it lists the port-forward steps. If your internet provider shares one public address between customers (CGNAT), PCs on other networks can't connect directly, and the app says so. Over the internet each token waits 30-80 ms, so splitting is slow there.
+
+**Unlink** on either PC. Linking again needs a new code.
+
 ## Troubleshooting
 
 - **"VRAM spilled into shared memory"**: the NVIDIA driver quietly moved part of the model into system RAM. That makes it much slower instead of failing. Lower the context length, use a quantized KV cache (q8_0), offload fewer layers, or pick a smaller quantization. **Auto** GPU offload picks a fit for you.
@@ -162,6 +182,14 @@ A skill is a folder in `%APPDATA%\LocalAIStudio\skills` with a `SKILL.md`. That 
 - **"The model's chat template does not support tool calling"**: set Tool calls to Automatic or Text format in Chat settings, or load a model with tool calling (for example Qwen3 or Llama 3.1 and newer).
 - **A tool keeps asking**: choose "Allow for this chat/task" or "Always allow this tool", or change its permission on MCP Connections or Execution Environments.
 - **Sandbox will not start**: WSL must be installed (`wsl --install --no-distribution`) and virtualization enabled in the BIOS.
+- **Backend exits at once with 0xC0000135 / missing vcruntime140.dll**: a fresh Windows lacks the Visual C++ runtime. The app copies vcruntime140.dll, vcruntime140_1.dll and msvcp140.dll next to each runtime and retries once; if it still fails, install the Microsoft Visual C++ 2015-2022 Redistributable (x64).
+- **Linked PC: "nothing is listening"**: the other PC answered, but Local AI Studio there isn't running, or isn't showing a code or helping. Open Linked PCs there.
+- **Linked PC: "no answer"**: the other PC can't be reached: it's off or asleep, the address or port is wrong, or its firewall or router blocks the port (default 47070; from another network the port must be forwarded on its router).
+- **"Port ... is reserved by Windows or already in use"** (on the helper): after a reboot, Hyper-V, WSL, Docker or VirtualBox can reserve blocks of ports (50060-50159 was measured on one PC, which blocked the old default 50070). Check with `netsh interface ipv4 show excludedportrange protocol=tcp`. The default is now 47070, below that dynamic range. If the chosen port is still reserved or used, the app listens on the next free port from 47071 to 47099 and shows it (and in the linking code view); type that port on the other PC. A port stored as 50070 by an older version is moved to 47070 once, with a notice.
+- **Linked PC: "accepted the connection but closed it"**: something other than Local AI Studio answers on that port, usually a router or VirtualBox port forward with nothing behind it. Check the app is open there.
+- **Linked PC: "isn't helping right now"**: turn on Let this PC help on that PC, then load again.
+- **Linked PC: "identity key is not the one pinned"**: the other PC was reinstalled, or something is intercepting the connection. Unlink and link again with a new code.
+- **Linked PC: "Both PCs need the same runtime build"**: install the same llama.cpp runtime (for example b12250) on both PCs on the Runtimes page.
 - **Logs**: `%APPDATA%\LocalAIStudio\logs\app.log` (passwords and tokens are removed before writing).
 
 ## Where your data lives
@@ -169,11 +197,14 @@ A skill is a folder in `%APPDATA%\LocalAIStudio\skills` with a `SKILL.md`. That 
 | What | Where |
 |---|---|
 | Database (chats, tasks, settings, audit log) | `%APPDATA%\LocalAIStudio\app.db` |
-| llama.cpp runtimes | `%APPDATA%\LocalAIStudio\runtimes` |
+| llama.cpp runtimes | the Runtimes folder in Settings > Storage (new installs: `runtimes` in the install folder; older installs: `%APPDATA%\LocalAIStudio\runtimes`) |
+| Downloaded models | the Models folder in Settings > Storage (new installs: `models` in the install folder; older installs: `%USERPROFILE%\LocalAIStudio\models`) |
+| Which folders you chose | `%APPDATA%\LocalAIStudio\storage.json` |
 | Skills | `%APPDATA%\LocalAIStudio\skills` |
 | Trash (deleted files and skills) | `%APPDATA%\LocalAIStudio\trash` |
 | Sandboxes | `%APPDATA%\LocalAIStudio\sandboxes` |
 | SSH host keys you trusted | `%APPDATA%\LocalAIStudio\known_hosts` |
+| Weights a linked PC sent (helper cache) | `%APPDATA%\LocalAIStudio\rpc-cache` |
 | Logs | `%APPDATA%\LocalAIStudio\logs` |
 | Downloaded models | `%USERPROFILE%\LocalAIStudio\models` (changeable in Settings) |
 | Agent workspace on This PC | `%USERPROFILE%\LocalAIStudio\workspace` (changeable) |

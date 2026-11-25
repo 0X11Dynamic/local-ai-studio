@@ -28,7 +28,7 @@ const SHOTS = path.join(RUN, "screenshots");
 const SMALL = "DeepSeek-R1-Distill-Qwen-1.5B-OBLITERATED.i1-Q6_K";
 const MEDIUM = "gemma-4-E4B-it-Q4_K_M";
 const BIG = "Qwen3.8-27B-Q4_K_M";
-// Will's models: in LM Studio's folder until LM Studio is removed, then in the app's own folder.
+// Local models: in LM Studio's folder until LM Studio is removed, then in the app's own folder.
 const LMS_MODELS = path.join(os.homedir(), ".lmstudio", "models");
 const HAS_LMS = fs.existsSync(LMS_MODELS) && fs.readdirSync(LMS_MODELS, { recursive: true }).some((n) => String(n).toLowerCase().endsWith(".gguf"));
 const APP_MODELS = path.join(os.homedir(), "LocalAIStudio", "models");
@@ -156,7 +156,7 @@ await check("live usage refreshes", async () => {
 // ---------------- navigation ----------------
 await check("every nav item opens its page; unbuilt pages have no controls", async () => {
   const labels = await cdp.eval("[...document.querySelectorAll('.nav-item .nav-label')].map(e => e.innerText).filter(t => t !== 'Collapse')");
-  assert(labels.length === 13, `nav items: ${labels.length}`);
+  assert(labels.length === 14, `nav items: ${labels.length}`);
   const unbuilt = [];
   for (const l of labels) {
     await cdp.nav(l);

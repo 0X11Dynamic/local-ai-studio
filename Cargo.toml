@@ -15,13 +15,14 @@ members = [
     "crates/execution-ssh",
     "crates/execution-docker",
     "crates/skills",
+    "crates/linking",
     "src-tauri",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "UNLICENSED"
+license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
 publish = false
 
 [workspace.dependencies]
@@ -40,6 +41,7 @@ execution = { path = "crates/execution" }
 execution-ssh = { path = "crates/execution-ssh" }
 execution-docker = { path = "crates/execution-docker" }
 skills = { path = "crates/skills" }
+linking = { path = "crates/linking" }
 
 # External crates (versions checked on crates.io 2026-11-10)
 anyhow = "1.0.104"
@@ -63,7 +65,7 @@ walkdir = "2.5.0"
 sysinfo = { version = "0.40.1", default-features = false, features = ["system"] }
 nvml-wrapper = "0.13.0"
 keyring = "4.2.0"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_Storage_FileSystem"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_ProcessStatus","Win32_Security", "Win32_Storage_FileSystem"] }
 tempfile = "3.27.0"
 base64 = "0.23.1"
 
@@ -71,3 +73,22 @@ base64 = "0.23.1"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Linked PCs: the tunnel's crypto and framing are optimized even in debug
+# builds (unoptimized ChaCha20-Poly1305 added ~30 ms per 64 KB round trip).
+[profile.dev.package.linking]
+opt-level = 3
+[profile.dev.package.snow]
+opt-level = 3
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+[profile.dev.package.chacha20]
+opt-level = 3
+[profile.dev.package.poly1305]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.lz4_flex]
+opt-level = 3

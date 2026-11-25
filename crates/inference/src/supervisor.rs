@@ -20,15 +20,24 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::{Health, LlamaClient, ServerProps};
 use crate::config::LoadConfig;
+use crate::progress::{self, LoadProgress, PeerProbe, ProgressTracker, Sample, Throttle};
 use crate::runtime::InstalledRuntime;
 
 const LOG_CAPACITY: usize = 4000;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 static OFFLOAD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"offloaded (\d+)/(\d+) layers to GPU").unwrap());
-/// e.g. "CUDA0 model buffer size =  1208.11 MiB", "CUDA0 KV buffer size = 112.00 MiB"
+/// The weights are in place: llama.cpp starts building the context right
+/// after the last tensor is read and sent ("llama_context: constructing
+/// llama_context" on b12250; older builds log "llama_init_from_model:" or
+/// "llama_new_context_with_model:"). The "offloaded" line is logged before
+/// any weight is read, so it can't mark the end of loading.
+static WEIGHTS_LOADED_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"llama_context: constructing|llama_init_from_model:|llama_new_context_with_model:").unwrap());
+/// e.g. "CUDA0 model buffer size =  1208.11 MiB", "CUDA0 KV buffer size = 112.00 MiB",
+/// "RPC0[127.0.0.1:62565] model buffer size =  1367.54 MiB" (the endpoint is dropped).
 static BUFFER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?P<dev>[A-Za-z_]+[0-9]*(?:_Mapped|_Host)?)\s+(?P<kind>model|KV|compute|RS)\s+buffer size\s*=\s*(?P<mib>[\d.]+) MiB").unwrap()
+    Regex::new(r"(?P<dev>[A-Za-z_]+[0-9]*(?:_Mapped|_Host)?)(?:\[[^\]]*\])?\s+(?P<kind>model|KV|compute|RS)\s+buffer size\s*=\s*(?P<mib>[\d.]+) MiB").unwrap()
 });
 
 /// e.g. "- CUDA0   : NVIDIA GeForce RTX 5060 (8123 MiB, 7031 MiB free)"
@@ -122,6 +131,9 @@ pub enum EngineEvent {
     /// A backend instance was stopped on purpose (unload, replaced by another
     /// load, cancelled load, app exit). Crashes are reported via Status=Failed.
     InstanceEnded { instance_id: String },
+    /// How far a model load has got, per device (at most 5 per second; the
+    /// last one is `done` or `failed`).
+    LoadProgress { progress: Box<LoadProgress> },
 }
 
 /// What to load. The caller resolves ids to paths before calling the engine.
@@ -135,6 +147,10 @@ pub struct LoadRequest {
     pub config: LoadConfig,
     /// Name reported as the model id by the backend's OpenAI API.
     pub alias: Option<String>,
+    /// Size of the weights in bytes for load progress (0 = the model file's size).
+    pub model_bytes: u64,
+    /// Linked PCs receiving weights, for their progress rows.
+    pub probes: Vec<PeerProbe>,
 }
 
 struct Running {
@@ -203,6 +219,21 @@ impl Engine {
         l.iter().skip(l.len().saturating_sub(last)).cloned().collect()
     }
 
+    /// Add notes from the app (e.g. a setting it changed for this load) to
+    /// the status warnings, without duplicates.
+    pub fn add_warnings(&self, notes: &[String]) {
+        if notes.is_empty() {
+            return;
+        }
+        self.set_status(|s| {
+            for n in notes {
+                if !s.warnings.contains(n) {
+                    s.warnings.push(n.clone());
+                }
+            }
+        });
+    }
+
     fn set_status(&self, f: impl FnOnce(&mut EngineStatus)) {
         let snapshot = {
             let mut g = self.inner.lock().unwrap();
@@ -230,7 +261,22 @@ impl Engine {
         }
     }
 
+    /// Load a model. If the backend dies with STATUS_DLL_NOT_FOUND (the Visual
+    /// C++ runtime DLLs are missing), copy the bundled DLLs next to it and retry once.
     pub async fn load(&self, req: LoadRequest) -> AppResult<EngineStatus> {
+        crate::vcrt::ensure_next_to(&req.runtime.server_path);
+        let exe = req.runtime.server_path.clone();
+        let first = self.load_once(req.clone()).await;
+        match first {
+            Err(AppError::Runtime(ref m)) if crate::vcrt::is_missing_dll_error(m) && !crate::vcrt::ensure_next_to(&exe).is_empty() => {
+                tracing::warn!("backend was missing the Visual C++ runtime; repaired, retrying once");
+                self.load_once(req).await
+            }
+            other => other,
+        }
+    }
+
+    async fn load_once(&self, req: LoadRequest) -> AppResult<EngineStatus> {
         req.config.validate().map_err(AppError::InvalidInput)?;
         if !req.model_path.is_file() {
             return Err(AppError::NotFound(format!("model file not found: {}", req.model_path.display())));
@@ -352,10 +398,38 @@ impl Engine {
             });
         }
 
-        // Wait for readiness.
+        // Wait for readiness, reporting progress on the way.
         let client = LlamaClient::new(port);
         let deadline = Instant::now() + LOAD_TIMEOUT;
+        let model_bytes = if req.model_bytes > 0 {
+            req.model_bytes
+        } else {
+            let len = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            len(&req.model_path) + req.projector_path.as_deref().map(len).unwrap_or(0)
+        };
+        let mut tracker = ProgressTracker::new(model_bytes, &req.probes);
+        let mut throttle = Throttle::default();
+        let mut first_counters: Option<(u64, u64)> = None;
+        let mut last_progress: Option<LoadProgress> = None;
         loop {
+            if throttle.ready(started.elapsed(), last_progress.is_none()) {
+                let facts = offload.lock().unwrap().clone();
+                let counters = progress::process_counters(pid);
+                let first = *first_counters.get_or_insert(counters.unwrap_or((0, 0)));
+                let local_bytes = counters.map(|c| progress::local_read_bytes(first, c)).unwrap_or(0);
+                for (i, bytes) in rpc_expected_bytes(&facts.buffers, req.probes.len()) {
+                    tracker.set_expected(i, bytes);
+                }
+                let p = tracker.update(&Sample {
+                    elapsed_secs: started.elapsed().as_secs_f64(),
+                    local_bytes,
+                    peer_sent: req.probes.iter().map(progress::probe_sent).collect(),
+                    peer_cached: req.probes.iter().map(progress::probe_cached).collect(),
+                    weights_done: facts.weights_loaded,
+                });
+                let _ = self.events.send(EngineEvent::LoadProgress { progress: Box::new(p.clone()) });
+                last_progress = Some(p);
+            }
             if cancel.is_cancelled() {
                 drop(_op);
                 self.unload().await;
@@ -395,6 +469,10 @@ impl Engine {
             g.load_cancel = None;
             g.speed_checked = false;
         }
+        if let Some(last) = &last_progress {
+            let done = tracker.finished(last, secs);
+            let _ = self.events.send(EngineEvent::LoadProgress { progress: Box::new(done) });
+        }
         let fit = fits_layers(&req.config, &req.runtime);
         if let Some((n, m)) = facts.offloaded {
             tracing::info!("llama.cpp put {n} of {m} layers on the GPU{}", if fit { " (--fit)" } else { "" });
@@ -432,6 +510,9 @@ impl Engine {
 
     fn fail(&self, msg: &str, hint: Option<String>) {
         let msg = msg.to_string();
+        if self.inner.lock().unwrap().status.state == EngineState::Loading {
+            let _ = self.events.send(EngineEvent::LoadProgress { progress: Box::new(LoadProgress::failed(&msg)) });
+        }
         self.set_status(|s| {
             s.state = EngineState::Failed;
             s.error = Some(msg);
@@ -483,10 +564,27 @@ impl Engine {
     }
 }
 
+/// Bytes each linked PC will receive, from the backend's
+/// "RPCn model buffer size" lines: with one linked PC all RPC devices belong
+/// to it; with several, only when there is one RPC device per PC (in order).
+fn rpc_expected_bytes(buffers: &[BufferReport], peers: usize) -> Vec<(usize, u64)> {
+    let mut rpc: Vec<&BufferReport> = buffers.iter().filter(|b| b.kind == "model" && b.device.starts_with("RPC")).collect();
+    rpc.sort_by_key(|b| b.device.trim_start_matches("RPC").parse::<u32>().unwrap_or(u32::MAX));
+    let bytes = |b: &BufferReport| (b.mib * 1024.0 * 1024.0) as u64;
+    match (peers, rpc.len()) {
+        (0, _) | (_, 0) => Vec::new(),
+        (1, _) => vec![(0, rpc.iter().map(|b| bytes(b)).sum())],
+        (n, m) if n == m => rpc.iter().enumerate().map(|(i, b)| (i, bytes(b))).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Facts parsed from backend log lines while loading.
 #[derive(Debug, Clone, Default)]
 struct LogFacts {
     offloaded: Option<(u32, u32)>,
+    /// All weights are in place (see [`WEIGHTS_LOADED_RE`]).
+    weights_loaded: bool,
     buffers: Vec<BufferReport>,
     devices: Vec<DeviceReport>,
 }
@@ -495,6 +593,9 @@ impl LogFacts {
     fn observe(&mut self, line: &str) {
         if let Some(c) = OFFLOAD_RE.captures(line) {
             self.offloaded = Some((c[1].parse().unwrap_or(0), c[2].parse().unwrap_or(0)));
+        }
+        if !self.weights_loaded && WEIGHTS_LOADED_RE.is_match(line) {
+            self.weights_loaded = true;
         }
         if let Some(c) = DEVICE_RE.captures(line) {
             let d = DeviceReport {
@@ -622,7 +723,19 @@ fn classify(msg: String) -> AppError {
 
 /// Turn the last backend log lines into a readable error and a hint.
 pub fn diagnose(tail: &str, code: Option<i32>) -> (String, Option<String>) {
+    if code == Some(crate::vcrt::STATUS_DLL_NOT_FOUND) {
+        let (m, h) = crate::vcrt::missing_dll_message();
+        return (m, Some(h));
+    }
     let t = tail.to_lowercase();
+    // A linked PC's buffer (RPCn) couldn't be allocated: its owner's limit
+    // (the helper answers like a failed allocation) or its memory ran out.
+    if t.lines().any(|l| l.contains("rpc") && (l.contains("allocate") || l.contains("alloc_buffer"))) {
+        return (
+            "a linked PC could not allocate the memory for its share of the model".into(),
+            Some("Its owner's sharing limit may be lower than this load needs (see the Linked PCs page there), or it ran out of memory. Use a smaller context, or ask them to raise the limit.".into()),
+        );
+    }
     let oom = ["out of memory", "cudamalloc failed", "failed to allocate", "unable to allocate", "cuda error: out of memory"];
     if oom.iter().any(|p| t.contains(p)) {
         return (
@@ -675,6 +788,50 @@ fn free_port() -> AppResult<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linked_pc_share_comes_from_the_rpc_model_buffers() {
+        let mut f = LogFacts::default();
+        for l in [
+            "load_tensors:        RPC1 model buffer size =  2048.00 MiB",
+            "load_tensors:        RPC0 model buffer size =  1024.00 MiB",
+            "load_tensors:        CUDA0 model buffer size =  5000.00 MiB",
+        ] {
+            f.observe(l);
+        }
+        let mib = 1024u64 * 1024;
+        // One linked PC owns every RPC device.
+        assert_eq!(rpc_expected_bytes(&f.buffers, 1), vec![(0, 3072 * mib)]);
+        // One RPC device per PC: in order.
+        assert_eq!(rpc_expected_bytes(&f.buffers, 2), vec![(0, 1024 * mib), (1, 2048 * mib)]);
+        // Unclear mapping or nothing linked: no refinement.
+        assert!(rpc_expected_bytes(&f.buffers, 3).is_empty());
+        assert!(rpc_expected_bytes(&f.buffers, 0).is_empty());
+    }
+
+    /// b12250 with a linked PC (VM test 2026-11-23): the RPC device line
+    /// carries its endpoint, and the weights are sent between the buffer
+    /// lines (0.85 s) and "constructing llama_context" (2 min later).
+    #[test]
+    fn rpc_buffer_line_with_endpoint_and_the_real_end_of_loading() {
+        let mut f = LogFacts::default();
+        for l in [
+            "0.00.848.603 I load_tensors: offloaded 37/37 layers to GPU",
+            "0.00.848.606 I load_tensors:   CPU_Mapped model buffer size =   304.28 MiB",
+            "0.00.848.608 I load_tensors:        CUDA0 model buffer size =  1008.37 MiB",
+            "0.00.848.609 I load_tensors: RPC0[127.0.0.1:62565] model buffer size =  1367.54 MiB",
+        ] {
+            f.observe(l);
+        }
+        assert_eq!(f.offloaded, Some((37, 37)));
+        assert!(!f.weights_loaded, "the layer line comes before any weight is sent");
+        let mib = 1024.0 * 1024.0;
+        assert_eq!(rpc_expected_bytes(&f.buffers, 1), vec![(0, (1367.54 * mib) as u64)]);
+        f.observe("2.09.100.273 I llama_context: constructing llama_context");
+        assert!(f.weights_loaded);
+        f.observe("2.09.265.672 I sched_reserve: RPC0[127.0.0.1:62565] compute buffer size =   156.05 MiB");
+        assert!(f.buffers.iter().any(|b| b.device == "RPC0" && b.kind == "compute"));
+    }
 
     #[test]
     fn parses_offload_and_buffer_lines_from_real_log() {
@@ -777,6 +934,8 @@ mod tests {
         assert!(m.contains("out of memory") && h.unwrap().contains("context length"));
         let (m, _) = diagnose("gguf_init_from_file_impl: invalid magic characters: 'PK..'", Some(1));
         assert!(m.contains("not a valid GGUF"));
+        let (m, h) = diagnose("llama_model_load: error loading model: unable to allocate RPC0[127.0.0.1:53110] buffer", Some(1));
+        assert!(m.contains("linked PC") && h.unwrap().contains("sharing limit"), "{m}");
         let (m, _) = diagnose("something odd\nfinal line here", Some(3));
         assert!(m.contains("exit code 3") && m.contains("final line here"));
     }

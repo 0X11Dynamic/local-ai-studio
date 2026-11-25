@@ -6,8 +6,12 @@ use super::Cmd;
 use crate::state::SharedState;
 
 #[tauri::command]
-pub fn get_paths(state: State<'_, SharedState>) -> app_core::AppPaths {
-    state.paths.clone()
+pub async fn get_paths(state: State<'_, SharedState>) -> Cmd<app_core::AppPaths> {
+    // The folders can change while the app runs (Settings -> Storage).
+    let mut p = state.paths.clone();
+    p.runtimes_dir = state.runtimes.dir();
+    p.default_models_dir = state.models_dir().await;
+    Ok(p)
 }
 
 /// The user guide, embedded at build time so it works offline after install.
@@ -59,8 +63,18 @@ pub async fn set_setting(state: State<'_, SharedState>, key: String, value: serd
         return Err(AppError::InvalidInput("concurrent downloads must be 1-8".into()));
     }
     if key == "library.models_dir" {
+        // Kept for older callers; storage.json is the single source of truth.
         let p = value.as_str().ok_or_else(|| AppError::InvalidInput("models_dir must be a path".into()))?;
-        std::fs::create_dir_all(p)?;
+        let target = if p.trim().is_empty() {
+            super::storage::default_models_dir(&state.paths).to_string_lossy().into_owned()
+        } else {
+            p.to_string()
+        };
+        super::storage::apply(&state, Some(target), None, false).await?;
+        if p.trim().is_empty() {
+            return state.db.set_setting(&key, &"").await;
+        }
+        return Ok(());
     }
     state.db.set_setting(&key, &value).await
 }

@@ -1,16 +1,16 @@
 import { useEffect, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { invoke } from "@tauri-apps/api/core";
 import { Markdown } from "../components/Markdown";
 import { OPEN_SETUP_EVENT } from "../components/FirstRun";
 import { api, errorMessage, type AppPaths } from "../lib/api";
 import { api2 } from "../lib/api2";
+import { SearchSettingsPanel } from "../components/SearchSettingsPanel";
+import { StoragePanel } from "../components/StoragePanel";
 
 export function Settings() {
   const [paths, setPaths] = useState<AppPaths | null>(null);
   const [theme, setTheme] = useState<"dark" | "light">("dark");
-  const [modelsDir, setModelsDir] = useState("");
   const [concurrency, setConcurrency] = useState(2);
   const [hasHf, setHasHf] = useState(false);
   const [hfToken, setHfToken] = useState("");
@@ -23,7 +23,6 @@ export function Settings() {
     api.getPaths().then(setPaths);
     api.getSettings().then((s) => {
       setTheme(s["ui.theme"] === "light" ? "light" : "dark");
-      if (typeof s["library.models_dir"] === "string") setModelsDir(s["library.models_dir"] as string);
       if (typeof s["downloads.concurrency"] === "number") setConcurrency(s["downloads.concurrency"] as number);
     });
     api2.hasHfToken().then(setHasHf);
@@ -47,11 +46,6 @@ export function Settings() {
     await api.setSetting("ui.theme", t);
   };
 
-  const pickDir = async () => {
-    const d = await open({ directory: true });
-    if (d) run(async () => { await api.setSetting("library.models_dir", d); setModelsDir(d); }, "Download folder changed. Existing models stay where they are.");
-  };
-
   return (
     <div className="page">
       {err && <div className="notice error" style={{ marginBottom: 10 }}>{err}</div>}
@@ -66,15 +60,8 @@ export function Settings() {
       </div>
 
       <h2>Downloads</h2>
+      <p className="lede">The models folder is under Storage below.</p>
       <div className="form-grid" style={{ maxWidth: 720 }}>
-        <div className="field wide">
-          <label>Download folder for new models</label>
-          <div className="row">
-            <span className="mono">{modelsDir || paths?.default_models_dir}</span>
-            <button className="btn sm" onClick={pickDir}>Change</button>
-            {modelsDir && <button className="btn sm ghost" onClick={() => run(async () => { await api.setSetting("library.models_dir", ""); setModelsDir(""); }, "Using the default folder.")}>Use default</button>}
-          </div>
-        </div>
         <div className="field">
           <label htmlFor="conc">Downloads at the same time</label>
           <select id="conc" className="input" value={concurrency} onChange={(e) => {
@@ -95,6 +82,10 @@ export function Settings() {
           <span className="help">Stored in Windows Credential Manager and sent only to huggingface.co. It is never shown again or written to logs.</span>
         </div>
       </div>
+
+      <h2>Search</h2>
+      <p className="lede">The web_search tool lets models in Agent and Plan mode look things up. Pick where searches go.</p>
+      <SearchSettingsPanel />
 
       <h2>Setup</h2>
       <p className="lede">Check this PC again, install the recommended runtime and get a starter model.</p>
@@ -118,12 +109,12 @@ export function Settings() {
       )}
 
       <h2>Storage</h2>
+      <p className="lede">Where models and runtimes are kept. Anything you already have stays where it is unless you move it.</p>
+      <StoragePanel onMessage={(m) => { setErr(null); setMsg(m); }} onError={(m) => { setMsg(null); setErr(m); }} />
       {paths && (
-        <dl className="kv">
-          <dt>App data</dt>
-          <dd><button className="btn ghost sm mono" onClick={() => revealItemInDir(paths.db_path)}>{paths.data_dir}</button></dd>
-          <dt>Database</dt><dd>{paths.db_path}</dd>
-          <dt>Runtimes</dt><dd>{paths.runtimes_dir}</dd>
+        <dl className="kv" style={{ marginTop: 14 }}>
+          <dt>Database</dt>
+          <dd><button className="btn ghost sm mono" onClick={() => revealItemInDir(paths.db_path)}>{paths.db_path}</button></dd>
           <dt>Logs</dt><dd>{paths.logs_dir}</dd>
           <dt>LM Studio models</dt><dd>{paths.lmstudio_models_dir ?? "not found"} (registered in place, read-only)</dd>
         </dl>

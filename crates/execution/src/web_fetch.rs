@@ -369,7 +369,7 @@ pub fn html_to_text(html: &str, base: &Url) -> String {
 
 /// Index just past the `>` that ends the tag starting at `start` (quotes
 /// in attribute values may contain `>`).
-fn tag_end(b: &[u8], start: usize) -> usize {
+pub(crate) fn tag_end(b: &[u8], start: usize) -> usize {
     let mut q: Option<u8> = None;
     let mut j = start + 1;
     while j < b.len() {
@@ -390,7 +390,7 @@ fn find_ci(hay: &str, from: usize, needle: &str) -> Option<usize> {
 }
 
 /// The value of attribute `name` in a tag's inside (`a href="x" ...`).
-fn attr(tag: &str, name: &str) -> Option<String> {
+pub(crate) fn attr(tag: &str, name: &str) -> Option<String> {
     let lower = tag.to_ascii_lowercase();
     let mut from = 0;
     while let Some(pos) = lower[from..].find(name).map(|p| p + from) {

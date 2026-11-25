@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { api, errorMessage, type HardwareInfo, type InstalledRuntime, type ModelView, type ResourceSnapshot } from "../lib/api";
 import { bytes, percent } from "../lib/format";
 import { useEngine } from "../lib/engine";
@@ -31,8 +32,33 @@ export function Overview({ go }: { go: (p: PageId) => void }) {
 
   useEffect(() => {
     api.getHardware().then(setHw).catch((e) => setErr(errorMessage(e)));
-    api.listRuntimes().then(setRuntimes).catch(() => setRuntimes([]));
-    api.listModels().then(setModels).catch(() => setModels([]));
+  }, []);
+
+  // The next-step banner follows runtimes and models installed while this
+  // page is open (first-run setup installs a runtime over it).
+  useEffect(() => {
+    const refresh = () => {
+      api.listRuntimes().then(setRuntimes).catch(() => setRuntimes([]));
+      api.listModels().then(setModels).catch(() => setModels([]));
+    };
+    refresh();
+    let t: ReturnType<typeof setTimeout> | null = null;
+    const later = () => {
+      if (t) clearTimeout(t);
+      t = setTimeout(refresh, 500);
+    };
+    const un = listen("runtime://install-progress", later);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") refresh();
+    };
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      if (t) clearTimeout(t);
+      un.then((f) => f());
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, []);
 
   const gpu = hw?.gpus[0];

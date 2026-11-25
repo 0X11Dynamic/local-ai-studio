@@ -21,8 +21,10 @@ export interface ServerView {
 export interface AutoConnect { attempt: number; max_attempts: number; retry_in_secs: number | null; gave_up: boolean }
 /** One tool source in a chat's Tools menu: "builtin" or an MCP server. */
 export interface ToolCostEntry {
-  id: string; name: string; kind: "builtin" | "mcp"; state: string; enabled: boolean; in_chat: boolean;
+  id: string; name: string; kind: "builtin" | "websearch" | "mcp"; state: string; enabled: boolean; in_chat: boolean;
   tool_count: number; tokens: number; error: string | null;
+  /** Listed by name only; the model loads these tools' details on demand. */
+  deferred?: boolean;
 }
 export interface ToolCosts { exact: boolean; mode: "chat" | "plan" | "agent"; entries: ToolCostEntry[] }
 export interface SecretsPatch { env?: Record<string, string | null>; headers?: Record<string, string | null>; bearer?: string | null }

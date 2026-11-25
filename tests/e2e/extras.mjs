@@ -6,7 +6,7 @@
 //   cargo build -p local-ai-studio --features tauri/custom-protocol
 //   node tests/e2e/extras.mjs            (LAS_SKIP_BIG=1 skips the 27B load)
 //
-// Uses Will's real model files read-only (registered by path in the test
+// Uses real local model files read-only (registered by path in the test
 // profile, never moved), plus the cached Qwen3-4B test model. The 27B
 // Share-with-CPU check needs ~16 GB of free RAM: close heavy apps first.
 import fs from "node:fs";
@@ -17,7 +17,7 @@ import { Cdp, countProcesses, launchApp, closeAppGracefully, makeProfile, makeRu
 
 const ROOT = path.resolve(import.meta.dirname, "../..");
 const EXE = exePath(ROOT);
-// Will's models: LM Studio's folder until it is removed, then the app's own folder.
+// Local models: LM Studio's folder until it is removed, then the app's own folder.
 const LMS_DIR = path.join(os.homedir(), ".lmstudio", "models");
 const LMS = fs.existsSync(LMS_DIR) && fs.readdirSync(LMS_DIR, { recursive: true }).some((n) => String(n).toLowerCase().endsWith(".gguf")) ? LMS_DIR : path.join(os.homedir(), "LocalAIStudio", "models");
 const M = {
@@ -140,7 +140,7 @@ await check("Plan mode chat: read-only tools, a numbered plan, nothing changed o
   ids.planConv = conv;
   const ctx = await inv("chat_context", { id: conv, draft: "" });
   // fs_list, fs_read, fs_search, web_fetch and the ask-every-time shell.
-  assert(ctx.agent_mode && ctx.tool_count > 0 && ctx.tool_count <= 5, `plan tool count ${ctx.tool_count}`);
+  assert(ctx.agent_mode && ctx.tool_count > 0 && ctx.tool_count <= 6, `plan tool count (fs_list, fs_read, fs_search, web_fetch, web_search, shell-asks) ${ctx.tool_count}`);
   const agentConv = await convWith({ agent_mode: true, mode: "agent", builtin_tools: true, tool_servers: [] });
   const actx = await inv("chat_context", { id: agentConv, draft: "" });
   assert(actx.tool_count > ctx.tool_count, `agent ${actx.tool_count} vs plan ${ctx.tool_count}`);

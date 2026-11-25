@@ -6,3 +6,11 @@
 *.gguf
 .env
 .env.*
+/.claude/
+
+# VC++ runtime DLLs are copied from the build machine by src-tauri/build.rs
+/src-tauri/resources/vcrt/*.dll
+
+
+# CodeGraph index (local only)
+/.codegraph/

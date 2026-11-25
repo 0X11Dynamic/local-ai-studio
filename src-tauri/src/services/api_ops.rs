@@ -44,16 +44,15 @@ impl local_api::NativeOps for AppOps {
             .ok_or_else(|| AppError::InvalidInput("body needs \"model_id\" (see GET /api/models)".into()))?
             .to_string();
         let m = st.db.get_model(&model_id).await?;
+        let runtime = body["runtime_id"].as_str().map(str::to_string);
         let config: LoadConfig = match body.get("config") {
             Some(c) if !c.is_null() => serde_json::from_value(c.clone())?,
-            _ => m
-                .default_config
-                .as_deref()
-                .or(m.last_config.as_deref())
-                .and_then(|c| serde_json::from_str(c).ok())
-                .unwrap_or_default(),
+            _ => match m.default_config.as_deref().and_then(|c| serde_json::from_str(c).ok()) {
+                Some(c) => c,
+                // "Last used", upgraded like the load panel's defaults.
+                None => crate::commands::models::last_used_config(&st, &m, runtime.as_deref()).await.unwrap_or_default(),
+            },
         };
-        let runtime = body["runtime_id"].as_str().map(str::to_string);
         let s = do_load(&st, model_id, config, runtime).await?;
         Ok(serde_json::to_value(&s)?)
     }

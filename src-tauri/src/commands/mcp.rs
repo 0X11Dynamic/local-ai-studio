@@ -400,10 +400,10 @@ pub async fn run_tool_manually(
 
 #[derive(Debug, Serialize)]
 pub struct ToolCostEntry {
-    /// "builtin" for the built-in tools, else the MCP server id.
+    /// "builtin" for the built-in tools, "web_search" for web search, else the MCP server id.
     pub id: String,
     pub name: String,
-    /// builtin | mcp
+    /// builtin | websearch | mcp
     pub kind: String,
     /// MCP connection state (built-in: "connected", or "error").
     pub state: String,
@@ -417,6 +417,9 @@ pub struct ToolCostEntry {
     /// model is loaded, else about 4 characters per token).
     pub tokens: u64,
     pub error: Option<String>,
+    /// Its tools are listed by name only and loaded on demand in this chat
+    /// ("Load tool details on demand" with many tools).
+    pub deferred: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -448,6 +451,8 @@ pub async fn chat_tool_costs(state: State<'_, SharedState>, id: String) -> Cmd<T
         Ok((t, _)) => (if plan { chat::plan_filter(&st, t) } else { t }, None),
         Err(e) => (vec![], Some(e.to_string())),
     };
+    // Web search has its own line (and switch); the built-in line counts the rest.
+    let (search, builtin): (Vec<_>, Vec<_>) = builtin.into_iter().partition(chat::is_web_search);
     entries.push(ToolCostEntry {
         id: "builtin".into(),
         name: format!("Built-in tools ({label})"),
@@ -458,7 +463,22 @@ pub async fn chat_tool_costs(state: State<'_, SharedState>, id: String) -> Cmd<T
         tool_count: builtin.len(),
         tokens: tool_tokens(&st, client.as_ref(), &builtin).await,
         error: berr,
+        deferred: false,
     });
+    if !search.is_empty() {
+        entries.push(ToolCostEntry {
+            id: "web_search".into(),
+            name: "Web search".into(),
+            kind: "websearch".into(),
+            state: "connected".into(),
+            enabled: true,
+            in_chat: s.web_search,
+            tool_count: search.len(),
+            tokens: tool_tokens(&st, client.as_ref(), &search).await,
+            error: None,
+            deferred: false,
+        });
+    }
     // MCP servers: tools of every connected, turned-on server.
     let all = svc::exposed_tools(&st, &[]).await?;
     let all = if plan { chat::plan_filter(&st, all) } else { all };
@@ -475,9 +495,27 @@ pub async fn chat_tool_costs(state: State<'_, SharedState>, id: String) -> Cmd<T
             enabled: row.enabled != 0,
             tool_count: mine.len(),
             error: status.error.clone(),
+            deferred: false,
         });
     }
+    // Deferred loading: which servers this chat lists by name only (same rule as the chat).
+    if s.defer_tools && mode != "chat" {
+        let live = |e: &ToolCostEntry| e.in_chat && e.enabled && e.state == "connected";
+        let groups: Vec<(String, usize)> = entries.iter().filter(|e| e.kind == "mcp" && live(e)).map(|e| (e.id.clone(), e.tool_count)).collect();
+        // Same count as `pick_deferred` gets in the chat: the subagent tools are in the list too.
+        let total = deferral_total(entries.iter().filter(|e| live(e)).map(|e| e.tool_count).sum(), &s, plan);
+        let deferred = agent_runtime::deferred::deferred_servers(&groups, total);
+        for e in entries.iter_mut() {
+            e.deferred = deferred.contains(&e.id);
+        }
+    }
     Ok(ToolCosts { exact, mode: mode.into(), entries })
+}
+
+/// Tools the chat's deferral threshold counts: its live sources plus the
+/// subagent tools (added when subagents are on, never in Plan mode).
+fn deferral_total(sources: usize, s: &crate::services::chat::ChatSettings, plan: bool) -> usize {
+    sources + if !plan && crate::services::tasks::chat_offers_subagents(s) { crate::services::tasks::subagent_tools("chat").len() } else { 0 }
 }
 
 /// Tokens of these tools' definitions as sent to the model.
@@ -490,5 +528,21 @@ async fn tool_tokens(st: &SharedState, client: Option<&inference::LlamaClient>, 
     match client {
         Some(c) => crate::services::chat::count_tokens(st, c, &json).await.unwrap_or(rough),
         None => rough,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deferral_total_counts_the_subagent_tools_like_the_chat_does() {
+        let on: crate::services::chat::ChatSettings = serde_json::from_str(r#"{"agent_mode":true,"subagents":true}"#).unwrap();
+        let off: crate::services::chat::ChatSettings = serde_json::from_str(r#"{"agent_mode":true,"subagents":false}"#).unwrap();
+        let n = crate::services::tasks::subagent_tools("chat").len();
+        assert!(n > 0);
+        assert_eq!(deferral_total(20, &on, false), 20 + n);
+        assert_eq!(deferral_total(20, &on, true), 20, "Plan mode: no subagent tools");
+        assert_eq!(deferral_total(20, &off, false), 20);
     }
 }

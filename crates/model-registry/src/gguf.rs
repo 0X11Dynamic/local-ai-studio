@@ -18,6 +18,14 @@ const MAGIC: &[u8; 4] = b"GGUF";
 const MAX_STRING: u64 = 64 * 1024 * 1024; // chat templates can be large, but not this large
 const MAX_KV: u64 = 1_000_000;
 const MAX_ARRAY: u64 = 50_000_000;
+const MAX_TENSORS: u64 = 100_000;
+const MAX_TENSOR_NAME: u64 = 4096;
+/// Most tensor-name bytes read from one file's tensor-info section.
+const MAX_TENSOR_NAME_BYTES: u64 = 64 * 1024 * 1024;
+/// Highest `block_count` taken from a header (the largest real models have a
+/// few hundred); a hostile value would make per-layer estimate loops huge.
+pub const MAX_BLOCK_COUNT: u64 = 4096;
+const MAX_TENSOR_DIMS: u32 = 8;
 
 #[derive(Debug)]
 pub enum GgufError {
@@ -97,6 +105,83 @@ pub struct GgufHeader {
     pub version: u32,
     pub tensor_count: u64,
     pub kv: BTreeMap<String, Value>,
+    /// MTP / NextN tensor names (containing "nextn") from the tensor-info
+    /// section (names only, never data). Other names are not kept.
+    #[serde(skip)]
+    pub tensor_names: Vec<String>,
+    /// The whole tensor-info section was read (false: corrupt or over the
+    /// limits, so `tensor_names` says nothing about which tensors exist).
+    #[serde(skip)]
+    pub tensors_read: bool,
+    /// Bytes of the tensors llama.cpp keeps in host memory whatever `-ngl`
+    /// says ([`HOST_TENSORS`]), from their dims and type (never their data).
+    /// None when there are none or a size is unknown.
+    #[serde(skip)]
+    pub host_weight_bytes: Option<u64>,
+}
+
+/// Tensors llama.cpp always keeps in host (CPU) memory, not on the GPU:
+/// Gemma 3n / Gemma 4's per-layer embedding table ("PLE", an input-layer
+/// tensor read with get_rows). Gemma-4-E4B Q4_K_M: 2.31 GB of the 5.34 GB
+/// file; measured with every layer on an 8 GB GPU at -c 98304: 5264 MiB VRAM
+/// in total, KV 1576 MiB.
+pub const HOST_TENSORS: &[&str] = &["per_layer_token_embd.weight"];
+
+/// (elements per block, bytes per block) of a GGML tensor type (ggml.h ids);
+/// None for types not in the table.
+pub fn ggml_type_size(ty: u32) -> Option<(u64, u64)> {
+    Some(match ty {
+        0 => (1, 4),      // F32
+        1 => (1, 2),      // F16
+        2 => (32, 18),    // Q4_0
+        3 => (32, 20),    // Q4_1
+        6 => (32, 22),    // Q5_0
+        7 => (32, 24),    // Q5_1
+        8 => (32, 34),    // Q8_0
+        9 => (32, 36),    // Q8_1
+        10 => (256, 84),  // Q2_K
+        11 => (256, 110), // Q3_K
+        12 => (256, 144), // Q4_K
+        13 => (256, 176), // Q5_K
+        14 => (256, 210), // Q6_K
+        15 => (256, 292), // Q8_K
+        16 => (256, 66),  // IQ2_XXS
+        17 => (256, 74),  // IQ2_XS
+        18 => (256, 98),  // IQ3_XXS
+        19 => (256, 50),  // IQ1_S
+        20 => (32, 18),   // IQ4_NL
+        21 => (256, 110), // IQ3_S
+        22 => (256, 82),  // IQ2_S
+        23 => (256, 136), // IQ4_XS
+        24 => (1, 1),     // I8
+        25 => (1, 2),     // I16
+        26 => (1, 4),     // I32
+        27 | 28 => (1, 8), // I64, F64
+        29 => (256, 56),  // IQ1_M
+        30 => (1, 2),     // BF16
+        34 => (256, 54),  // TQ1_0
+        35 => (256, 66),  // TQ2_0
+        39 => (32, 17),   // MXFP4
+        _ => return None,
+    })
+}
+
+/// Bytes of a tensor with `dims` and GGML type `ty`; None for an unknown
+/// type, a row that is not a whole number of blocks, or an overflow.
+pub fn tensor_bytes(dims: &[u64], ty: u32) -> Option<u64> {
+    let (blk, sz) = ggml_type_size(ty)?;
+    if dims.first().is_some_and(|&d| d % blk != 0) {
+        return None;
+    }
+    let ne = dims.iter().try_fold(1u64, |a, &d| a.checked_mul(d))?;
+    (ne / blk).checked_mul(sz)
+}
+
+/// What the tensor-info section tells the app.
+#[derive(Debug, Default)]
+struct TensorInfo {
+    names: Vec<String>,
+    host_bytes: Option<u64>,
 }
 
 /// Fields the app uses, extracted from the raw key/value map.
@@ -157,11 +242,31 @@ pub struct ModelMetadata {
     /// `<arch>.nextn_predict_layers`: multi-token-prediction (MTP / NextN)
     /// layers at the end of `block_count`. They have no KV cache in a normal
     /// load; llama-server can use them for speculative decoding (`--spec-type draft-mtp`).
+    /// Set only when the file really contains the MTP tensors; see
+    /// `mtp_layers_declared` for the raw header value.
     #[serde(default)]
     pub mtp_layers: Option<u64>,
+    /// Raw `<arch>.nextn_predict_layers`. Some files keep the key but had the
+    /// MTP tensors stripped (declared > 0 while `mtp_layers` is None).
+    #[serde(default)]
+    pub mtp_layers_declared: Option<u64>,
+    /// MTP is declared but the tensor list (of some shard) could not be read,
+    /// so it is unknown whether the MTP tensors are there: not "removed", and
+    /// speculative MTP is not turned on by default.
+    #[serde(default)]
+    pub mtp_unknown: bool,
+    /// Not stored: set by the caller for one estimate when speculative MTP
+    /// decoding is on, so the MTP layer's own KV cache is counted.
+    #[serde(skip)]
+    pub mtp_speculative: bool,
     /// `<arch>.full_attention_interval` of hybrid (linear + full attention) models.
     #[serde(default)]
     pub full_attention_interval: Option<u64>,
+    /// Bytes of weights llama.cpp keeps in host memory with every layer on
+    /// the GPU ([`HOST_TENSORS`]: Gemma 3n / 4 per-layer embeddings). The
+    /// estimate counts them in RAM, not VRAM. None: none (or unknown).
+    #[serde(default)]
+    pub host_weight_bytes: Option<u64>,
 }
 
 pub fn read_header(path: &Path) -> Result<GgufHeader, GgufError> {
@@ -189,12 +294,125 @@ pub fn read_header(path: &Path) -> Result<GgufHeader, GgufError> {
         let val = read_value(&mut r, ty, file_len)?;
         kv.insert(key, val);
     }
-    Ok(GgufHeader { version, tensor_count, kv })
+    let (tensor_names, tensors_read, host_weight_bytes) = match read_tensor_names(&mut r, tensor_count, file_len) {
+        Ok(t) => (t.names, true, t.host_bytes),
+        Err(_) => (Vec::new(), false, None),
+    };
+    Ok(GgufHeader { version, tensor_count, kv, tensor_names, tensors_read, host_weight_bytes })
+}
+
+/// Reads the tensor-info section (each entry: name, n_dims u32, dims u64 x n,
+/// type u32, offset u64) and keeps only the MTP / NextN names (containing
+/// "nextn") and the size of the [`HOST_TENSORS`] (from dims and type; a
+/// tensor of unknown type is not counted). Bounded by `MAX_TENSORS`,
+/// `MAX_TENSOR_NAME`, `MAX_TENSOR_NAME_BYTES` and the file length. Errors
+/// mean "unknown", not fatal.
+fn read_tensor_names<R: Read>(r: &mut R, count: u64, file_len: u64) -> Result<TensorInfo, GgufError> {
+    if count > MAX_TENSORS {
+        return Err(GgufError::Corrupt(format!("{count} tensors")));
+    }
+    let mut names = Vec::new();
+    let mut host = 0u64;
+    let mut name_bytes = 0u64;
+    let mut buf = Vec::with_capacity(256);
+    for _ in 0..count {
+        let len = read_u64(r)?;
+        if len > MAX_TENSOR_NAME || len > file_len {
+            return Err(GgufError::Corrupt(format!("tensor name length {len}")));
+        }
+        name_bytes = name_bytes.saturating_add(len);
+        if name_bytes > MAX_TENSOR_NAME_BYTES {
+            return Err(GgufError::Corrupt("tensor names too long in total".into()));
+        }
+        buf.resize(len as usize, 0);
+        r.read_exact(&mut buf)?;
+        let name = String::from_utf8_lossy(&buf).into_owned();
+        let n_dims = read_u32(r)?;
+        if n_dims > MAX_TENSOR_DIMS {
+            return Err(GgufError::Corrupt(format!("{n_dims} tensor dims")));
+        }
+        let mut dims = [0u64; MAX_TENSOR_DIMS as usize];
+        for d in dims.iter_mut().take(n_dims as usize) {
+            *d = read_u64(r)?;
+        }
+        let ty = read_u32(r)?;
+        let _offset = read_u64(r)?;
+        if HOST_TENSORS.contains(&name.as_str())
+            && let Some(b) = tensor_bytes(&dims[..n_dims as usize], ty).filter(|&b| b <= file_len)
+        {
+            host = host.saturating_add(b);
+        }
+        if name.contains("nextn") {
+            names.push(name);
+        }
+    }
+    Ok(TensorInfo { names, host_bytes: Some(host).filter(|&b| b > 0) })
+}
+
+/// Number of MTP layers whose tensors are present: `nextn` tensors in the last
+/// `declared` block indices (blk.<block_count - declared + i>.nextn.*). 0 when
+/// the tensors were stripped or the tensor section is unreadable.
+pub fn count_mtp_layers(declared: u64, block_count: Option<u64>, names: &[String]) -> u64 {
+    if declared == 0 {
+        return 0;
+    }
+    let first = block_count.map(|b| b.saturating_sub(declared));
+    let mut blocks = std::collections::BTreeSet::new();
+    let mut any_nextn = false;
+    for n in names {
+        let idx = n.strip_prefix("blk.").and_then(|r| r.split('.').next()).and_then(|i| i.parse::<u64>().ok());
+        if n.contains("nextn") {
+            any_nextn = true;
+        }
+        if let (Some(i), Some(f)) = (idx, first) {
+            if i >= f && n.contains("nextn") {
+                blocks.insert(i);
+            }
+        }
+    }
+    if blocks.is_empty() && any_nextn { declared } else { (blocks.len() as u64).min(declared) }
 }
 
 pub fn read_metadata(path: &Path) -> Result<ModelMetadata, GgufError> {
     let h = read_header(path)?;
     Ok(extract(&h))
+}
+
+/// [`read_metadata`] for a model split into shards: the key/value metadata
+/// comes from `first`, the MTP tensor names from every shard (the NextN
+/// tensors are usually in the last one). `shards` may include `first`.
+pub fn read_metadata_shards(first: &Path, shards: &[std::path::PathBuf]) -> Result<ModelMetadata, GgufError> {
+    let mut h = read_header(first)?;
+    add_shard_tensors(&mut h, first, shards);
+    Ok(extract(&h))
+}
+
+/// Add the MTP tensor names of the other shards of a split model to `h` (the
+/// header of `first`). A shard that cannot be read makes the tensor list
+/// incomplete (`tensors_read` false). Only done when the header declares MTP
+/// layers whose tensors `first` does not hold, or for an architecture with
+/// per-layer embeddings ([`HOST_TENSORS`]) whose table is not in `first`.
+pub fn add_shard_tensors(h: &mut GgufHeader, first: &Path, shards: &[std::path::PathBuf]) {
+    let a = h.kv.get("general.architecture").and_then(Value::as_str).unwrap_or_default().to_string();
+    let declared = h.kv.get(&format!("{a}.nextn_predict_layers")).and_then(Value::as_u64).unwrap_or(0);
+    let blocks = h.kv.get(&format!("{a}.block_count")).and_then(Value::as_u64);
+    let need_mtp = declared > 0 && count_mtp_layers(declared, blocks, &h.tensor_names) < declared;
+    let need_host = matches!(a.as_str(), "gemma3n" | "gemma4") && h.host_weight_bytes.is_none();
+    if !need_mtp && !need_host {
+        return;
+    }
+    for p in shards.iter().filter(|p| p.as_path() != first) {
+        match read_header(p) {
+            Ok(s) => {
+                h.tensors_read &= s.tensors_read;
+                h.tensor_names.extend(s.tensor_names);
+                if let Some(b) = s.host_weight_bytes {
+                    h.host_weight_bytes = Some(h.host_weight_bytes.unwrap_or(0).saturating_add(b));
+                }
+            }
+            Err(_) => h.tensors_read = false,
+        }
+    }
 }
 
 pub fn extract(h: &GgufHeader) -> ModelMetadata {
@@ -208,6 +426,11 @@ pub fn extract(h: &GgufHeader) -> ModelMetadata {
         Some(Value::Array { len, .. }) => Some(*len),
         _ => ak("vocab_size").and_then(Value::as_u64),
     };
+    let declared_mtp = ak("nextn_predict_layers").and_then(Value::as_u64).filter(|&n| n > 0);
+    let block_count = ak("block_count").and_then(Value::as_u64).map(|b| b.min(MAX_BLOCK_COUNT));
+    let mtp_found = count_mtp_layers(declared_mtp.unwrap_or(0), block_count, &h.tensor_names);
+    // Declared, none found, and the tensor list is incomplete: unknown, not stripped.
+    let mtp_unknown = declared_mtp.is_some() && mtp_found == 0 && !h.tensors_read;
     ModelMetadata {
         is_projector: a == "clip" || get("clip.has_vision_encoder").is_some(),
         architecture: arch,
@@ -216,7 +439,7 @@ pub fn extract(h: &GgufHeader) -> ModelMetadata {
         file_type,
         quantization: file_type.and_then(file_type_name).map(str::to_string),
         context_length: ak("context_length").and_then(Value::as_u64),
-        block_count: ak("block_count").and_then(Value::as_u64),
+        block_count,
         embedding_length: ak("embedding_length").and_then(Value::as_u64),
         head_count: ak("attention.head_count").and_then(Value::as_u64),
         head_count_kv: ak("attention.head_count_kv").and_then(Value::as_u64),
@@ -246,8 +469,12 @@ pub fn extract(h: &GgufHeader) -> ModelMetadata {
         key_length_swa: ak("attention.key_length_swa").and_then(Value::as_u64),
         value_length_swa: ak("attention.value_length_swa").and_then(Value::as_u64),
         shared_kv_layers: ak("attention.shared_kv_layers").and_then(Value::as_u64).filter(|&n| n > 0),
-        mtp_layers: ak("nextn_predict_layers").and_then(Value::as_u64).filter(|&n| n > 0),
+        mtp_layers: Some(mtp_found).filter(|&n| n > 0),
+        mtp_layers_declared: declared_mtp,
+        mtp_unknown,
+        mtp_speculative: false,
         full_attention_interval: ak("full_attention_interval").and_then(Value::as_u64).filter(|&n| n > 0),
+        host_weight_bytes: h.host_weight_bytes.filter(|&b| b > 0),
     }
 }
 
@@ -557,7 +784,10 @@ pub(crate) mod tests {
         );
         let m = read_metadata(&p).unwrap();
         assert_eq!((m.sliding_window_pattern, m.swa_layers.as_ref()), (Some(4), None));
-        assert_eq!((m.mtp_layers, m.full_attention_interval), (Some(1), Some(4)));
+        // Declared in the header but this synthetic file has no nextn tensors:
+        // usable MTP layers are counted from the tensors only (0 here).
+        assert_eq!((m.mtp_layers_declared, m.full_attention_interval), (Some(1), Some(4)));
+        assert_eq!(m.mtp_layers.unwrap_or(0), 0);
         // Rows stored before these fields existed still parse (all None).
         let mut v = serde_json::to_value(ModelMetadata::default()).unwrap();
         for k in ["sliding_window", "swa_layers", "mtp_layers", "shared_kv_layers"] {
@@ -611,6 +841,243 @@ pub(crate) mod tests {
                     m.is_projector
                 );
             }
+        }
+    }
+
+    /// Synthetic GGUF with a qwen35-style header and the given tensor names.
+    fn write_with_tensors(path: &Path, declared: u32, block_count: u32, names: &[&str]) {
+        let s = |v: &str| [(v.len() as u64).to_le_bytes().to_vec(), v.as_bytes().to_vec()].concat();
+        let kvs = [
+            entry("general.architecture", 8, &s("qwen35")),
+            entry("qwen35.block_count", 4, &block_count.to_le_bytes()),
+            entry("qwen35.nextn_predict_layers", 4, &declared.to_le_bytes()),
+        ];
+        let mut b: Vec<u8> = b"GGUF".to_vec();
+        b.extend(3u32.to_le_bytes());
+        b.extend((names.len() as u64).to_le_bytes());
+        b.extend((kvs.len() as u64).to_le_bytes());
+        kvs.iter().for_each(|k| b.extend(k));
+        for n in names {
+            b.extend(s(n));
+            b.extend(2u32.to_le_bytes());
+            b.extend([4u64.to_le_bytes(), 8u64.to_le_bytes()].concat());
+            b.extend(0u32.to_le_bytes());
+            b.extend(0u64.to_le_bytes());
+        }
+        b.extend([0u8; 64]);
+        std::fs::File::create(path).unwrap().write_all(&b).unwrap();
+    }
+
+    #[test]
+    fn mtp_layers_need_the_nextn_tensors() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("t.gguf");
+        let with = ["token_embd.weight", "blk.0.attn_q.weight", "blk.2.attn_q.weight", "blk.2.nextn.eh_proj.weight", "blk.2.nextn.enorm.weight"];
+        write_with_tensors(&p, 1, 3, &with);
+        let h = read_header(&p).unwrap();
+        // Only the NextN names are kept.
+        assert_eq!(h.tensor_names, vec!["blk.2.nextn.eh_proj.weight".to_string(), "blk.2.nextn.enorm.weight".to_string()]);
+        assert!(h.tensors_read);
+        let m = extract(&h);
+        assert_eq!((m.mtp_layers, m.mtp_layers_declared, m.mtp_unknown), (Some(1), Some(1), false));
+        // Key kept, MTP tensors stripped (the last block is an ordinary one, or gone).
+        write_with_tensors(&p, 1, 3, &["token_embd.weight", "blk.0.attn_q.weight", "blk.2.attn_q.weight"]);
+        let m = read_metadata(&p).unwrap();
+        assert_eq!((m.mtp_layers, m.mtp_layers_declared, m.mtp_unknown), (None, Some(1), false), "stripped, and known to be");
+        write_with_tensors(&p, 1, 3, &["blk.0.attn_q.weight"]);
+        assert_eq!(read_metadata(&p).unwrap().mtp_layers, None);
+        // No key at all.
+        write_with_tensors(&p, 0, 3, &with);
+        let m = read_metadata(&p).unwrap();
+        assert_eq!((m.mtp_layers, m.mtp_layers_declared), (None, None));
+    }
+
+    #[test]
+    fn malformed_tensor_section_is_bounded() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("b.gguf");
+        write_with_tensors(&p, 1, 3, &["blk.2.nextn.enorm.weight"]);
+        let mut raw = std::fs::read(&p).unwrap();
+        raw[8..16].copy_from_slice(&u64::MAX.to_le_bytes()); // absurd tensor count
+        std::fs::write(&p, &raw).unwrap();
+        let m = read_metadata(&p).unwrap(); // still opens; MTP is unknown, not "removed"
+        assert_eq!((m.mtp_layers, m.mtp_layers_declared, m.mtp_unknown), (None, Some(1), true));
+        raw[8..16].copy_from_slice(&5u64.to_le_bytes()); // more tensors than the file holds
+        std::fs::write(&p, &raw).unwrap();
+        let m = read_metadata(&p).unwrap();
+        assert_eq!((m.mtp_layers, m.mtp_unknown), (None, true));
+        // Over the tensor-count cap: refused quickly, unknown.
+        raw[8..16].copy_from_slice(&(MAX_TENSORS + 1).to_le_bytes());
+        std::fs::write(&p, &raw).unwrap();
+        assert!(read_metadata(&p).unwrap().mtp_unknown);
+        // No MTP declared: an unreadable tensor list changes nothing.
+        write_with_tensors(&p, 0, 3, &["blk.0.attn_q.weight"]);
+        let mut raw = std::fs::read(&p).unwrap();
+        raw[8..16].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&p, &raw).unwrap();
+        assert!(!read_metadata(&p).unwrap().mtp_unknown);
+    }
+
+    #[test]
+    fn tensor_names_are_capped_in_total_bytes() {
+        // 17,000 names of 4 KiB each = 68 MiB of names: over the 64 MiB cap.
+        let mut r: Vec<u8> = Vec::new();
+        let name = "x".repeat(4096);
+        for _ in 0..17_000 {
+            r.extend((name.len() as u64).to_le_bytes());
+            r.extend(name.as_bytes());
+            r.extend(1u32.to_le_bytes());
+            r.extend([0u8; 8 + 12]);
+        }
+        let len = r.len() as u64;
+        let e = read_tensor_names(&mut std::io::Cursor::new(r), 17_000, len).unwrap_err();
+        assert!(e.to_string().contains("too long"), "{e}");
+    }
+
+    #[test]
+    fn hostile_block_count_is_clamped() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("h.gguf");
+        let s = |v: &str| [(v.len() as u64).to_le_bytes().to_vec(), v.as_bytes().to_vec()].concat();
+        write_kvs(&p, &[entry("general.architecture", 8, &s("llama")), entry("llama.block_count", 10, &u64::MAX.to_le_bytes())]);
+        assert_eq!(read_metadata(&p).unwrap().block_count, Some(MAX_BLOCK_COUNT));
+    }
+
+    /// A GGUF with the given key/values and tensor names (2-D, type 0, offset 0).
+    fn write_kv_tensors(path: &Path, kvs: &[Vec<u8>], names: &[&str]) {
+        let s = |v: &str| [(v.len() as u64).to_le_bytes().to_vec(), v.as_bytes().to_vec()].concat();
+        let mut b: Vec<u8> = b"GGUF".to_vec();
+        b.extend(3u32.to_le_bytes());
+        b.extend((names.len() as u64).to_le_bytes());
+        b.extend((kvs.len() as u64).to_le_bytes());
+        kvs.iter().for_each(|k| b.extend(k));
+        for n in names {
+            b.extend(s(n));
+            b.extend(2u32.to_le_bytes());
+            b.extend([4u64.to_le_bytes(), 8u64.to_le_bytes()].concat());
+            b.extend(0u32.to_le_bytes());
+            b.extend(0u64.to_le_bytes());
+        }
+        b.extend([0u8; 64]);
+        std::fs::File::create(path).unwrap().write_all(&b).unwrap();
+    }
+
+    #[test]
+    fn split_models_find_mtp_tensors_in_a_later_shard() {
+        let d = tempfile::tempdir().unwrap();
+        let s = |v: &str| [(v.len() as u64).to_le_bytes().to_vec(), v.as_bytes().to_vec()].concat();
+        let u16v = |v: u16| v.to_le_bytes().to_vec();
+        let first = d.path().join("m-00001-of-00002.gguf");
+        let second = d.path().join("m-00002-of-00002.gguf");
+        write_kv_tensors(
+            &first,
+            &[
+                entry("general.architecture", 8, &s("qwen35")),
+                entry("qwen35.block_count", 4, &3u32.to_le_bytes()),
+                entry("qwen35.nextn_predict_layers", 4, &1u32.to_le_bytes()),
+                entry("split.no", 2, &u16v(0)),
+                entry("split.count", 2, &u16v(2)),
+            ],
+            &["token_embd.weight", "blk.0.attn_q.weight"],
+        );
+        write_kv_tensors(&second, &[entry("split.no", 2, &u16v(1)), entry("split.count", 2, &u16v(2))], &["blk.2.attn_q.weight", "blk.2.nextn.eh_proj.weight"]);
+        let shards = vec![first.clone(), second.clone()];
+        // The first shard alone looks stripped; with every shard the MTP layer is there.
+        assert_eq!(read_metadata(&first).unwrap().mtp_layers, None);
+        let m = read_metadata_shards(&first, &shards).unwrap();
+        assert_eq!((m.mtp_layers, m.mtp_layers_declared, m.mtp_unknown), (Some(1), Some(1), false));
+        // A later shard without the tensors: stripped (known).
+        write_kv_tensors(&second, &[entry("split.no", 2, &u16v(1))], &["blk.2.attn_q.weight"]);
+        let m = read_metadata_shards(&first, &shards).unwrap();
+        assert_eq!((m.mtp_layers, m.mtp_unknown), (None, false));
+        // A shard that cannot be read: unknown, never "removed".
+        std::fs::write(&second, b"GGUF garbage").unwrap();
+        let m = read_metadata_shards(&first, &shards).unwrap();
+        assert_eq!((m.mtp_layers, m.mtp_unknown), (None, true));
+        std::fs::remove_file(&second).unwrap();
+        assert!(read_metadata_shards(&first, &shards).unwrap().mtp_unknown);
+    }
+
+    /// A GGUF with the given key/values and (name, dims, GGML type) tensors.
+    fn write_typed_tensors(path: &Path, kvs: &[Vec<u8>], tensors: &[(&str, &[u64], u32)]) {
+        let s = |v: &str| [(v.len() as u64).to_le_bytes().to_vec(), v.as_bytes().to_vec()].concat();
+        let mut b: Vec<u8> = b"GGUF".to_vec();
+        b.extend(3u32.to_le_bytes());
+        b.extend((tensors.len() as u64).to_le_bytes());
+        b.extend((kvs.len() as u64).to_le_bytes());
+        kvs.iter().for_each(|k| b.extend(k));
+        for (n, dims, ty) in tensors {
+            b.extend(s(n));
+            b.extend((dims.len() as u32).to_le_bytes());
+            dims.iter().for_each(|d| b.extend(d.to_le_bytes()));
+            b.extend(ty.to_le_bytes());
+            b.extend(0u64.to_le_bytes());
+        }
+        b.extend(vec![0u8; 4 << 20]); // room for the sizes to be plausible
+        std::fs::File::create(path).unwrap().write_all(&b).unwrap();
+    }
+
+    #[test]
+    fn per_layer_embedding_size_is_read_from_dims_and_type() {
+        // Q6_K: 210 bytes per 256 elements; Gemma-4-E4B's table is [10752, 262144] -> 2,312,110,080 bytes.
+        assert_eq!(tensor_bytes(&[10_752, 262_144], 14), Some(2_312_110_080));
+        assert_eq!(tensor_bytes(&[2560, 4], 0), Some(2560 * 4 * 4));
+        assert_eq!(tensor_bytes(&[100, 4], 14), None, "a row that is not whole blocks");
+        assert_eq!(tensor_bytes(&[256, 4], 99), None, "unknown type: not counted");
+        assert_eq!(tensor_bytes(&[u64::MAX, u64::MAX], 0), None, "overflow");
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("g.gguf");
+        let s = |v: &str| [(v.len() as u64).to_le_bytes().to_vec(), v.as_bytes().to_vec()].concat();
+        let kvs = [entry("general.architecture", 8, &s("gemma4")), entry("gemma4.block_count", 4, &2u32.to_le_bytes())];
+        let t: [(&str, &[u64], u32); 3] = [("token_embd.weight", &[256, 64], 14), ("per_layer_token_embd.weight", &[512, 64], 14), ("blk.0.attn_q.weight", &[256, 256], 12)];
+        write_typed_tensors(&p, &kvs, &t);
+        let m = read_metadata(&p).unwrap();
+        assert_eq!(m.host_weight_bytes, Some(512 * 64 / 256 * 210), "only the per-layer embedding table");
+        // An unknown type: nothing is subtracted.
+        write_typed_tensors(&p, &kvs, &[("per_layer_token_embd.weight", &[512, 64], 77)]);
+        assert_eq!(read_metadata(&p).unwrap().host_weight_bytes, None);
+        // A model without the table: None, and old rows parse (the field defaults).
+        write_typed_tensors(&p, &kvs, &[("token_embd.weight", &[256, 64], 14)]);
+        assert_eq!(read_metadata(&p).unwrap().host_weight_bytes, None);
+        let mut v = serde_json::to_value(ModelMetadata::default()).unwrap();
+        v.as_object_mut().unwrap().remove("host_weight_bytes");
+        assert_eq!(serde_json::from_value::<ModelMetadata>(v).unwrap().host_weight_bytes, None);
+    }
+
+    /// Path of a real model file from the env var `var`; `None` (test skips) when unset or missing.
+    fn real_model(var: &str) -> Option<String> {
+        match std::env::var(var) {
+            Ok(p) if Path::new(&p).is_file() => Some(p),
+            _ => {
+                eprintln!("skipping: set {var} to a real GGUF file");
+                None
+            }
+        }
+    }
+
+    /// `cargo test -p model-registry real_gemma4_per_layer_embeddings -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_gemma4_per_layer_embeddings() {
+        let Some(real_gemma4) = real_model("LAS_REAL_GEMMA4") else { return };
+        let m = read_metadata(Path::new(&real_gemma4)).unwrap();
+        println!("{real_gemma4}: host_weight_bytes={:?}", m.host_weight_bytes);
+        // per_layer_token_embd.weight: [10752, 262144] Q6_K.
+        assert_eq!(m.host_weight_bytes, Some(2_312_110_080));
+    }
+
+
+    #[test]
+    #[ignore]
+    fn real_files_mtp_tensors() {
+        let (Some(stripped), Some(real)) = (real_model("LAS_REAL_MTP_STRIPPED"), real_model("LAS_REAL_MTP")) else { return };
+        for (p, want) in [(stripped.as_str(), 0), (real.as_str(), 1)] {
+            let h = read_header(Path::new(p)).unwrap();
+            let m = extract(&h);
+            let last = m.block_count.unwrap_or(0).saturating_sub(1);
+            let names: Vec<_> = h.tensor_names.iter().filter(|n| n.contains("nextn") || n.starts_with(&format!("blk.{last}."))).collect();
+            println!("{p}\n tensors={} read={} block_count={:?} declared={:?} mtp={:?}\n {names:?}", h.tensor_count, h.tensor_names.len(), m.block_count, m.mtp_layers_declared, m.mtp_layers);
+            assert_eq!(m.mtp_layers.unwrap_or(0), want, "{p}");
         }
     }
 }

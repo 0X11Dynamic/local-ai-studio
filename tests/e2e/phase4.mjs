@@ -67,7 +67,7 @@ await check("allowed folders: protected, missing and whole-drive folders are ref
   const r = await inv("set_local_roots", { roots: [WORK] });
   assert(r.length === 1 && r[0] === WORK, JSON.stringify(r));
   const local = (await inv("list_environments")).find((e) => e.id === "local");
-  assert(local.config.roots[0] === WORK && local.tools.length === 9 && local.config.outside === "ask", JSON.stringify(local.config));
+  assert(local.config.roots[0] === WORK && local.tools.length === 10 && local.config.outside === "ask", JSON.stringify(local.config));
 });
 
 await check("This PC health check runs PowerShell", async () => {
@@ -240,7 +240,7 @@ const waitDone = (conv, ms = 240000) => waitFor(async () => {
 await check("context meter counts the built-in tools in Agent Mode", async () => {
   ids.conv = await convWith({ agent_mode: true, builtin_tools: true, environment_id: null, tool_servers: [] });
   const ctx = await inv("chat_context", { id: ids.conv, draft: "" });
-  assert(ctx.agent_mode && ctx.tool_count === 9 && ctx.tools > 0, JSON.stringify(ctx));
+  assert(ctx.agent_mode && ctx.tool_count === 10 && ctx.tools > 0, JSON.stringify(ctx));
   return `${ctx.tool_count} tools = ${ctx.tools} tokens`;
 });
 

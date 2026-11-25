@@ -223,11 +223,18 @@ pub struct AppToolHost {
     pub agent_id: Option<String>,
     /// Shown on approval prompts, e.g. "Subagent: count lines".
     pub agent_label: Option<String>,
+    /// Counts web_search calls for a chat reply (tasks use their run id).
+    pub reply_id: Option<String>,
 }
 
 impl AppToolHost {
     pub fn chat(st: SharedState, app: AppHandle, conversation_id: Option<String>) -> Self {
-        Self { st, app, conversation_id, run_id: None, agent_id: None, agent_label: None }
+        Self { st, app, conversation_id, run_id: None, agent_id: None, agent_label: None, reply_id: Some(app_core::new_id()) }
+    }
+
+    /// Key of this host's deferred-tools offer (see `tool_offer::key`).
+    pub fn offer_key(&self) -> Option<String> {
+        crate::services::tool_offer::key(self.conversation_id.as_deref(), self.run_id.as_deref(), self.agent_id.as_deref())
     }
 }
 
@@ -354,11 +361,24 @@ impl ToolHost for AppToolHost {
                 "wait_subagents" => crate::services::tasks::wait_subagents(self, args, timeout, cancel).await,
                 "stop_subagent" => crate::services::tasks::stop_subagent_tool(self, args).await,
                 "ask_user" => crate::services::tasks::ask_user(self, call, args, cancel).await,
+                agent_runtime::LOAD_TOOLS => Ok(crate::services::tool_offer::call(self.offer_key().as_deref(), &args)),
                 "skill_propose_edit" => match tokio::time::timeout(timeout, crate::services::skills::propose_from_agent(&self.st, &args, self.run_id.as_deref().or(self.conversation_id.as_deref()))).await {
                     Ok(r) => r,
                     Err(_) => Err(AppError::Runtime(format!("the tool did not finish within {} s", timeout.as_secs()))),
                 },
                 other => Err(AppError::NotFound(format!("no agent tool {other}"))),
+            };
+        }
+        if tool.tool_name == "web_search" && tool.server_id.starts_with(agent_runtime::BUILTIN_PREFIX) {
+            let scope = self.run_id.clone().or_else(|| self.reply_id.clone()).or_else(|| self.conversation_id.clone()).unwrap_or_default();
+            // Runs in the app on every environment, like web_fetch.
+            return tokio::select! {
+                r = crate::services::websearch::run(&self.st, &scope, &args) => Ok(match r {
+                    Ok(resp) => CallResult { text: resp.render(), is_error: false },
+                    Err(AppError::Cancelled) => return Err(AppError::Cancelled),
+                    Err(e) => CallResult { text: e.to_string(), is_error: true },
+                }),
+                _ = cancel.cancelled() => Err(AppError::Cancelled),
             };
         }
         if let Some(env_id) = tool.server_id.strip_prefix(agent_runtime::BUILTIN_PREFIX) {
@@ -367,6 +387,10 @@ impl ToolHost for AppToolHost {
         }
         let out = self.st.mcp.call_tool(&tool.server_id, &tool.tool_name, args, timeout, cancel).await?;
         Ok(CallResult { text: out.text, is_error: out.is_error })
+    }
+
+    fn tool_offer(&self) -> Option<std::sync::Arc<agent_runtime::ToolOffer>> {
+        crate::services::tool_offer::get(&self.offer_key()?)
     }
 
     fn event(&self, ev: ToolEvent) {

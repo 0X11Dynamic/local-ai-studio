@@ -13,6 +13,7 @@ export function errorMessage(e: unknown): string {
 export interface AppPaths {
   data_dir: string; db_path: string; runtimes_dir: string; logs_dir: string;
   skills_dir: string; default_models_dir: string; lmstudio_models_dir: string | null;
+  install_dir: string | null; storage_origin: string;
 }
 export interface GpuInfo {
   index: number; name: string; vendor: string; vram_total_bytes: number; vram_used_bytes: number;
@@ -58,6 +59,10 @@ export interface ModelMetadata {
   split_count: number | null; is_projector: boolean; gguf_version: number;
   /** Multi-token-prediction (NextN) layers: speculative decoding with `--spec-type draft-mtp`. */
   mtp_layers?: number | null;
+  /** Raw header value; > 0 with mtp_layers empty means the MTP layers were removed from the file. */
+  mtp_layers_declared?: number | null;
+  /** MTP declared but the tensor list (of some shard) could not be read: unknown, not removed. */
+  mtp_unknown?: boolean;
 }
 export interface ModelView {
   id: string; repo_id: string | null; path: string; format: string; quantization: string | null;
@@ -88,7 +93,15 @@ export interface LoadConfig {
   cache_type_auto?: boolean;
   /** Speculative decoding type (`--spec-type`), e.g. "draft-mtp"; null = off. */
   speculative?: string | null;
+  /** `speculative` is the app's default (not the user's choice); the app may turn it off for a load. */
+  speculative_auto?: boolean;
   spec_draft_n_max?: number | null;
+  /** "Use linked PCs": split layers with linked PCs (resolved by the app at load). */
+  use_linked_pcs?: boolean;
+  /** Set by the app for one load: its 127.0.0.1 tunnel endpoints (`--rpc`). */
+  rpc?: string[];
+  /** Set by the app for one load: `--tensor-split`. */
+  tensor_split?: string | null;
 }
 export interface LoadDefaults {
   config: LoadConfig; source: "model_default" | "last_used" | "app_default";
@@ -111,13 +124,27 @@ export interface EstimateView {
   auto_kv: AutoKv | null;
   /** Share with CPU is on and llama.cpp fits the layers itself: share_split is only an estimate. */
   share_fit: boolean;
+  /** The `--fit-target` margin such a load passes (MiB), when share_fit. */
+  fit_target_mib: number | null;
+  /** RAM Auto keeps free for the system and other apps. */
+  ram_reserve_bytes: number;
+  /** "Use linked PCs" is on and they lend memory: the Auto context this PC would get alone. */
+  auto_ctx_alone: number | null;
+  /** What each linked PC lends this load (from their last info). */
+  linked_contrib: { peer: string; endpoint: string; device: string; bytes: number; cpu: boolean; cap_bytes: number | null }[];
 }
 export interface AutoKv {
-  cache_type_k: string; cache_type_v: string; flash_attention_on: boolean; saves_bytes: number; summary: string;
+  cache_type_k: string; cache_type_v: string; flash_attention_on: boolean; saves_bytes: number;
+  /** The f16 Auto context, when q8_0 was picked because it reaches a larger step fully on the GPU. */
+  raised_from: number | null;
+  summary: string;
 }
 export interface AutoCtx {
   n_ctx: number; trained: number | null;
-  limited_by: "trained" | "memory" | "minimum" | "no_gpu_info"; fits: boolean; summary: string;
+  limited_by: "trained" | "memory" | "minimum" | "no_gpu_info" | "ram_reserve"; fits: boolean;
+  /** The model is larger than free RAM: its weights page from disk, the context was sized without them. */
+  pages_weights: boolean;
+  summary: string;
 }
 export interface ShareSplit {
   gpu_layers: number; total_layers: number; n_cpu_moe: number | null; all_fit: boolean; vram_bytes: number; summary: string;
@@ -137,8 +164,27 @@ export interface EngineStatus {
   unsupported_settings: string[]; props: ServerProps | null; gpu_layers_offloaded: [number, number] | null;
   buffers: BufferReport[]; devices: DeviceReport[]; warnings: string[]; load_seconds: number | null; error: string | null; error_hint: string | null;
 }
+export type LoadPhase = "starting" | "loading" | "finishing" | "done" | "failed";
+/** One row of the load progress: this PC or a linked PC. */
+export interface DeviceProgress {
+  /** "local" or the linked PC's id. */
+  id: string; name: string; linked: boolean;
+  done_bytes: number; total_bytes: number; percent: number;
+  /** Speed of the data really moving (read here, or sent to the linked PC). */
+  bytes_per_sec: number | null; eta_secs: number | null;
+  /** The helper reported cache hits: part of the weights came from its cache. */
+  cached: boolean;
+  /** Bytes its cache supplied (included in done_bytes). */
+  cached_bytes: number;
+}
+/** Sent at most 5 times a second while a model loads; the last one is "done" or "failed". */
+export interface LoadProgress {
+  phase: LoadPhase; percent: number; eta_secs: number | null; elapsed_secs: number;
+  devices: DeviceProgress[]; error: string | null;
+}
 export type EngineEvent =
   | { type: "status"; status: EngineStatus }
+  | { type: "load_progress"; progress: LoadProgress }
   | { type: "log"; line: string; stream: "stdout" | "stderr" }
   | { type: "instance_ended"; instance_id: string };
 
@@ -163,7 +209,8 @@ export const api = {
   removeModel: (id: string) => invoke<void>("remove_model", { id }),
   /** Permanently deletes the model's GGUF files; `confirm` must be true (the user ticked the box). */
   deleteModelFiles: (id: string, confirm: boolean) => invoke<string[]>("delete_model_files", { id, confirm }),
-  estimateMemory: (id: string, config: LoadConfig) => invoke<EstimateView>("estimate_memory", { id, config }),
+  estimateMemory: (id: string, config: LoadConfig, runtimeId: string | null) =>
+    invoke<EstimateView>("estimate_memory", { id, config, runtimeId }),
   getLoadDefaults: (id: string) => invoke<LoadDefaults>("get_load_defaults", { id }),
   saveModelDefaults: (id: string, config: LoadConfig) => invoke<void>("save_model_defaults", { id, config }),
   resetModelDefaults: (id: string) => invoke<void>("reset_model_defaults", { id }),

@@ -5,53 +5,24 @@ import { open as openDialog, save } from "@tauri-apps/plugin-dialog";
 import { errorMessage } from "../lib/api";
 import {
   api2, type ChatEvent, type ChatSettings, type ContextReport, type ConversationSummary, type ConversationView,
-  type InstructionProfile, type Message, type MessageStats,
+  type InstructionProfile, type Message,
 } from "../lib/api2";
 import { useEngine } from "../lib/engine";
-import { Markdown } from "../components/Markdown";
-import { ToolCard, type ToolCall } from "../components/ToolCard";
 import { api3, type ApprovalAnswer, type ApprovalRequest } from "../lib/api3";
 import { api4, type EnvView } from "../lib/api4";
-import { OPEN_CHAT_KEY, keptNote, onOpen } from "../lib/api5";
-import { ChatSubagents } from "../components/ChatSubagents";
+import { OPEN_CHAT_KEY, keptNote, onOpen, type DeleteResult } from "../lib/api5";
 import { ThinkingControls, useModelSupport } from "../components/ThinkingControls";
-import { api6, parseAttachments, type Attachment } from "../lib/api6";
+import { api6, type Attachment } from "../lib/api6";
+import { AssistantRow, AttachmentChips, UserRow, type RowActions } from "../components/chat/MessageRow";
+import { streamStore } from "../lib/streamStore";
 // --- chat mode / tools menus (composer bar) ---
 import { ModeMenu, type ChatMode } from "../components/chat/ModeMenu";
+import { Trash } from "@phosphor-icons/react";
+import { ConfirmDelete } from "../components/chat/ConfirmDelete";
 import { ToolsMenu } from "../components/chat/ToolsMenu";
 import { SubagentControls } from "../components/chat/SubagentControls";
 // --- end chat mode / tools menus ---
 import type { PageId } from "../App";
-
-function parseStats(m: Message): MessageStats | null {
-  try {
-    return m.stats ? (JSON.parse(m.stats) as MessageStats) : null;
-  } catch {
-    return null;
-  }
-}
-
-function StatsLine({ s }: { s: MessageStats }) {
-  if (s.stop_reason === "error") return <div className="danger-text" style={{ fontSize: 12 }}>Generation failed: {s.error}</div>;
-  const parts: string[] = [];
-  if (s.completion_tokens != null) parts.push(`${s.completion_tokens} tokens`);
-  if (s.tokens_per_sec != null) parts.push(`${s.tokens_per_sec.toFixed(1)} tok/s`);
-  if (s.time_to_first_token_ms != null) parts.push(`first token ${(s.time_to_first_token_ms / 1000).toFixed(2)} s`);
-  if (s.prompt_tokens_per_sec != null) parts.push(`prompt ${Math.round(s.prompt_tokens_per_sec)} tok/s`);
-  if (s.total_ms != null) parts.push(`${(s.total_ms / 1000).toFixed(1)} s total`);
-  if (s.context_tokens != null && s.n_ctx) parts.push(`context ${s.context_tokens.toLocaleString()} / ${s.n_ctx.toLocaleString()}`);
-  if (s.thinking_requested != null) parts.push(`thinking ${s.thinking_requested ? "on" : "off"}`);
-  else if (s.thinking_control === "always") parts.push("thinking always on");
-  if (s.reasoning_effort) parts.push(`effort ${s.reasoning_effort}`);
-  const stop = s.stop_reason === "length" ? "stopped: max tokens reached" : s.stop_reason === "cancelled" ? "stopped by you" : null;
-  return (
-    <div className="mono faint" style={{ fontSize: 11 }}>
-      {parts.join("  ")}
-      {stop && <span style={{ color: "var(--accent)" }}>  {stop}</span>}
-      {s.dropped_messages ? <div style={{ color: "var(--accent)" }}>{s.dropped_messages} oldest message(s) were left out to fit the context.</div> : null}
-    </div>
-  );
-}
 
 function ContextMeter({ r, err }: { r: ContextReport | null; err: string | null }) {
   if (err) return <div className="faint" style={{ fontSize: 12 }}>{err}</div>;
@@ -83,21 +54,7 @@ function ContextMeter({ r, err }: { r: ContextReport | null; err: string | null 
   );
 }
 
-function AttachmentChips({ items, onRemove }: { items: Attachment[]; onRemove?: (a: Attachment) => void }) {
-  if (items.length === 0) return null;
-  return (
-    <div className="attach-chips" aria-label={onRemove ? "Pending attachments" : "Attachments"}>
-      {items.map((a) => (
-        <span key={a.id} className={`attach-chip kind-${a.kind}`} title={`${a.name} (${a.kind}, ${(a.size / 1024).toFixed(1)} KB${a.tokens != null ? `, about ${a.tokens} tokens` : ""})`}>
-          <span className="attach-kind">{a.kind === "pdf" ? "PDF" : a.kind}</span>
-          <span className="attach-name">{a.name}</span>
-          {a.tokens != null && <span className="faint mono">{a.tokens} tok</span>}
-          {onRemove && <button className="attach-x" aria-label={`Remove ${a.name}`} onClick={() => onRemove(a)}>x</button>}
-        </span>
-      ))}
-    </div>
-  );
-}
+const NO_MAP: Record<string, never> = {};
 
 const EMPTY_SETTINGS: ChatSettings = {
   profile_id: null,
@@ -109,6 +66,7 @@ const EMPTY_SETTINGS: ChatSettings = {
   disabled_servers: [],
   limits: { max_tool_calls: null, max_wall_secs: null },
   builtin_tools: true,
+  web_search: true,
   environment_id: null,
   skills: true,
   tool_mode: "auto",
@@ -129,7 +87,6 @@ export function Chat({ go }: { go: (p: PageId) => void }) {
   const [query, setQuery] = useState("");
   const [current, setCurrent] = useState<ConversationView | null>(null);
   const [draft, setDraft] = useState("");
-  const [streaming, setStreaming] = useState<Record<string, { content: string; reasoning: string }>>({});
   const [generating, setGenerating] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [ctx, setCtx] = useState<ContextReport | null>(null);
@@ -142,6 +99,10 @@ export function Chat({ go }: { go: (p: PageId) => void }) {
   const [planEdit, setPlanEdit] = useState<{ id: string; text: string } | null>(null);
   // Git worktrees a deleted chat's subagents had to keep.
   const [wtNote, setWtNote] = useState<string | null>(null);
+  const [selecting, setSelecting] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [confirmDel, setConfirmDel] = useState<{ ids: string[]; title?: string } | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
@@ -179,13 +140,50 @@ export function Chat({ go }: { go: (p: PageId) => void }) {
     setPending(c.pending_attachments ?? []);
     setProjNeeded(false);
     setGenerating(c.generating);
-    setStreaming({});
+    streamStore.clear();
     setEditing(null);
     const pend = await api3.pendingApprovals();
     setApprovals(Object.fromEntries(pend.filter((p) => p.conversation_id === id).map((p) => [p.call_id, p])));
     setLiveTools({});
     setLiveOut({});
   }, []);
+
+  const leaveSelect = useCallback(() => { setSelecting(false); setSelected(new Set()); }, []);
+  useEffect(() => {
+    if (!selecting) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape" && !confirmDel) leaveSelect(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selecting, confirmDel, leaveSelect]);
+
+  // Delete chats (one or many), then refresh and move off a deleted open chat.
+  const doDelete = async (ids: string[]) => {
+    setDeleting(true);
+    try {
+      let r: DeleteResult;
+      let failed: { id: string; error: string }[] = [];
+      if (ids.length === 1) r = await api2.deleteConversation(ids[0]);
+      else { const b = await api2.deleteConversations(ids); r = b; failed = b.failed; }
+      const gone = ids.filter((i) => !failed.some((f) => f.id === i));
+      const notes = [keptNote(r), failed.length ? `${failed.length} chat${failed.length === 1 ? "" : "s"} could not be deleted: ${failed.map((f) => f.error).join("; ")}` : null].filter(Boolean);
+      setWtNote(notes.length ? notes.join("\n") : null);
+      setSelected((x) => new Set([...x].filter((i) => !gone.includes(i))));
+      const l = await api2.listConversations(query);
+      setList(l);
+      if (currentIdRef.current && gone.includes(currentIdRef.current)) {
+        currentIdRef.current = null;
+        setCurrent(null);
+        if (l[0]) await open(l[0].id);
+      }
+      setConfirmDel(null);
+      if (selecting && failed.length === 0) leaveSelect();
+    } catch (e) {
+      setErr(errorMessage(e));
+      setConfirmDel(null);
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   useEffect(() => {
     api2.listConversations().then((l) => {
@@ -275,32 +273,18 @@ export function Chat({ go }: { go: (p: PageId) => void }) {
         reloadMessages(ev.conversation_id);
       }
       if (ev.type === "segment_reset") {
-        setStreaming((s) => {
-          const n = { ...s };
-          delete n[ev.message_id];
-          return n;
-        });
+        streamStore.remove(ev.message_id);
       } else if (ev.type === "segment_start" || ev.type === "tool_result") {
         setCurrent((c) => c && (c.messages.some((m) => m.id === ev.message.id) ? c : { ...c, messages: [...c.messages, ev.message] }));
       } else if (ev.type === "segment_done") {
         setCurrent((c) => c && { ...c, messages: c.messages.map((m) => (m.id === ev.message.id ? ev.message : m)) });
-        setStreaming((s) => {
-          const n = { ...s };
-          delete n[ev.message.id];
-          return n;
-        });
+        streamStore.remove(ev.message.id);
       } else if (ev.type === "delta") {
-        setStreaming((s) => {
-          const cur = s[ev.message_id] ?? { content: "", reasoning: "" };
-          return { ...s, [ev.message_id]: { content: cur.content + ev.content, reasoning: cur.reasoning + ev.reasoning } };
-        });
+        // Held outside React state: only the live row re-renders, once per frame.
+        streamStore.append(ev.message_id, ev.content, ev.reasoning);
       } else if (ev.type === "done") {
         setCurrent((c) => c && { ...c, messages: c.messages.map((m) => (m.id === ev.message_id ? ev.message : m)) });
-        setStreaming((s) => {
-          const n = { ...s };
-          delete n[ev.message_id];
-          return n;
-        });
+        streamStore.remove(ev.message_id);
         setGenerating(false);
         api2.listConversations().then(setList);
       } else {
@@ -314,13 +298,16 @@ export function Chat({ go }: { go: (p: PageId) => void }) {
     };
   }, [open, reloadMessages]);
 
-  // Context meter (debounced, real tokenizer).
+  // Context meter (debounced, real tokenizer). It recounts after typing
+  // pauses and when a reply finishes (`generating` flips to false), never
+  // while a reply or agent run is in progress (every tool segment adds a message).
   useEffect(() => {
     if (!currentId || !loaded) {
       setCtx(null);
       setCtxErr(loaded ? null : "Load a model to see context usage.");
       return;
     }
+    if (generating) return;
     const t = setTimeout(() => {
       api2.chatContext(currentId, draft).then((r) => { setCtx(r); setCtxErr(null); }).catch((e) => setCtxErr(errorMessage(e)));
     }, 350);
@@ -336,10 +323,12 @@ export function Chat({ go }: { go: (p: PageId) => void }) {
     stick.current = true;
     toBottom();
   }, [currentId]);
-  // New messages and streamed text: follow only if the user has not scrolled up.
+  // New messages: follow only if the user has not scrolled up. Streamed text
+  // is followed by the live row itself (rows.grew), once per rendered frame.
   useEffect(() => {
     if (stick.current) toBottom();
-  }, [current?.messages.length, streaming]);
+  }, [current?.messages.length]);
+  useEffect(() => () => streamStore.clear(), []);
 
   const newChat = async () => {
     const c = await api2.createConversation();
@@ -542,6 +531,29 @@ ${text}`));
     return m;
   }, [current?.messages]);
   const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
+  // Stable handlers for the memoized rows; they always call the latest closures.
+  const actNow: RowActions = {
+    answerApproval: (id, a) => { void answerApproval(id, a); },
+    openSubagents: () => go("subagents"),
+    startEdit: (id, text) => setEditing({ id, text }),
+    editText: (id, text) => setEditing({ id, text }),
+    cancelEdit: () => setEditing(null),
+    saveEdit: (id, t) => { setEditing(null); void started(() => api2.chatEdit(currentIdRef.current!, id, t)); },
+    startPlanEdit: (id, text) => setPlanEdit({ id, text }),
+    planText: (id, text) => setPlanEdit({ id, text }),
+    cancelPlanEdit: () => setPlanEdit(null),
+    runPlan: (t) => { void runPlan(t); },
+    regenerate: () => { void started(() => api2.chatRegenerate(currentIdRef.current!)); },
+    grew: () => { if (stick.current) toBottom(); },
+  };
+  const actRef = useRef(actNow);
+  actRef.current = actNow;
+  const act = useMemo<RowActions>(() => {
+    const o = {} as Record<string, (...a: unknown[]) => unknown>;
+    for (const k of Object.keys(actNow)) o[k] = (...a: unknown[]) => (actRef.current as unknown as Record<string, (...x: unknown[]) => unknown>)[k](...a);
+    return o as unknown as RowActions;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const profileLabel = useMemo(() => {
     if (!ctx?.profile) return null;
     const src = { conversation: "this chat", model: "model default", default: "app default", agent_default: "agent default", plan_default: "plan default" }[ctx.profile.source];
@@ -550,24 +562,59 @@ ${text}`));
 
   return (
     <div className="chat-layout">
+      {confirmDel && <ConfirmDelete count={confirmDel.ids.length} title={confirmDel.title} busy={deleting} onConfirm={() => doDelete(confirmDel.ids)} onCancel={() => { if (!deleting) setConfirmDel(null); }} />}
       <aside className="chat-list">
         <div className="row" style={{ padding: "10px 10px 6px" }}>
           <button className="btn primary sm" onClick={newChat}>New chat</button>
+          <span className="spacer" />
+          {selecting ? (
+            <button className="btn sm" onClick={leaveSelect}>Done</button>
+          ) : (
+            <button className="btn sm ghost" aria-label="Select chats" onClick={() => setSelecting(true)}>Select</button>
+          )}
         </div>
         <div style={{ padding: "0 10px 8px" }}>
           <input className="input" style={{ width: "100%" }} placeholder="Search chats" aria-label="Search chats" value={query}
             onChange={(e) => { setQuery(e.target.value); api2.listConversations(e.target.value).then(setList); }} />
         </div>
+        {selecting && (
+          <div className="chat-select-bar row">
+            <label className="row" style={{ gap: 6 }}>
+              <input type="checkbox" aria-label="Select all" disabled={!list || list.length === 0}
+                checked={!!list && list.length > 0 && list.every((c) => selected.has(c.id))}
+                onChange={(e) => setSelected(e.target.checked ? new Set(list?.map((c) => c.id) ?? []) : new Set())} />
+              <span>Select all</span>
+            </label>
+            <span className="spacer" />
+            <span className="faint mono" aria-live="polite" style={{ fontSize: 11 }}>{selected.size} selected</span>
+            <button className="btn sm danger" aria-label="Delete selected chats" disabled={selected.size === 0}
+              onClick={() => setConfirmDel({ ids: [...selected] })}>Delete {selected.size} {selected.size === 1 ? "chat" : "chats"}</button>
+          </div>
+        )}
         {list == null ? (
           <div style={{ padding: 10, display: "grid", gap: 8 }}><div className="skeleton" /><div className="skeleton" /></div>
         ) : list.length === 0 ? (
           <div className="empty" style={{ padding: 12 }}>{query ? "No chats match." : "No chats yet."}</div>
         ) : (
-          list.map((c) => (
-            <button key={c.id} className="chat-item" aria-current={c.id === currentId ? "true" : undefined} onClick={() => open(c.id)}>
-              <span className="chat-title">{c.title}</span>
-              <span className="faint mono" style={{ fontSize: 10.5 }}>{c.message_count} msgs</span>
-            </button>
+          list.map((c) => selecting ? (
+            <label key={c.id} className="chat-item chat-row-select" aria-current={c.id === currentId ? "true" : undefined}>
+              <input type="checkbox" aria-label={`Select ${c.title}`} checked={selected.has(c.id)}
+                onChange={() => setSelected((x) => { const n = new Set(x); if (n.has(c.id)) n.delete(c.id); else n.add(c.id); return n; })} />
+              <span className="chat-row-text">
+                <span className="chat-title">{c.title}</span>
+                <span className="faint mono" style={{ fontSize: 10.5 }}>{c.message_count} msgs</span>
+              </span>
+            </label>
+          ) : (
+            <div key={c.id} className="chat-row">
+              <button className="chat-item" aria-current={c.id === currentId ? "true" : undefined} onClick={() => open(c.id)}>
+                <span className="chat-title">{c.title}</span>
+                <span className="faint mono" style={{ fontSize: 10.5 }}>{c.message_count} msgs</span>
+              </button>
+              <button className="chat-row-del" aria-label={`Delete chat ${c.title}`} title="Delete chat" onClick={() => setConfirmDel({ ids: [c.id], title: c.title })}>
+                <Trash size={14} />
+              </button>
+            </div>
           ))
         )}
       </aside>
@@ -592,7 +639,7 @@ ${text}`));
               <button className="btn sm ghost" onClick={() => setRenaming(current.title)}>Rename</button>
               <button className="btn sm ghost" onClick={async () => { const c = await api2.duplicateConversation(current.id); await refreshList(); open(c.id); }}>Duplicate</button>
               <button className="btn sm ghost" onClick={exportChat}>Export</button>
-              <button className="btn sm ghost danger" onClick={async () => { const r = await api2.deleteConversation(current.id); setWtNote(keptNote(r)); setCurrent(null); const l = await api2.listConversations(query); setList(l); if (l[0]) open(l[0].id); }}>Delete</button>
+              <button className="btn sm ghost danger" onClick={() => setConfirmDel({ ids: [current.id], title: current.title })}>Delete</button>
             </>
           )}
           <button className="btn sm" onClick={() => setShowSettings((v) => !v)} aria-expanded={showSettings}>Chat settings</button>
@@ -619,91 +666,14 @@ ${text}`));
               <strong>Start the conversation.</strong>Messages are saved on this PC. The reply streams from the loaded model.
             </div>
           )}
-          {messages.filter((m) => m.role !== "tool").map((m) => {
-            const live = streaming[m.id];
-            const content = live ? live.content : m.content;
-            const reasoning = live ? live.reasoning : m.reasoning ?? "";
-            const stats = parseStats(m);
-            const isLive = !!live || (generating && m.id === lastAssistant?.id && !m.stats);
-            if (m.role === "user") {
-              return (
-                <div key={m.id} className="msg user">
-                  {editing?.id === m.id ? (
-                    <div style={{ display: "grid", gap: 6 }}>
-                      <textarea className="input composer-input" aria-label="Edit message" value={editing.text} onChange={(e) => setEditing({ id: m.id, text: e.target.value })} rows={4} />
-                      <div className="row">
-                        <button className="btn sm primary" onClick={async () => { const t = editing.text; setEditing(null); await started(() => api2.chatEdit(current!.id, m.id, t)); }}>Save and resend</button>
-                        <button className="btn sm ghost" onClick={() => setEditing(null)}>Cancel</button>
-                      </div>
-                    </div>
-                  ) : (
-                    <>
-                      {m.content && <div className="msg-text">{m.content}</div>}
-                      <AttachmentChips items={parseAttachments(m.attachments)} />
-                      <div className="msg-actions">
-                        <button className="btn ghost sm" disabled={generating} onClick={() => setEditing({ id: m.id, text: m.content })}>Edit</button>
-                      </div>
-                    </>
-                  )}
-                </div>
-              );
-            }
-            return (
-              <div key={m.id} className="msg assistant">
-                <div className="faint mono" style={{ fontSize: 11, marginBottom: 4 }}>{m.model_name ?? "model"} (generated by the model)</div>
-                {reasoning && (
-                  <details className="reasoning" open={isLive && !content}>
-                    <summary>Reasoning{isLive && !content ? " (thinking)" : ""}</summary>
-                    <div className="reasoning-text">{reasoning}</div>
-                  </details>
-                )}
-                {(() => {
-                  const calls: ToolCall[] = (() => { try { return m.tool_calls ? JSON.parse(m.tool_calls) : []; } catch { return []; } })();
-                  return calls.length ? (
-                    <div style={{ display: "grid", gap: 8, margin: "6px 0" }}>
-                      {content && <Markdown text={content} />}
-                      {calls.map((c) => (
-                        <ToolCard key={c.id} call={c} result={toolResults.get(c.id)}
-                          approval={approvals[c.id]} live={liveTools[c.id]} output={liveOut[c.id]} where={callServer[c.id] ?? approvals[c.id]?.server_name} onAnswer={answerApproval}
-                          extra={c.function.name === "spawn_subagents" && current ? (
-                            <ChatSubagents conversationId={current.id} callId={c.id} approvals={Object.values(approvals)} onAnswer={answerApproval} onOpenPage={() => go("subagents")} />
-                          ) : undefined} />
-                      ))}
-                    </div>
-                  ) : null;
-                })()}
-                {m.tool_calls ? null : content ? <Markdown text={content} /> : isLive ? <div className="faint">{reasoning ? "" : "Waiting for the first token"}</div> : stats?.stop_reason === "cancelled" ? <div className="faint">Stopped before any answer text.</div> : stats && stats.stop_reason !== "error" ? (
-                  <div className="notice warn empty-answer" role="status">{stats.note ?? "The model returned no answer."}{reasoning ? " It wrote only reasoning (above)." : ""} Try Regenerate, or ask again.</div>
-                ) : null}
-                {stats && <StatsLine s={stats} />}
-                {!isLive && stats?.mode === "plan" && !m.tool_calls && content && m.id === lastAssistant?.id && stats.stop_reason !== "error" && (
-                  <div className="plan-actions">
-                    {planEdit?.id === m.id ? (
-                      <>
-                        <textarea className="input composer-input" aria-label="Plan to run" rows={8} value={planEdit.text} onChange={(e) => setPlanEdit({ id: m.id, text: e.target.value })} />
-                        <div className="row">
-                          <button className="btn sm primary" disabled={!loaded || generating || !planEdit.text.trim()} onClick={() => runPlan(planEdit.text)}>Run this plan</button>
-                          <button className="btn sm ghost" onClick={() => setPlanEdit(null)}>Cancel</button>
-                        </div>
-                      </>
-                    ) : (
-                      <div className="row">
-                        <button className="btn sm primary" disabled={!loaded || generating} onClick={() => runPlan(content)} title="Switch this chat to Agent mode and carry out the plan">Run this plan</button>
-                        <button className="btn sm ghost" disabled={generating} onClick={() => setPlanEdit({ id: m.id, text: content })}>Edit plan</button>
-                        <span className="help faint">Runs it in Agent mode (tools still ask before running unless you allowed them).</span>
-                      </div>
-                    )}
-                  </div>
-                )}
-                {!isLive && (
-                  <div className="msg-actions">
-                    <button className="btn ghost sm" onClick={() => navigator.clipboard.writeText(content)}>Copy</button>
-                    {m.id === lastAssistant?.id && <button className="btn ghost sm" disabled={!loaded || generating} onClick={() => started(() => api2.chatRegenerate(current!.id))}>Regenerate</button>}
-                  </div>
-                )}
-              </div>
-            );
-          })}
+          {messages.filter((m) => m.role !== "tool").map((m) => m.role === "user" ? (
+            <UserRow key={m.id} m={m} editingText={editing?.id === m.id ? editing.text : null} generating={generating} act={act} />
+          ) : (
+            <AssistantRow key={m.id} m={m} isLast={m.id === lastAssistant?.id} generating={generating} loaded={loaded} convId={currentId}
+              results={toolResults} planEdit={planEdit?.id === m.id ? planEdit.text : null} act={act}
+              approvals={m.tool_calls ? approvals : NO_MAP} liveTools={m.tool_calls ? liveTools : NO_MAP}
+              liveOut={m.tool_calls ? liveOut : NO_MAP} callServer={m.tool_calls ? callServer : NO_MAP} />
+          ))}
         </div>
 
         <div className={`composer${dragOver ? " drag-over" : ""}`}>
@@ -726,7 +696,7 @@ ${text}`));
                 onChange={(allowed, max) => saveSettings({ ...settings, subagents: allowed, max_subagents: max })} />
             )}
             <ToolsMenu conversationId={currentId} settings={settings} mode={modeOf(settings)} onChange={saveSettings} onManage={() => go("mcp")}
-              refreshKey={`${status?.instance_id ?? ""}|${modeOf(settings)}|${settings.builtin_tools}|${settings.environment_id ?? ""}|${settings.tool_servers.join(",")}|${(settings.disabled_servers ?? []).join(",")}|${ctxTick}`} />
+              refreshKey={`${status?.instance_id ?? ""}|${modeOf(settings)}|${settings.builtin_tools}|${settings.web_search}|${settings.environment_id ?? ""}|${settings.tool_servers.join(",")}|${(settings.disabled_servers ?? []).join(",")}|${ctxTick}`} />
             <span className="composer-sep" aria-hidden />
             {/* --- end chat mode / tools menus --- */}
             <button className="btn sm ghost" aria-label="Attach files" disabled={attaching || generating}

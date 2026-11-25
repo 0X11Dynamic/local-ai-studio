@@ -40,7 +40,7 @@ pub struct AppState {
     pub token_cache: Mutex<HashMap<(u16, u64), usize>>,
     /// One generation at a time per loaded model slot (chats, tasks and
     /// subagents share it), keyed by backend instance id.
-    pub gen_gate: Mutex<(Option<String>, Arc<tokio::sync::Semaphore>)>,
+    pub gen_gate: Mutex<(Option<String>, agent_runtime::Gate)>,
     /// Running agent tasks, by run id.
     pub tasks: Mutex<HashMap<String, Arc<crate::services::tasks::RunCtx>>>,
     /// Tasks between "start/resume" and running (reserved so they start once).
@@ -50,27 +50,33 @@ pub struct AppState {
     /// Attachments added to a chat's composer but not sent yet, by conversation id.
     /// Their files are already in the attachments folder; the next send takes them.
     pub pending_attachments: Mutex<HashMap<String, Vec<crate::services::attachments::Attachment>>>,
+    /// Layers llama.cpp put on the GPU (of all) when it chose them itself
+    /// (GPU offload Auto / `--fit`), by (model id, `models::offload_key`):
+    /// the next load with the same settings knows whether it is split.
+    pub observed_offload: Mutex<HashMap<(String, String), (u32, u32)>>,
+    /// Linked PCs: helper listener + rpc-server, pairing, tunnels to helpers.
+    pub linking: Arc<crate::services::linking::LinkService>,
 }
 
 pub type SharedState = Arc<AppState>;
 
 impl AppState {
-    /// Where new downloads go (setting, else the default folder).
+    /// Where new downloads go: the folder recorded in storage.json (the one
+    /// source of truth), else the folder resolved at startup.
     pub async fn models_dir(&self) -> PathBuf {
-        match self.db.get_setting::<String>("library.models_dir").await {
-            Ok(Some(p)) if !p.trim().is_empty() => PathBuf::from(p),
-            _ => self.paths.default_models_dir.clone(),
-        }
+        app_core::storage::read(&self.paths.data_dir)
+            .map(|c| c.models_dir)
+            .unwrap_or_else(|| self.paths.default_models_dir.clone())
     }
 
     /// The generation gate for the loaded model: as many permits as the
     /// backend has parallel slots (1 by default).
-    pub fn gate(&self) -> Arc<tokio::sync::Semaphore> {
+    pub fn gate(&self) -> agent_runtime::Gate {
         let status = self.engine.status();
         let mut g = self.gen_gate.lock().unwrap();
         if g.0 != status.instance_id {
             let slots = status.props.as_ref().and_then(|p| p.total_slots).unwrap_or(1).clamp(1, 8) as usize;
-            *g = (status.instance_id.clone(), Arc::new(tokio::sync::Semaphore::new(slots)));
+            *g = (status.instance_id.clone(), agent_runtime::Gate::new(slots));
         }
         g.1.clone()
     }

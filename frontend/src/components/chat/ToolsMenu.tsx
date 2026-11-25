@@ -27,7 +27,7 @@ export function toggleServer(s: ChatSettings, entries: ToolCostEntry[], id: stri
  * each MCP server with its tool count and token cost; unticking one leaves
  * its tools out of this chat only. Items are menuitemcheckbox elements with
  * aria-label "<server name> tools" (e.g. "filesystem tools"); the built-in entry is
- * labelled with its name, e.g. "Built-in tools (This PC)".
+ * labelled with its name, e.g. "Built-in tools (This PC)", and "Web search" has its own item.
  */
 export function ToolsMenu({ conversationId, settings, mode, onChange, onManage, refreshKey }: {
   conversationId: string | null;
@@ -67,14 +67,17 @@ export function ToolsMenu({ conversationId, settings, mode, onChange, onManage, 
   }, []);
 
   const entries = costs?.entries ?? [];
-  const on = entries.filter((e) => e.in_chat && (e.kind === "builtin" || e.enabled));
+  const on = entries.filter((e) => e.in_chat && (e.kind !== "mcp" || e.enabled));
   const live = on.filter((e) => e.state === "connected");
-  const tokens = live.reduce((a, e) => a + e.tokens, 0);
+  // Servers loaded on demand send only a name list up front, not their definitions.
+  const tokens = live.reduce((a, e) => a + (e.deferred ? 0 : e.tokens), 0);
+  const deferOn = settings.defer_tools !== false;
+  const deferred = live.filter((e) => e.deferred);
   const tools = live.reduce((a, e) => a + e.tool_count, 0);
   const sends = mode !== "chat";
 
   const flip = (e: ToolCostEntry) => {
-    const next = e.kind === "builtin" ? { ...settings, builtin_tools: !settings.builtin_tools } : toggleServer(settings, entries, e.id);
+    const next = e.kind === "builtin" ? { ...settings, builtin_tools: !settings.builtin_tools } : e.kind === "websearch" ? { ...settings, web_search: settings.web_search === false } : toggleServer(settings, entries, e.id);
     // Show the change at once; the refetch confirms it.
     setCosts((c) => c && { ...c, entries: c.entries.map((x) => (x.id === e.id ? { ...x, in_chat: !x.in_chat } : x)) });
     onChange(next);
@@ -83,6 +86,7 @@ export function ToolsMenu({ conversationId, settings, mode, onChange, onManage, 
   const meta = (e: ToolCostEntry) => {
     if (e.kind === "mcp" && !e.enabled) return "turned off on the MCP page";
     if (e.state !== "connected") return STATE[e.state] ?? e.state;
+    if (e.deferred && e.in_chat) return `${e.tool_count} tools, loaded on demand`;
     return `${e.tool_count} tool${e.tool_count === 1 ? "" : "s"}, ${costs?.exact ? "" : "about "}${e.tokens.toLocaleString()} tok`;
   };
 
@@ -115,7 +119,7 @@ export function ToolsMenu({ conversationId, settings, mode, onChange, onManage, 
             const checked = e.in_chat && !off;
             return (
               <button key={e.id} type="button" role="menuitemcheckbox" aria-checked={checked} aria-disabled={off || undefined}
-                aria-label={e.kind === "builtin" ? e.name : `${e.name} tools`} tabIndex={-1} className={`dd-item dd-check${off ? " is-off" : ""}`}
+                aria-label={e.kind !== "mcp" ? e.name : `${e.name} tools`} tabIndex={-1} className={`dd-item dd-check${off ? " is-off" : ""}`}
                 title={e.error ?? undefined}
                 onClick={() => { if (!off) flip(e); }}>
                 <span className={`dd-box${checked ? " on" : ""}`} aria-hidden />
@@ -126,8 +130,17 @@ export function ToolsMenu({ conversationId, settings, mode, onChange, onManage, 
               </button>
             );
           })}
-          {entries.length <= 1 && <div className="dd-note">No MCP servers yet.</div>}
+          {!entries.some((e) => e.kind === "mcp") && <div className="dd-note">No MCP servers yet.</div>}
           <div className="dd-sep" role="separator" />
+          <button type="button" role="menuitemcheckbox" aria-checked={deferOn} aria-label="Load tool details on demand" tabIndex={-1} className="dd-item dd-check"
+            title="With many tools (a server with more than 30, or more than 60 in all), the big servers' tools are listed by name and the model loads the ones it needs. Shorter prompts, faster first replies."
+            onClick={() => onChange({ ...settings, defer_tools: !deferOn })}>
+            <span className={`dd-box${deferOn ? " on" : ""}`} aria-hidden />
+            <span className="dd-item-body">
+              <span className="dd-item-name">Load tool details on demand</span>
+              <span className="dd-item-desc">{!deferOn ? "Off: every tool's details are sent" : deferred.length > 0 ? `On for ${deferred.map((e) => e.name).join(", ")}` : "On when a server has over 30 tools, or over 60 in all"}</span>
+            </span>
+          </button>
           <button type="button" role="menuitem" tabIndex={-1} className="dd-item dd-link" onClick={onManage}>
             <Plugs size={14} aria-hidden className="dd-item-icon" />
             <span className="dd-item-body"><span className="dd-item-name">Manage MCP servers</span></span>

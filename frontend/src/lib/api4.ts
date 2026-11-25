@@ -34,7 +34,6 @@ export const api4 = {
   addDocker: (name: string, config: DockerConfig) => invoke<string>("add_docker_environment", { name, config }),
   updateDocker: (id: string, name: string, config: DockerConfig) => invoke<void>("update_docker_environment", { id, name, config }),
   dockerStatus: (host: string) => invoke<string>("docker_status", { host }),
-  wslStatus: () => invoke<string>("wsl_status"),
   createSandbox: (name: string, network: boolean) => invoke<string>("create_sandbox", { name, network }),
   remove: (id: string) => invoke<void>("delete_environment", { id }),
   setToolPref: (envId: string, tool: string, enabled: boolean, policy: Policy) => invoke<void>("set_builtin_tool_pref", { envId, tool, enabled, policy }),

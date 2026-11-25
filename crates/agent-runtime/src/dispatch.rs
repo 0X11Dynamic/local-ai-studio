@@ -68,6 +68,11 @@ pub trait ToolHost: Send + Sync {
     async fn call(&self, tool: &ExposedTool, call: &ToolCall, args: serde_json::Value, timeout: Duration, cancel: &CancellationToken) -> AppResult<CallResult>;
     /// Live UI events (tool started / waiting / finished).
     fn event(&self, ev: ToolEvent);
+    /// Deferred tool loading for this chat/agent (None = every tool is sent in
+    /// full). The loop reads it before each model step.
+    fn tool_offer(&self) -> Option<std::sync::Arc<crate::deferred::ToolOffer>> {
+        None
+    }
     /// App-owned facts about this call worked out from its arguments (built-in
     /// tools: places outside the allowed folders, blocked folders, Plan mode,
     /// local network addresses). Default: none.
@@ -113,9 +118,43 @@ fn truncate(s: &str) -> (String, bool) {
     (format!("{cut}\n[output truncated: {} characters in total]", s.chars().count()), true)
 }
 
+type Compiled = Option<std::sync::Arc<jsonschema::Validator>>;
+
+/// Compiled validators, keyed by the schema text itself (tools keep their
+/// schema between requests, so each is compiled once, not once per request).
+/// Keyed by the full text, not a hash: a hash collision must never hand one
+/// tool another tool's validator.
+fn compiled(schema: &serde_json::Value) -> Compiled {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+    static CACHE: LazyLock<Mutex<HashMap<String, Compiled>>> = LazyLock::new(Default::default);
+    compiled_in(&CACHE, schema)
+}
+
+const VALIDATOR_CACHE_MAX: usize = 4096;
+
+fn compiled_in(cache: &std::sync::Mutex<std::collections::HashMap<String, Compiled>>, schema: &serde_json::Value) -> Compiled {
+    let key = schema.to_string();
+    if let Some(v) = cache.lock().unwrap().get(&key) {
+        return v.clone();
+    }
+    let v = jsonschema::validator_for(schema).ok().map(std::sync::Arc::new);
+    let mut c = cache.lock().unwrap();
+    if c.len() >= VALIDATOR_CACHE_MAX {
+        c.clear();
+    }
+    c.insert(key, v.clone());
+    v
+}
+
+/// Does this schema compile (cached)?
+pub fn schema_compiles(schema: &serde_json::Value) -> bool {
+    compiled(schema).is_some()
+}
+
 /// Validate `args` against a JSON Schema. Returns human-readable errors.
 pub fn validate_args(schema: &serde_json::Value, args: &serde_json::Value) -> Result<(), Vec<String>> {
-    let Ok(v) = jsonschema::validator_for(schema) else {
+    let Some(v) = compiled(schema) else {
         // An unusable schema from the server: only require an object.
         return if args.is_object() { Ok(()) } else { Err(vec!["arguments must be a JSON object".into()]) };
     };
@@ -292,6 +331,20 @@ async fn end(host: &dyn ToolHost, audit_id: &str, call: &ToolCall, status: &str,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn validator_cache_is_keyed_by_schema_text_and_bounded() {
+        let cache = std::sync::Mutex::new(std::collections::HashMap::new());
+        let a = serde_json::json!({ "type": "object", "required": ["a"] });
+        let b = serde_json::json!({ "type": "object", "required": ["b"] });
+        let (va, vb) = (super::compiled_in(&cache, &a).unwrap(), super::compiled_in(&cache, &b).unwrap());
+        assert!(!va.is_valid(&serde_json::json!({ "b": 1 })) && vb.is_valid(&serde_json::json!({ "b": 1 })));
+        assert!(std::sync::Arc::ptr_eq(&va, &super::compiled_in(&cache, &a).unwrap()), "same schema reuses its validator");
+        for i in 0..super::VALIDATOR_CACHE_MAX + 10 {
+            super::compiled_in(&cache, &serde_json::json!({ "type": "object", "maxProperties": i }));
+        }
+        assert!(cache.lock().unwrap().len() <= super::VALIDATOR_CACHE_MAX);
+    }
+
     use super::*;
     use security::policy::Policy;
     use std::sync::Mutex;

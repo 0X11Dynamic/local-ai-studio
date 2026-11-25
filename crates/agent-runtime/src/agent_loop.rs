@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 use app_core::AppResult;
 use async_trait::async_trait;
 use inference::{ChatDelta, ChatStats, LlamaClient, SamplingParams, ToolCall};
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::dispatch::{DispatchOutcome, ToolHost, dispatch};
+use crate::gate::{Gate, GateStop, Seat};
 use crate::tools::{ExposedTool, Limits, openai_tools};
 
 /// Persistence and UI hooks for the loop (implemented by chat and tasks).
@@ -76,8 +76,9 @@ pub struct TurnCtx<'a> {
     pub scope: Option<&'a str>,
     pub cancel: &'a CancellationToken,
     pub mode: ToolMode,
-    /// Shared limit on concurrent generations (one GPU, one model).
-    pub gate: Option<&'a Semaphore>,
+    /// This agent's seat at the shared generation gate (one GPU, one model).
+    /// The seat keeps its permit across consecutive fast steps (see `gate.rs`).
+    pub gate: Option<&'a Seat>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -167,9 +168,26 @@ impl TurnResult {
 /// Generate one segment and run its tool calls, appending everything to
 /// `messages`. `offer_tools: false` asks for a written answer.
 pub async fn turn(ctx: &TurnCtx<'_>, messages: &mut Vec<serde_json::Value>, segment: usize, offer_tools: bool, calls_left: u32, time_left: Duration) -> TurnResult {
+    let r = turn_inner(ctx, messages, segment, offer_tools, calls_left, time_left).await;
+    // Only a turn that goes straight on to the next step keeps the gate.
+    if !matches!(r.end, TurnEnd::Continue)
+        && let Some(seat) = ctx.gate
+    {
+        seat.release();
+    }
+    r
+}
+
+async fn turn_inner(ctx: &TurnCtx<'_>, messages: &mut Vec<serde_json::Value>, segment: usize, offer_tools: bool, calls_left: u32, time_left: Duration) -> TurnResult {
     let xml = ctx.mode == ToolMode::Xml;
     let offer_tools = offer_tools && !ctx.tools.is_empty();
-    let defs = openai_tools(ctx.tools);
+    // Deferred loading: only the tools not deferred, plus the ones loaded so
+    // far, are sent in full (re-read each step: load_tools may have added some).
+    let offer = ctx.host.tool_offer();
+    let defs = match &offer {
+        Some(o) => openai_tools(&o.sent(ctx.tools)),
+        None => openai_tools(ctx.tools),
+    };
     if let Err(e) = ctx.hooks.begin_segment(segment).await {
         return TurnResult::stop("error", Some(e.to_string()));
     }
@@ -179,15 +197,13 @@ pub async fn turn(ctx: &TurnCtx<'_>, messages: &mut Vec<serde_json::Value>, segm
     let after_tools = follows_tool_results(messages, xml);
     let mut nudged = false;
     let mut earlier_tokens = 0u64;
-    // Wait for a free generation slot (the wait counts against time).
-    let permit = match ctx.gate {
-        Some(g) => tokio::select! {
-            p = g.acquire() => p.ok(),
-            _ = ctx.cancel.cancelled() => return TurnResult::stop("cancelled", None),
-            _ = tokio::time::sleep(time_left) => return TurnResult::stop("time_limit", None),
-        },
-        None => None,
-    };
+    // Wait for a free generation slot (the wait counts against time). An agent
+    // that kept its slot from the last step goes straight on.
+    if let Some(seat) = ctx.gate
+        && let Err(stop) = seat.acquire(ctx.cancel, time_left).await
+    {
+        return TurnResult::stop(if stop == GateStop::Cancelled { "cancelled" } else { "time_limit" }, None);
+    }
     let (mut reply, calls, mut note, malformed, cut_off) = loop {
         let left = time_left.saturating_sub(started.elapsed());
         let reply = match generate(ctx, messages, offer_tools && !xml, &defs, segment, left).await {
@@ -254,7 +270,6 @@ pub async fn turn(ctx: &TurnCtx<'_>, messages: &mut Vec<serde_json::Value>, segm
         }
         break (reply, calls, note, malformed, cut_off);
     };
-    drop(permit);
     if earlier_tokens > 0 {
         // The nudged-away attempt's tokens count too (budgets, usage).
         reply.stats.completion_tokens = Some(reply.stats.completion_tokens.unwrap_or(0) + earlier_tokens);
@@ -302,7 +317,17 @@ pub async fn turn(ctx: &TurnCtx<'_>, messages: &mut Vec<serde_json::Value>, segm
             DispatchOutcome { status: "cancelled".into(), content: "Not run: the work was stopped.".into(), audit_id: None }
         } else {
             result.calls_counted += 1;
-            dispatch(ctx.host, ctx.tools, call, ctx.scope, ctx.cancel).await
+            // A listed-but-not-loaded tool called directly: it is validated
+            // against its real schema as usual, and loaded for later steps.
+            if let Some(o) = offer.as_ref().filter(|o| o.is_hidden(&call.name)) {
+                o.load(std::slice::from_ref(&call.name));
+            }
+            let run = dispatch(ctx.host, ctx.tools, call, ctx.scope, ctx.cancel);
+            match ctx.gate {
+                // A call that waits on something external lets go of the gate.
+                Some(seat) => seat.during_tool(&call.name, run).await,
+                None => run.await,
+            }
         };
         let _ = ctx.hooks.on_tool_result(call, &outcome).await;
         if xml {
@@ -332,10 +357,11 @@ pub async fn run_reply(
     conversation_id: Option<&str>,
     cancel: &CancellationToken,
     mode: ToolMode,
-    gate: Option<&Semaphore>,
+    gate: Option<&Gate>,
 ) -> LoopOutcome {
     let started = Instant::now();
-    let ctx = TurnCtx { client, tools, params, host, hooks, scope: conversation_id, cancel, mode, gate };
+    let seat = gate.map(Gate::seat);
+    let ctx = TurnCtx { client, tools, params, host, hooks, scope: conversation_id, cancel, mode, gate: seat.as_ref() };
     let mut out = LoopOutcome::default();
     let mut offer_tools = !tools.is_empty();
     let mut limit_seen = false;

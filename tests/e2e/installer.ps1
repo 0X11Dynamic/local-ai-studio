@@ -1,6 +1,6 @@
 # Installer test: silent install, desktop + Start menu shortcuts, smoke suite
 # against the installed exe, silent uninstall (shortcuts removed), and proof
-# that Will's real app data is untouched.
+# that the real app data is untouched.
 #   powershell -NoProfile -File tests\e2e\installer.ps1
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)

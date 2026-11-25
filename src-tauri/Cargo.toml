@@ -28,7 +28,9 @@ execution.workspace = true
 execution-ssh.workspace = true
 execution-docker.workspace = true
 skills.workspace = true
+linking.workspace = true
 futures.workspace = true
+dirs.workspace = true
 async-trait = "0.1.92"
 base64.workspace = true
 # PDF text extraction for chat attachments (pure Rust).
@@ -48,3 +50,4 @@ reqwest.workspace = true
 
 [dev-dependencies]
 jsonschema = { version = "0.61.1", default-features = false }
+tempfile.workspace = true

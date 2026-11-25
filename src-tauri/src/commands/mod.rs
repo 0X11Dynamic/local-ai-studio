@@ -4,9 +4,12 @@ pub mod discover;
 pub mod engine;
 pub mod exec;
 pub mod instructions;
+pub mod linking;
 pub mod mcp;
 pub mod models;
 pub mod runtimes;
+pub mod search;
+pub mod storage;
 pub mod system;
 pub mod tasks;
 

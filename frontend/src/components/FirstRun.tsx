@@ -9,6 +9,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { api, errorMessage, type AvailableRuntime, type InstallProgress, type InstalledRuntime } from "../lib/api";
 import { api2, type DownloadEvent } from "../lib/api2";
+import { api8, type FolderCheck } from "../lib/api8";
+import { StorageFolder } from "./StorageFolder";
 import { bytes, percent, rate } from "../lib/format";
 import type { PageId } from "../App";
 
@@ -46,6 +48,15 @@ export function FirstRun({ go }: { go: (p: PageId) => void }) {
   const [dlErr, setDlErr] = useState<string | null>(null);
   const [modelStatus, setModelStatus] = useState<string | null>(null);
   const [showOthers, setShowOthers] = useState(false);
+  // Storage step: nothing installs until the folders are confirmed (a profile
+  // that already has a runtime counts as confirmed; Settings > Storage changes them).
+  const [modelsDir, setModelsDir] = useState("");
+  const [runtimesDir, setRuntimesDir] = useState("");
+  const [modelsCheck, setModelsCheck] = useState<FolderCheck | null>(null);
+  const [runtimesCheck, setRuntimesCheck] = useState<FolderCheck | null>(null);
+  const [storageOk, setStorageOk] = useState(false);
+  const [storageBusy, setStorageBusy] = useState(false);
+  const [storageErr, setStorageErr] = useState<string | null>(null);
   const autoStarted = useRef(false);
   const dlIdRef = useRef<string | null>(null);
 
@@ -62,6 +73,10 @@ export function FirstRun({ go }: { go: (p: PageId) => void }) {
     setPlanErr(null);
     try {
       const p = await invoke<SetupPlan>("setup_plan");
+      const st = await api8.getStorage();
+      setModelsDir(st.models.path);
+      setRuntimesDir(st.runtimes.path);
+      setStorageOk(p.installed.length > 0);
       setPlan(p);
       setInstalled(p.installed);
     } catch (e) {
@@ -109,10 +124,23 @@ export function FirstRun({ go }: { go: (p: PageId) => void }) {
   // old (then the user picks Vulkan or CPU after reading why).
   useEffect(() => {
     if (!open || !plan || autoStarted.current) return;
-    if (plan.installed.length > 0 || !recommended || driverBlocks) return;
+    if (plan.installed.length > 0 || !recommended || driverBlocks || !storageOk) return;
     autoStarted.current = true;
     install(recommended);
-  }, [open, plan, recommended, driverBlocks, install]);
+  }, [open, plan, recommended, driverBlocks, storageOk, install]);
+
+  const confirmStorage = async () => {
+    setStorageBusy(true);
+    setStorageErr(null);
+    try {
+      await api8.setStorageDirs(modelsDir, runtimesDir, false);
+      setStorageOk(true);
+    } catch (e) {
+      setStorageErr(errorMessage(e));
+    } finally {
+      setStorageBusy(false);
+    }
+  };
 
   const runtime = installed[0] ?? null;
   const starter = plan && runtime ? (usesGpu(runtime.variant) && plan.starter_gpu ? plan.starter_gpu : plan.starter_cpu) : null;
@@ -172,7 +200,7 @@ export function FirstRun({ go }: { go: (p: PageId) => void }) {
           <button className="btn sm ghost" onClick={() => close(true)}>Skip setup</button>
         </div>
         <p className="lede" style={{ marginBottom: 14 }}>
-          Three steps: check this PC, install the engine that runs models, and get a first model. You can skip and do it later from Runtimes and Discover; Settings opens this again.
+          Four steps: check this PC, choose where files go, install the engine that runs models, and get a first model. You can skip and do it later from Runtimes and Discover; Settings opens this again.
         </p>
 
         {planErr && (
@@ -211,7 +239,26 @@ export function FirstRun({ go }: { go: (p: PageId) => void }) {
             )}
             {plan.driver?.status === "ok" && <p className="faint" style={{ margin: "8px 0 0" }}>{plan.driver.message}</p>}
 
-            <h3 style={{ fontSize: 13, margin: "20px 0 8px" }}>2. Runtime</h3>
+            <h3 style={{ fontSize: 13, margin: "20px 0 8px" }}>2. Storage</h3>
+            <div data-storage-step data-storage-confirmed={storageOk ? "1" : "0"}>
+              <div className="form-grid">
+                <StorageFolder id="setup-models" label="Models folder" value={modelsDir} onChange={(v) => { setModelsDir(v); }} disabled={storageBusy || installed.length > 0 || !!installing} onCheck={setModelsCheck} />
+                <StorageFolder id="setup-runtimes" label="Runtimes folder (the engine that runs models)" value={runtimesDir} onChange={(v) => { setRuntimesDir(v); }} disabled={storageBusy || installed.length > 0 || !!installing} onCheck={setRuntimesCheck} />
+              </div>
+              {installed.length === 0 && (
+                <div className="row" style={{ marginTop: 8 }}>
+                  <button className="btn sm primary" disabled={storageBusy || !modelsCheck?.ok || !runtimesCheck?.ok} onClick={confirmStorage}>
+                    {storageOk ? "Use these folders again" : "Use these folders"}
+                  </button>
+                  {!storageOk && <span className="faint">The engine installs after you confirm. The defaults are fine for most people.</span>}
+                  {storageOk && <span className="faint">Saved.</span>}
+                </div>
+              )}
+              {installed.length > 0 && <p className="faint" style={{ margin: "8px 0 0" }}>Change these later in Settings, Storage.</p>}
+              {storageErr && <div className="danger-text" style={{ marginTop: 6 }}>{storageErr}</div>}
+            </div>
+
+            <h3 style={{ fontSize: 13, margin: "20px 0 8px" }}>3. Runtime</h3>
             {runtime ? (
               <div className="row">
                 <span>Installed:</span> <strong className="mono">{runtime.id}</strong>
@@ -222,6 +269,8 @@ export function FirstRun({ go }: { go: (p: PageId) => void }) {
                 <span>Could not reach GitHub for the llama.cpp runtime: {plan.available_error}</span><span className="spacer" />
                 <button className="btn sm" onClick={loadPlan}>Retry</button>
               </div>
+            ) : !storageOk ? (
+              <div className="faint">Choose the storage folders above first.</div>
             ) : recommended ? (
               <div>
                 <div className="row">
@@ -260,7 +309,7 @@ export function FirstRun({ go }: { go: (p: PageId) => void }) {
               <div className="faint">Looking for the latest llama.cpp release...</div>
             )}
 
-            <h3 style={{ fontSize: 13, margin: "20px 0 8px" }}>3. A first model</h3>
+            <h3 style={{ fontSize: 13, margin: "20px 0 8px" }}>4. A first model</h3>
             {!starter ? (
               <div className="faint">Install a runtime first; the suggestion depends on whether models run on the GPU or the CPU.</div>
             ) : (

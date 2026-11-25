@@ -15,6 +15,7 @@ pub mod downloads;
 pub mod exec;
 pub mod mcp;
 pub mod models;
+pub mod peers;
 pub mod presets;
 pub mod settings;
 pub mod skills;
@@ -27,6 +28,7 @@ pub use downloads::DownloadRow;
 pub use exec::{BuiltinPrefRow, ExecProfileRow};
 pub use mcp::{GrantRow, McpServerRow, NewToolExec, ToolExecRow, ToolPrefRow};
 pub use models::{ModelInstanceRow, ModelRow};
+pub use peers::{InstanceSpeed, NewPeer, PeerRow, PeerShare};
 pub use presets::PresetRow;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -95,7 +97,7 @@ mod tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(n.0, 19, "all spec section 12 tables plus builtin_tool_preferences should exist");
+        assert_eq!(n.0, 20, "all spec section 12 tables plus builtin_tool_preferences and linked_peers should exist");
         // Re-opening must not re-run migrations or fail.
         drop(db);
         Db::open(&dir.path().join("t.db")).await.unwrap();

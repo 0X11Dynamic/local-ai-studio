@@ -24,7 +24,13 @@ use crate::gguf::{self, GgufHeader, Value};
 /// Bump when detection changes so stored rows are re-detected at startup.
 /// 2: also back-fills the attention layout (sliding window, shared KV, MTP
 /// layers) the memory estimate reads.
-pub const CAPS_VERSION: u32 = 2;
+/// 3: MTP layers count only when the file has the nextn tensors (reads the
+/// tensor names); also back-fills `mtp_layers_declared`.
+/// 4: MTP tensors are looked up in every shard of a split model, and an
+/// unreadable tensor list is "unknown" (`mtp_unknown`), not "removed".
+/// 5: back-fills `host_weight_bytes` (Gemma 3n / 4 per-layer embeddings,
+/// which llama.cpp keeps in host memory) from the tensor-info section.
+pub const CAPS_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

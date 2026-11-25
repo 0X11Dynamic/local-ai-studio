@@ -32,6 +32,9 @@
   },
   "bundle": {
     "active": true,
+    "resources": {
+      "resources/vcrt/": "vcrt/"
+    },
     "targets": [
       "nsis"
     ],

@@ -33,6 +33,8 @@ pub struct TaskSettings {
     /// Execution environment for the built-in tools (None = This PC).
     pub environment_id: Option<String>,
     pub builtin_tools: bool,
+    /// Offer web_search (the "Task tools" picker); on by default.
+    pub web_search: bool,
     /// Offer MCP tools; `tool_servers` empty = every connected server.
     pub mcp_tools: bool,
     pub tool_servers: Vec<String>,
@@ -66,6 +68,7 @@ impl Default for TaskSettings {
         Self {
             environment_id: None,
             builtin_tools: true,
+            web_search: true,
             // Every connected server is on unless the picker turns it off.
             mcp_tools: true,
             tool_servers: vec![],
@@ -154,10 +157,11 @@ fn emit(app: &AppHandle, payload: serde_json::Value) {
     let _ = app.emit("task://event", &payload);
 }
 
-/// The tools section for a task or subagent: the tool list from
-/// `tools_section`, with this work's own limits (which may be "no limit").
-fn task_tools_section(tools: &[ExposedTool], b: &Budgets) -> String {
-    let s = agent_runtime::tools_section(tools, &agent_runtime::Limits { max_tool_calls: b.max_tool_calls, max_wall_secs: b.max_wall_secs });
+/// The tools section for a task or subagent: `tools_prompt` (the per-tool
+/// list in XML mode, the short native overview otherwise, plus the index of
+/// tools loaded on demand), with this work's own limits (which may be "no limit").
+fn task_tools_section(tools: &[ExposedTool], b: &Budgets, mode: ToolMode, offer: Option<&agent_runtime::ToolOffer>) -> String {
+    let s = agent_runtime::tools_prompt(tools, &agent_runtime::Limits { max_tool_calls: b.max_tool_calls, max_wall_secs: b.max_wall_secs }, mode, offer);
     let list = s.split("\n\n## Limits\n").next().unwrap_or(&s).to_string();
     format!("{list}\n\n## Limits\nEach tool call times out after its server's limit (usually 60 seconds). Limits for this work: {}.", b.describe())
 }
@@ -398,11 +402,51 @@ struct Observer {
     /// None = root agent (saves the run), Some = a subagent.
     agent_id: Option<String>,
     n_ctx: u64,
+    /// The agent's full tool list and its deferred-loading offer: the
+    /// definitions actually sent (see `sent_tool_tokens`) are counted anew on
+    /// every turn, since loaded tools only grow.
+    tools: Vec<ExposedTool>,
+    offer: Option<Arc<agent_runtime::ToolOffer>>,
 }
 
 /// Rough token estimate; the exact count is not needed to decide when to trim.
 fn approx_tokens(v: &[serde_json::Value]) -> u64 {
     (serde_json::to_string(v).map(|s| s.len()).unwrap_or(0) / 3) as u64
+}
+
+/// Approximate tokens of the JSON tool definitions sent next to the
+/// transcript. Only native mode sends them (`openai_tools`); in XML mode the
+/// tools are described in the system prompt, already inside the transcript.
+fn tool_def_tokens(mode: ToolMode, tools: &[ExposedTool]) -> u64 {
+    if mode != ToolMode::Native || tools.is_empty() {
+        return 0;
+    }
+    match agent_runtime::openai_tools(tools) {
+        serde_json::Value::Array(a) => approx_tokens(&a),
+        _ => 0,
+    }
+}
+
+/// Tokens of the tool definitions really sent: with deferred loading only the
+/// non-deferred tools (load_tools included) plus those loaded so far. The
+/// deferred index text lives in the system prompt, inside the transcript.
+fn sent_tool_tokens(mode: ToolMode, tools: &[ExposedTool], offer: Option<&agent_runtime::ToolOffer>) -> u64 {
+    match offer {
+        Some(o) => tool_def_tokens(mode, &o.sent(tools)),
+        None => tool_def_tokens(mode, tools),
+    }
+}
+
+/// The transcript's token limit: 70% of the context minus the tool
+/// definitions sent outside it. Errors when the definitions alone do not fit.
+fn transcript_limit(n_ctx: u64, tool_tokens: u64) -> Result<u64, String> {
+    let budget = n_ctx * 7 / 10;
+    if tool_tokens >= budget {
+        return Err(format!(
+            "The tool definitions alone take about {tool_tokens} tokens, but this model's context ({n_ctx} tokens) leaves room for only about {budget}. Turn off some MCP servers for this task, or load the model with a larger context."
+        ));
+    }
+    Ok(budget - tool_tokens)
 }
 
 fn is_tool_result(m: &serde_json::Value) -> bool {
@@ -474,7 +518,8 @@ impl TaskObserver for Observer {
             let done = std::mem::take(&mut *self.run.child_usage.lock().unwrap());
             usage.add(&done);
         }
-        let (removed, shortened) = fit_transcript(transcript, self.n_ctx * 7 / 10);
+        let limit = transcript_limit(self.n_ctx, sent_tool_tokens(self.run.mode, &self.tools, self.offer.as_deref())).map_err(AppError::InvalidInput)?;
+        let (removed, shortened) = fit_transcript(transcript, limit);
         if removed + shortened > 0 {
             let mut text = vec![];
             if removed > 0 {
@@ -600,10 +645,13 @@ async fn launch_reserved(st: &SharedState, app: &AppHandle, run_id: &str) -> App
     let env_id = settings.environment_id.clone().unwrap_or_else(|| exec::LOCAL_ID.to_string());
     let mut tools = vec![];
     let mut env_text = String::new();
-    if settings.builtin_tools {
+    // Web search follows its own switch, independent of the built-in tools.
+    if settings.builtin_tools || settings.web_search {
         let (t, sec) = exec::exposed(st, &env_id).await?;
-        tools.extend(t);
-        env_text = sec;
+        tools.extend(t.into_iter().filter(|t| if chat::is_web_search(t) { settings.web_search } else { settings.builtin_tools }));
+        if settings.builtin_tools {
+            env_text = sec;
+        }
     }
     if settings.mcp_tools {
         // Servers turned off in the start form's "Task tools" picker are left out.
@@ -629,6 +677,9 @@ async fn launch_reserved(st: &SharedState, app: &AppHandle, run_id: &str) -> App
         _ if supports_tools => ToolMode::Native,
         _ => ToolMode::Xml,
     };
+    // Many tools (a server over 30, or over 60 in all): the big servers' tools
+    // are listed by name and loaded on demand (load_tools).
+    let offer = crate::services::tool_offer::plan(&mut tools, true, &[], mode == ToolMode::Xml, run_id).map(|o| crate::services::tool_offer::install(st, &format!("run:{run_id}"), o));
 
     // Prompt: base + agent profile + generated sections.
     let base = st.db.get_setting::<String>("instructions.base").await?.unwrap_or_default();
@@ -649,7 +700,7 @@ async fn launch_reserved(st: &SharedState, app: &AppHandle, run_id: &str) -> App
     }
     let generated = format!(
         "{}\n\n{}\n\n{}",
-        task_tools_section(&tools, &budgets.remaining(&usage)),
+        task_tools_section(&tools, &budgets.remaining(&usage), mode, offer.as_deref()),
         shared.trim(),
         if planning { plan_section(&row.objective, &budgets, &usage) } else { task_section(&row.objective, &budgets, &usage, settings.subagents) }
     );
@@ -698,10 +749,10 @@ async fn launch_reserved(st: &SharedState, app: &AppHandle, run_id: &str) -> App
 
     let (st2, app2) = (st.clone(), app.clone());
     tokio::spawn(async move {
-        let host = AppToolHost { st: st2.clone(), app: app2.clone(), conversation_id: None, run_id: Some(run.run_id.clone()), agent_id: None, agent_label: Some("Main agent".into()) };
+        let host = AppToolHost { st: st2.clone(), app: app2.clone(), conversation_id: None, run_id: Some(run.run_id.clone()), agent_id: None, agent_label: Some("Main agent".into()), reply_id: None };
         let hooks = StepHooks::new(st2.clone(), app2.clone(), run.run_id.clone(), None);
-        let observer = Observer { st: st2.clone(), app: app2.clone(), run: run.clone(), agent_id: None, n_ctx };
-        let gate = st2.gate();
+        let observer = Observer { st: st2.clone(), app: app2.clone(), run: run.clone(), agent_id: None, n_ctx, tools: run.tools.clone(), offer: offer.clone() };
+        let gate = st2.gate().seat();
         let ctx = TurnCtx {
             client: &run.client,
             tools: &run.tools,
@@ -990,6 +1041,7 @@ pub async fn begin_chat_run(st: &SharedState, app: &AppHandle, init: ChatRunInit
     let settings = TaskSettings {
         environment_id: s.environment_id.clone(),
         builtin_tools: s.builtin_tools,
+        web_search: s.web_search,
         mcp_tools: true,
         tool_servers: s.tool_servers.clone(),
         disabled_servers: s.disabled_servers.clone(),
@@ -1146,12 +1198,30 @@ async fn worktree_repo(st: &SharedState, run: &RunCtx) -> AppResult<(std::path::
             repo.display()
         )));
     }
-    let rel =std::fs::canonicalize(&first)
-        .ok()
-        .zip(std::fs::canonicalize(&repo).ok())
-        .and_then(|(f, r)| f.strip_prefix(&r).ok().map(|p| p.to_string_lossy().into_owned()))
-        .unwrap_or_default();
+    let rel = rel_in_repo(&first, &repo);
     Ok((repo, rel))
+}
+
+/// Where `first` lies inside `repo` ("" = the repository's top folder).
+fn rel_in_repo(first: &std::path::Path, repo: &std::path::Path) -> String {
+    std::fs::canonicalize(first)
+        .ok()
+        .zip(std::fs::canonicalize(repo).ok())
+        .and_then(|(f, r)| f.strip_prefix(&r).ok().map(|p| p.to_string_lossy().into_owned()))
+        .unwrap_or_default()
+}
+
+/// A child's worktree id (12 hex characters).
+fn worktree_id() -> String {
+    app_core::new_id().replace('-', "").chars().take(12).collect()
+}
+
+/// The refusal for an `isolation` value other than "none" / "worktree".
+fn bad_isolation(a: &SpawnArgs) -> Option<String> {
+    a.subagents
+        .iter()
+        .find_map(|s| s.isolation.as_deref().filter(|i| !matches!(*i, "none" | "worktree")))
+        .map(|bad| format!("Not started: isolation must be \"none\" or \"worktree\", not {bad:?}."))
 }
 
 /// One child of a spawn call, saved before its worktree is made.
@@ -1191,8 +1261,13 @@ async fn roll_back(st: &SharedState, app: &AppHandle, run_id: &str, made: &[Chil
 
 async fn not_started(st: &SharedState, app: &AppHandle, run_id: &str, made: &[Child], why: &str, isolated: bool) -> AppResult<CallResult> {
     roll_back(st, app, run_id, made, why).await;
+    Ok(CallResult { text: not_started_text(why, isolated), is_error: true })
+}
+
+/// What the model reads when a spawn call started no child.
+fn not_started_text(why: &str, isolated: bool) -> String {
     let hint = if isolated { " You can call spawn_subagents again without \"isolation\" (the subagents then share your folders)." } else { "" };
-    Ok(CallResult { text: format!("Not started: no subagent was started because {why}.{hint}"), is_error: true })
+    format!("Not started: no subagent was started because {why}.{hint}")
 }
 
 /// The child's tools with This PC's built-ins swapped for the same tools in
@@ -1255,8 +1330,8 @@ pub async fn spawn_subagents(host: &AppToolHost, call: &ToolCall, args: serde_js
     };
     let run_id = run.run_id.clone();
     let a: SpawnArgs = serde_json::from_value(args).map_err(|e| AppError::InvalidInput(e.to_string()))?;
-    if let Some(bad) = a.subagents.iter().find_map(|s| s.isolation.as_deref().filter(|i| !matches!(*i, "none" | "worktree"))) {
-        return Ok(CallResult { text: format!("Not started: isolation must be \"none\" or \"worktree\", not {bad:?}."), is_error: true });
+    if let Some(text) = bad_isolation(&a) {
+        return Ok(CallResult { text, is_error: true });
     }
     // What the parent may hand out: its tools minus the app's agent tools.
     let allowed: Vec<ExposedTool> = run.tools.iter().filter(|t| !t.server_id.starts_with(AGENT_PREFIX)).cloned().collect();
@@ -1331,7 +1406,7 @@ pub async fn spawn_subagents(host: &AppToolHost, call: &ToolCall, args: serde_js
         if s.isolation.as_deref() == Some("worktree")
             && let Some((repo, rel)) = &repo
         {
-            let wid: String = app_core::new_id().replace('-', "").chars().take(12).collect();
+            let wid = worktree_id();
             let wt = match execution::git::plan_worktree(repo, &wid).await {
                 Ok(w) => w,
                 Err(e) => return not_started(st, &host.app, &run_id, &made, &format!("worktree isolation is not available: {e}"), true).await,
@@ -1437,6 +1512,7 @@ fn launch_child(host: &AppToolHost, run: &Arc<RunCtx>, c: Child, cancel: Cancell
         run_id: host.run_id.clone(),
         agent_id: host.agent_id.clone(),
         agent_label: host.agent_label.clone(),
+        reply_id: host.reply_id.clone(),
     };
     let run = run.clone();
     tokio::spawn(async move {
@@ -1710,13 +1786,21 @@ async fn run_child(
         run_id: Some(run.run_id.clone()),
         agent_id: Some(id.to_string()),
         agent_label: Some(format!("Subagent \"{label}\"")),
+        reply_id: None,
     };
     let hooks = StepHooks::new(st.clone(), host.app.clone(), run.run_id.clone(), Some(id.to_string()));
     let n_ctx = st.engine.status().props.as_ref().and_then(|p| p.n_ctx).unwrap_or(4096);
-    let observer = Observer { st: st.clone(), app: host.app.clone(), run: run.clone(), agent_id: Some(id.to_string()), n_ctx };
+    // Deferred tool loading: when the parent loads tools on demand, so does
+    // the child, starting with the tools the parent has loaded so far.
+    let parent_key = run.conversation_id.as_deref().map(crate::services::tool_offer::chat_key).unwrap_or_else(|| format!("run:{}", run.run_id));
+    let parent_loaded = crate::services::tool_offer::get(&parent_key).map(|o| o.loaded_ids()).unwrap_or_default();
+    let mut tools = tools;
+    let defer = run.tools.iter().any(crate::services::tool_offer::is_load_tools);
+    let offer = crate::services::tool_offer::plan(&mut tools, defer, &parent_loaded, run.mode == ToolMode::Xml, &run.run_id).map(|o| crate::services::tool_offer::install(st, &format!("agent:{id}"), o));
+    let observer = Observer { st: st.clone(), app: host.app.clone(), run: run.clone(), agent_id: Some(id.to_string()), n_ctx, tools: tools.clone(), offer: offer.clone() };
     let mut system = run.shared_prompt.clone();
     system.push_str("\n\n");
-    system.push_str(&task_tools_section(&tools, &budgets));
+    system.push_str(&task_tools_section(&tools, &budgets, run.mode, offer.as_deref()));
     system.push_str("\n\n");
     system.push_str(&subagent_section(label, objective, &budgets, tools.iter().any(|t| t.tool_name == "ask_user")));
     if let Some(i) = iso {
@@ -1726,7 +1810,7 @@ async fn run_child(
         system.push_str(&worktree_section(i));
     }
     let mut transcript = vec![serde_json::json!({ "role": "system", "content": system }), serde_json::json!({ "role": "user", "content": objective })];
-    let gate = st.gate();
+    let gate = st.gate().seat();
     let pause = run.pause.child_token();
     let ctx = TurnCtx {
         client: &run.client,
@@ -1995,6 +2079,169 @@ mod tests {
         serde_json::json!({ "role": role, "content": content })
     }
 
+    /// A chat's tools as the agent loop gets them: This PC's built-ins, the
+    /// subagent tools and a 31-tool MCP server (so deferred loading is on).
+    fn chat_tools() -> Vec<ExposedTool> {
+        let m = exec::EnvMeta { kind: "local".into(), label: "This PC (PC)".into(), shell: execution::Shell::PowerShell, roots: vec![] };
+        let mut tools: Vec<ExposedTool> = exec::BUILTINS
+            .iter()
+            .map(|b| ExposedTool {
+                tool_id: format!("{}local/{}", agent_runtime::BUILTIN_PREFIX, b.name),
+                model_name: b.name.into(),
+                server_id: format!("{}local", agent_runtime::BUILTIN_PREFIX),
+                server_name: m.label.clone(),
+                tool_name: b.name.into(),
+                description: exec::describe(b.name, &m),
+                input_schema: exec::schema(b.name),
+                policy: b.default_policy,
+                timeout_secs: 120,
+            })
+            .collect();
+        tools.extend(subagent_tools("r"));
+        tools.extend((0..31).map(|i| ExposedTool {
+            tool_id: format!("mcp:big/t{i}"),
+            model_name: format!("mcp__big__t{i}"),
+            server_id: "big".into(),
+            server_name: "big".into(),
+            tool_name: format!("t{i}"),
+            description: "A tool.".into(),
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            policy: Policy::Allow,
+            timeout_secs: 60,
+        }));
+        tools
+    }
+
+    /// Runs the isolation part of spawn_subagents for real in `root`: the
+    /// arguments as dispatch passes them, parsed into `SpawnArgs`, then the
+    /// repository check and one git worktree per isolated child. (The rest of
+    /// spawn_subagents needs a running app: database rows, events.)
+    struct SpawnHost {
+        root: std::path::PathBuf,
+        offer: Arc<agent_runtime::ToolOffer>,
+        made: Mutex<Vec<execution::git::Worktree>>,
+    }
+
+    #[async_trait]
+    impl agent_runtime::ToolHost for SpawnHost {
+        async fn grants(&self, _t: &str) -> AppResult<Vec<security::policy::Grant>> {
+            Ok(vec![])
+        }
+        async fn add_grant(&self, _s: security::policy::GrantScope, _t: &str, _c: Option<&str>) -> AppResult<()> {
+            Ok(())
+        }
+        async fn current_policy(&self, t: &ExposedTool) -> AppResult<(bool, Policy, bool)> {
+            Ok((true, t.policy, true))
+        }
+        async fn request_approval(&self, _r: agent_runtime::ApprovalRequest, _c: &CancellationToken) -> security::policy::ApprovalAnswer {
+            security::policy::ApprovalAnswer::Deny
+        }
+        async fn audit_start(&self, _t: &ExposedTool, _c: &ToolCall, _a: &str, _conv: Option<&str>) -> AppResult<String> {
+            Ok("a1".into())
+        }
+        async fn audit_status(&self, _id: &str, _s: &str, _a: &serde_json::Value) -> AppResult<()> {
+            Ok(())
+        }
+        async fn audit_end(&self, _id: &str, _s: &str, _r: Option<&str>, _a: &serde_json::Value, _ms: u64) -> AppResult<()> {
+            Ok(())
+        }
+        fn event(&self, _ev: agent_runtime::ToolEvent) {}
+        fn tool_offer(&self) -> Option<Arc<agent_runtime::ToolOffer>> {
+            Some(self.offer.clone())
+        }
+        async fn call(&self, tool: &ExposedTool, _call: &ToolCall, args: serde_json::Value, _to: std::time::Duration, _c: &CancellationToken) -> AppResult<CallResult> {
+            assert_eq!(tool.tool_name, "spawn_subagents");
+            let a: SpawnArgs = serde_json::from_value(args).map_err(|e| AppError::InvalidInput(e.to_string()))?;
+            if let Some(text) = bad_isolation(&a) {
+                return Ok(CallResult { text, is_error: true });
+            }
+            let isolated = a.subagents.iter().filter(|s| s.isolation.as_deref() == Some("worktree")).count();
+            if isolated == 0 {
+                return Ok(CallResult { text: "started without isolation".into(), is_error: false });
+            }
+            let repo = match execution::git::repo_root(&self.root).await {
+                Ok(r) => r,
+                Err(e) => return Ok(CallResult { text: not_started_text(&format!("worktree isolation is not available: {e}"), true), is_error: true }),
+            };
+            for _ in 0..isolated {
+                let wt = execution::git::plan_worktree(&repo, &worktree_id()).await?;
+                execution::git::create_worktree(&wt).await?;
+                self.made.lock().unwrap().push(wt);
+            }
+            Ok(CallResult { text: format!("started {isolated} in worktrees (folder {:?} in the repository)", rel_in_repo(&self.root, &repo)), is_error: false })
+        }
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+        let o = std::process::Command::new("git").args(args).current_dir(dir).output().expect("git runs");
+        assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    }
+
+    /// Regression (e2e "chat subagents in worktrees", "worktree isolation in
+    /// a non-git folder"): `isolation: "worktree"` must reach the model and
+    /// survive the loop's dispatch path (deferred-tools offer, cached
+    /// validators) into spawn_subagents' worktree step.
+    #[tokio::test]
+    async fn spawn_isolation_worktree_through_dispatch() {
+        let mut tools = chat_tools();
+        let offer = Arc::new(crate::services::tool_offer::plan(&mut tools, true, &[], false, "chat").expect("31 MCP tools are deferred"));
+        // What the model gets in native mode: spawn_subagents' own line in the
+        // prompt (small models skip "isolation" without it) and, in the
+        // definitions sent, the isolation argument.
+        let prompt = agent_runtime::tools_prompt(&tools, &agent_runtime::Limits::default(), ToolMode::Native, Some(&offer));
+        assert!(prompt.contains("The app's own tools:\n- spawn_subagents (server \"Local AI Studio\"): Start subagents"), "{prompt}");
+        assert!(!prompt.contains("- fs_read (built-in") && !prompt.contains("- load_tools ("), "only the app's own tools are listed: {prompt}");
+        let sent = agent_runtime::openai_tools(&offer.sent(&tools));
+        let spawn = sent.as_array().unwrap().iter().find(|d| d["function"]["name"] == "spawn_subagents").expect("spawn_subagents is sent in full");
+        assert_eq!(spawn["function"]["parameters"]["properties"]["subagents"]["items"]["properties"]["isolation"]["enum"], serde_json::json!(["none", "worktree"]));
+
+        let call = |args: serde_json::Value| ToolCall { id: "c1".into(), name: "spawn_subagents".into(), arguments: args.to_string() };
+        let two = serde_json::json!({ "subagents": [
+            { "label": "alpha", "objective": "a", "tools": [], "isolation": "worktree" },
+            { "label": "bravo", "objective": "b", "isolation": "worktree" }
+        ], "wait": false });
+        let cancel = CancellationToken::new();
+
+        // (a) In a git repository: one worktree per child, on its own las/ branch.
+        let repo = tempfile::tempdir().unwrap();
+        git_in(repo.path(), &["init", "-q", "-b", "main"]);
+        git_in(repo.path(), &["config", "user.name", "LAS test"]);
+        git_in(repo.path(), &["config", "user.email", "las-test@example.invalid"]);
+        std::fs::write(repo.path().join("README.md"), "# test\n").unwrap();
+        git_in(repo.path(), &["add", "."]);
+        git_in(repo.path(), &["commit", "-q", "-m", "init"]);
+        let host = SpawnHost { root: repo.path().to_path_buf(), offer: offer.clone(), made: Mutex::new(vec![]) };
+        // Twice: the second call validates with the cached validator.
+        for round in 0..2 {
+            let out = agent_runtime::dispatch(&host, &tools, &call(two.clone()), Some("conv"), &cancel).await;
+            assert_eq!(out.status, "ok", "round {round}: {}", out.content);
+        }
+        let made = host.made.lock().unwrap().clone();
+        assert_eq!(made.len(), 4);
+        for wt in &made {
+            assert!(std::path::Path::new(&wt.path).join("README.md").exists(), "{wt:?}");
+            assert!(wt.branch.starts_with(execution::git::BRANCH_PREFIX), "{wt:?}");
+        }
+        assert_eq!(git_in(repo.path(), &["worktree", "list"]).lines().count(), 5);
+        assert_eq!(git_in(repo.path(), &["status", "--porcelain"]), "", "main tree untouched");
+        // A value the schema does not allow never reaches the tool.
+        let bad = serde_json::json!({ "subagents": [{ "label": "x", "objective": "y", "isolation": "docker" }] });
+        let out = agent_runtime::dispatch(&host, &tools, &call(bad), Some("conv"), &cancel).await;
+        assert_eq!(out.status, "invalid_arguments", "{}", out.content);
+        for wt in &made {
+            let _ = execution::git::cleanup_worktree(wt).await;
+        }
+
+        // (b) Not a git repository: a clear error, no worktree.
+        let plain = tempfile::tempdir().unwrap();
+        let host = SpawnHost { root: plain.path().to_path_buf(), offer, made: Mutex::new(vec![]) };
+        let out = agent_runtime::dispatch(&host, &tools, &call(two), Some("conv"), &cancel).await;
+        assert_eq!(out.status, "tool_error", "{}", out.content);
+        assert!(out.content.contains("Not started") && out.content.contains("not inside a git repository"), "{}", out.content);
+        assert!(host.made.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn trimming_removes_old_outputs_then_shortens_new_ones() {
         let big = "x".repeat(30_000);
@@ -2013,6 +2260,75 @@ mod tests {
         // Small transcripts are left alone.
         let mut s = vec![msg("system", "sys"), msg("user", "hi"), msg("assistant", "a"), msg("tool", "small")];
         assert_eq!(fit_transcript(&mut s, 8192), (0, 0));
+    }
+
+    fn big_tools(n: usize) -> Vec<ExposedTool> {
+        (0..n)
+            .map(|i| ExposedTool {
+                tool_id: format!("mcp:s/t{i}"),
+                model_name: format!("mcp__s__t{i}"),
+                server_id: "s".into(),
+                server_name: "s".into(),
+                tool_name: format!("t{i}"),
+                description: "d".repeat(500),
+                input_schema: serde_json::json!({ "type": "object", "properties": { "path": { "type": "string", "description": "p".repeat(300) } } }),
+                policy: Policy::Allow,
+                timeout_secs: 60,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tool_definitions_shrink_the_transcript_limit() {
+        let n_ctx = 8192u64;
+        let tools = big_tools(10);
+        let tool_tokens = tool_def_tokens(ToolMode::Native, &tools);
+        assert!(tool_tokens > 1000 && tool_tokens < n_ctx * 7 / 10, "{tool_tokens}");
+        let big = "x".repeat(6_000); // two of them ~4k tokens: fit alone in 70% of 8k
+        let make = || vec![msg("system", "sys"), msg("user", "objective"), msg("assistant", "a1"), msg("tool", &big), msg("assistant", "a2"), msg("tool", &big)];
+        let mut alone = make();
+        assert_eq!(fit_transcript(&mut alone, transcript_limit(n_ctx, 0).unwrap()), (0, 0), "fits without tools");
+        let mut with_tools = make();
+        let limit = transcript_limit(n_ctx, tool_tokens).unwrap();
+        assert_eq!(limit, n_ctx * 7 / 10 - tool_tokens);
+        let (removed, shortened) = fit_transcript(&mut with_tools, limit);
+        assert!(removed + shortened > 0, "trimmed once the tool list is counted");
+    }
+
+    #[test]
+    fn tool_list_larger_than_the_budget_fails_with_a_clear_error() {
+        let tools = big_tools(40);
+        let tool_tokens = tool_def_tokens(ToolMode::Native, &tools);
+        let err = transcript_limit(4096, tool_tokens).unwrap_err();
+        assert!(err.contains("Turn off some MCP servers") && err.contains("larger context"), "{err}");
+        assert!(transcript_limit(1_000_000, tool_tokens).is_ok());
+    }
+
+    #[test]
+    fn xml_mode_does_not_count_tool_definitions_twice() {
+        let tools = big_tools(40);
+        assert_eq!(tool_def_tokens(ToolMode::Xml, &tools), 0);
+        assert_eq!(transcript_limit(4096, 0).unwrap(), 4096 * 7 / 10);
+        assert_eq!(tool_def_tokens(ToolMode::Native, &[]), 0);
+        let offer = agent_runtime::ToolOffer::new(&tools, &tools.iter().map(|t| t.model_name.clone()).collect::<Vec<_>>(), &[], true);
+        assert_eq!(sent_tool_tokens(ToolMode::Xml, &tools, Some(&offer)), 0);
+    }
+
+    #[test]
+    fn deferred_tools_count_only_once_loaded() {
+        let tools = big_tools(40);
+        let all = tool_def_tokens(ToolMode::Native, &tools);
+        let names: Vec<String> = tools.iter().map(|t| t.model_name.clone()).collect();
+        let offer = agent_runtime::ToolOffer::new(&tools, &names, &[], false);
+        assert_eq!(sent_tool_tokens(ToolMode::Native, &tools, Some(&offer)), 0, "nothing sent while all deferred");
+        assert!(transcript_limit(4096, sent_tool_tokens(ToolMode::Native, &tools, Some(&offer))).is_ok(), "no early refusal");
+        assert!(transcript_limit(4096, all).is_err());
+        offer.load(&names[..3]);
+        let three = sent_tool_tokens(ToolMode::Native, &tools, Some(&offer));
+        assert!(three > 0 && three < all / 5, "{three} vs {all}");
+        offer.load(&names[3..10]);
+        assert!(sent_tool_tokens(ToolMode::Native, &tools, Some(&offer)) > three, "loading raises the reserve");
+        assert_eq!(sent_tool_tokens(ToolMode::Native, &tools, None), all);
     }
 
     #[test]
@@ -2079,7 +2395,7 @@ mod tests {
         assert!(free.contains("no limit on model turns, tool calls, time or tokens"), "{free}");
         let tight = task_section("x", &Budgets::limited(10, 5, 600, 9000), &Usage { turns: 4, ..Default::default() }, true);
         assert!(tight.contains("Budget left: 6 model turns, 5 tool calls, about 10 minutes, 9000 tokens.") && tight.contains("stop_subagent"), "{tight}");
-        let tools = task_tools_section(&[], &Budgets::default());
+        let tools = task_tools_section(&[], &Budgets::default(), ToolMode::Native, None);
         assert!(tools.contains("Limits for this work: no limit on model turns") && !tools.contains("4294967295"), "{tools}");
         // MCP servers are on unless turned off; old settings load without the list.
         let d = TaskSettings::default();
